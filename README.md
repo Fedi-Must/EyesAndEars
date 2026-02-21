@@ -3,11 +3,14 @@
 ## Prototype overview
 
 EyesAndEars is a prototype "on-demand Copilot" for screen issues.
+This uses Gemini since the free tier allows all users to use Gemini 2.5 for a series of long requests. You can, however, pay Google and upgrade your Gemini API key and version if needed.
 
 - You press `Numpad 1` to capture the current screen.
 - The screenshot is sent to Gemini with a strict prompt to return only the direct fix/answer.
 - The app then lets you type naturally, but each keypress outputs the next character from the generated answer.
 - This gives a controlled "type-every-letter" flow instead of auto-pasting full text at once.
+
+Made this tool since it helped me with coding and various tasks, since it's faster than opening websites and having to manually input in questions and waiting for a reply to copy it.
 
 ## Local run
 
