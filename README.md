@@ -10,6 +10,7 @@ On first launch, the app asks you to create:
 - your Gemini API key
 
 Optional: you can still provide the key via `EYESANDEARS_API_KEY`.
+After setup, the CMD window auto-hides and the app continues in background with a tray icon.
 
 ## Hotkeys
 

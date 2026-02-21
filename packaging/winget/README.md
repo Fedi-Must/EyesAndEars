@@ -28,4 +28,5 @@ Notes:
 - If a user wants to keep package files during uninstall, they can use `--preserve` instead.
 - No Python runtime is required for end users (the EXE is self-contained).
 - On first launch, the app prompts for password and Gemini API key.
+- After setup prompts, the CMD window hides and the app runs with a tray icon.
 - When run from winget, `Numpad 9` schedules `winget uninstall --purge` automatically.

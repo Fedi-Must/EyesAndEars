@@ -2,3 +2,4 @@ google-generativeai
 Pillow
 pyperclip
 keyboard
+pystray

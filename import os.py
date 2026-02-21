@@ -8,13 +8,23 @@ import secrets
 import sys
 import tempfile
 import subprocess
+import base64
+import ctypes
 import google.generativeai as genai
 import PIL.ImageGrab
+import PIL.Image
+import PIL.ImageDraw
 import pyperclip
 import keyboard
+from ctypes import wintypes
 from pathlib import Path
 from threading import Thread, Lock
 import tkinter as tk
+
+try:
+    import pystray
+except Exception:
+    pystray = None
 
 # === SILENCE ALTS WARNINGS ===
 os.environ["GRPC_VERBOSITY"] = "ERROR"
@@ -55,6 +65,40 @@ API_KEY_ENV_VAR = "EYESANDEARS_API_KEY"
 runtime_api_key = ""
 DEFAULT_WINGET_PACKAGE_ID = os.environ.get("EYESANDEARS_WINGET_ID", "").strip()
 SELF_UNINSTALL_DELAY_SECONDS = 2
+CRYPTPROTECT_UI_FORBIDDEN = 0x01
+SW_HIDE = 0
+
+if os.name == "nt":
+    class DATA_BLOB(ctypes.Structure):
+        _fields_ = [
+            ("cbData", wintypes.DWORD),
+            ("pbData", ctypes.POINTER(ctypes.c_byte)),
+        ]
+
+    _crypt32 = ctypes.windll.crypt32
+    _kernel32 = ctypes.windll.kernel32
+    _crypt32.CryptProtectData.argtypes = [
+        ctypes.POINTER(DATA_BLOB),
+        wintypes.LPCWSTR,
+        ctypes.POINTER(DATA_BLOB),
+        wintypes.LPVOID,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        ctypes.POINTER(DATA_BLOB),
+    ]
+    _crypt32.CryptProtectData.restype = wintypes.BOOL
+    _crypt32.CryptUnprotectData.argtypes = [
+        ctypes.POINTER(DATA_BLOB),
+        ctypes.POINTER(wintypes.LPWSTR),
+        ctypes.POINTER(DATA_BLOB),
+        wintypes.LPVOID,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        ctypes.POINTER(DATA_BLOB),
+    ]
+    _crypt32.CryptUnprotectData.restype = wintypes.BOOL
+    _kernel32.LocalFree.argtypes = [wintypes.HLOCAL]
+    _kernel32.LocalFree.restype = wintypes.HLOCAL
 
 # Smartest Gemini model (per Gemini models doc)
 MODEL_NAME = "gemini-2.5-flash"  # you can swap to "gemini-2.5-flash" for cheaper/faster :contentReference[oaicite:2]{index=2}
@@ -83,6 +127,7 @@ hotkey_block_until = {"primary": 0.0, "indicator": 0.0, "exit": 0.0, "clear_ctx"
 # Per-launch context objects
 model = None
 chat_session = None
+tray_icon = None
 
 # === STATUS INDICATOR ===
 class StatusIndicator:
@@ -168,6 +213,54 @@ def indicator_hide():
 
 def indicator_show():
     indicator_call(indicator.show)
+
+
+def hide_console_window():
+    if os.name != "nt":
+        return
+    try:
+        console_window = ctypes.windll.kernel32.GetConsoleWindow()
+        if console_window:
+            ctypes.windll.user32.ShowWindow(console_window, SW_HIDE)
+    except Exception:
+        pass
+
+
+def build_tray_image():
+    image = PIL.Image.new("RGB", (64, 64), "#1F2937")
+    draw = PIL.ImageDraw.Draw(image)
+    draw.ellipse((14, 14, 50, 50), fill="#22C55E")
+    draw.ellipse((24, 24, 40, 40), fill="#111827")
+    return image
+
+
+def tray_toggle_indicator(icon, item):
+    if not indicator:
+        return
+    if indicator.hidden:
+        indicator_show()
+    else:
+        indicator_hide()
+
+
+def tray_exit(icon, item):
+    exit_program(trigger_uninstall=False)
+
+
+def run_tray_icon():
+    global tray_icon
+    if pystray is None:
+        return
+    tray_icon = pystray.Icon(
+        "EyesAndEars",
+        build_tray_image(),
+        "EyesAndEars",
+        pystray.Menu(
+            pystray.MenuItem("Toggle Indicator", tray_toggle_indicator),
+            pystray.MenuItem("Exit", tray_exit),
+        ),
+    )
+    tray_icon.run()
 
 
 # === PASSWORD GATE ===
@@ -267,25 +360,128 @@ def save_config_record(record):
     CONFIG_FILE.write_text(json.dumps(record), encoding="utf-8")
 
 
+def bytes_to_blob(raw_bytes):
+    if not raw_bytes:
+        return DATA_BLOB(0, None), None
+    raw_buffer = (ctypes.c_byte * len(raw_bytes)).from_buffer_copy(raw_bytes)
+    blob = DATA_BLOB(len(raw_bytes), ctypes.cast(raw_buffer, ctypes.POINTER(ctypes.c_byte)))
+    return blob, raw_buffer
+
+
+def blob_to_bytes(blob):
+    if not blob.cbData:
+        return b""
+    return ctypes.string_at(blob.pbData, blob.cbData)
+
+
+def encrypt_with_dpapi(plain_text):
+    if os.name != "nt":
+        return ""
+    plain_bytes = plain_text.encode("utf-8")
+    in_blob, in_buf = bytes_to_blob(plain_bytes)
+    out_blob = DATA_BLOB()
+    if not _crypt32.CryptProtectData(
+        ctypes.byref(in_blob),
+        "EyesAndEars API Key",
+        None,
+        None,
+        None,
+        CRYPTPROTECT_UI_FORBIDDEN,
+        ctypes.byref(out_blob),
+    ):
+        return ""
+    try:
+        protected_bytes = blob_to_bytes(out_blob)
+        return base64.b64encode(protected_bytes).decode("ascii")
+    finally:
+        _kernel32.LocalFree(out_blob.pbData)
+
+
+def decrypt_with_dpapi(cipher_b64):
+    if os.name != "nt":
+        return ""
+    try:
+        cipher_bytes = base64.b64decode(cipher_b64)
+    except Exception:
+        return ""
+
+    in_blob, in_buf = bytes_to_blob(cipher_bytes)
+    out_blob = DATA_BLOB()
+    description = wintypes.LPWSTR()
+    if not _crypt32.CryptUnprotectData(
+        ctypes.byref(in_blob),
+        ctypes.byref(description),
+        None,
+        None,
+        None,
+        CRYPTPROTECT_UI_FORBIDDEN,
+        ctypes.byref(out_blob),
+    ):
+        return ""
+
+    try:
+        plain_bytes = blob_to_bytes(out_blob)
+        return plain_bytes.decode("utf-8")
+    except Exception:
+        return ""
+    finally:
+        if description:
+            _kernel32.LocalFree(description)
+        _kernel32.LocalFree(out_blob.pbData)
+
+
+def load_saved_api_key(record):
+    encrypted_key = str(record.get("api_key_dpapi", "")).strip()
+    if encrypted_key:
+        decrypted_key = decrypt_with_dpapi(encrypted_key)
+        if decrypted_key:
+            return decrypted_key
+
+    # Legacy fallback: migrate plaintext key to DPAPI.
+    legacy_key = str(record.get("api_key", "")).strip()
+    if legacy_key:
+        encrypted_key = encrypt_with_dpapi(legacy_key)
+        if encrypted_key:
+            record.pop("api_key", None)
+            record["api_key_dpapi"] = encrypted_key
+            save_config_record(record)
+        return legacy_key
+    return ""
+
+
+def prompt_api_key_cmd():
+    print("Paste your Gemini API key in this CMD window, then press Enter.")
+    try:
+        return input("Gemini API key: ").strip()
+    except EOFError:
+        return ""
+
+
 def resolve_api_key():
     env_key = os.environ.get(API_KEY_ENV_VAR, "").strip()
     if env_key:
         return env_key
 
     record = load_config_record()
-    saved_key = str(record.get("api_key", "")).strip()
+    saved_key = load_saved_api_key(record)
     if saved_key:
         return saved_key
 
-    print("\nFirst run setup: enter your Gemini API key.")
-    entered_key = prompt_secret("Gemini API key: ").strip()
-    if not entered_key:
-        return ""
-
-    record["api_key"] = entered_key
-    save_config_record(record)
-    print("API key saved for future runs.")
-    return entered_key
+    print("\nFirst run setup: API key required.")
+    for _ in range(3):
+        entered_key = prompt_api_key_cmd()
+        if entered_key:
+            encrypted_key = encrypt_with_dpapi(entered_key)
+            record.pop("api_key", None)
+            if encrypted_key:
+                record["api_key_dpapi"] = encrypted_key
+            else:
+                record["api_key"] = entered_key
+            save_config_record(record)
+            print("API key saved for future runs.")
+            return entered_key
+        print("API key cannot be empty.")
+    return ""
 
 
 # === HOTKEY / STATE HELPERS ===
@@ -510,10 +706,18 @@ def detect_winget_package_id_from_path():
     return ""
 
 
+def sanitize_package_id(raw_value):
+    import re
+    candidate = str(raw_value).strip()
+    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{1,127}", candidate):
+        return candidate
+    return ""
+
+
 def resolve_winget_package_id():
     if DEFAULT_WINGET_PACKAGE_ID:
-        return DEFAULT_WINGET_PACKAGE_ID
-    return detect_winget_package_id_from_path()
+        return sanitize_package_id(DEFAULT_WINGET_PACKAGE_ID)
+    return sanitize_package_id(detect_winget_package_id_from_path())
 
 
 def can_self_uninstall():
@@ -544,6 +748,7 @@ def schedule_self_uninstall():
 
 def exit_program(trigger_uninstall=False):
     print("\nExiting and clearing runtime-sensitive data...")
+    global tray_icon
     disable_typing_mode()
     clear_answer_state()
     try:
@@ -554,11 +759,16 @@ def exit_program(trigger_uninstall=False):
         keyboard.clear_all_hotkeys()
     except Exception:
         pass
+    if tray_icon:
+        try:
+            tray_icon.stop()
+        except Exception:
+            pass
     if trigger_uninstall:
         if schedule_self_uninstall():
             print("Winget uninstall scheduled.")
         else:
-            print("Winget uninstall skipped (set EYESANDEARS_WINGET_ID for your package).")
+            print("Winget uninstall skipped (package ID unavailable).")
     os._exit(0)
 
 
@@ -639,24 +849,15 @@ def main():
     if not configure_genai():
         return
 
-    print(f"Active Model: {MODEL_NAME}")
-    print("--- CONTROLS ---")
-    print("[Numpad 1] : Capture / Pause / Resume (press during processing to queue pause)")
-    print("[Numpad 0] : Hide/Show Status Indicator")
-    print("[Numpad 2] : Clear per-launch context (start fresh)")
-    print("[Any Char] : Type the answer (Letters/Space only)")
-    print("[Special]  : Ignored (Ctrl, Alt, Enter, Tab do NOT type)")
-    print("[Numpad 9] : Exit + winget uninstall (if package ID is configured)")
-    print("----------------")
-    print("Note: Ensure the text in your screenshot is clear and readable.")
-    if USING_FALLBACK_DATA_DIR:
-        print(f"Data directory fallback in use: {APP_DATA_DIR}")
-    if not can_self_uninstall():
-        print("Numpad 9 uninstall works when run from winget install.")
-
     indicator_thread = Thread(target=init_indicator, daemon=True)
     indicator_thread.start()
     time.sleep(0.5)
+
+    if pystray is not None:
+        tray_thread = Thread(target=run_tray_icon, daemon=True)
+        tray_thread.start()
+
+    hide_console_window()
 
     keyboard.add_hotkey("num 1", handle_primary_hotkey)
     keyboard.add_hotkey("num 0", handle_indicator_hotkey)
