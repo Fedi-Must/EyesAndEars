@@ -1,8 +1,10 @@
 __pycache__/
 *.pyc
+.eyesandears/
 build/
 dist/
 *.spec
+_check_*.py
 cred_req.txt
 cred_resp.txt
 repo_create.json

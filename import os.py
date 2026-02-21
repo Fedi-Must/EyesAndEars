@@ -445,6 +445,15 @@ def load_saved_api_key(record):
             record.pop("api_key", None)
             record["api_key_dpapi"] = encrypted_key
             save_config_record(record)
+            return legacy_key
+
+        # Do not continue using plaintext on Windows if migration fails.
+        if os.name == "nt":
+            print("Stored API key is plaintext and could not be secured. Re-enter key.")
+            record.pop("api_key", None)
+            save_config_record(record)
+            return ""
+
         return legacy_key
     return ""
 
@@ -475,8 +484,11 @@ def resolve_api_key():
             record.pop("api_key", None)
             if encrypted_key:
                 record["api_key_dpapi"] = encrypted_key
-            else:
+            elif os.name != "nt":
                 record["api_key"] = entered_key
+            else:
+                print("Could not securely store API key. Try again.")
+                continue
             save_config_record(record)
             print("API key saved for future runs.")
             return entered_key
@@ -729,7 +741,7 @@ def schedule_self_uninstall():
     if not package_id:
         return False
 
-    uninstall_script = Path(tempfile.gettempdir()) / "eyesandears-self-uninstall.cmd"
+    uninstall_script = Path(tempfile.gettempdir()) / f"eyesandears-self-uninstall-{secrets.token_hex(8)}.cmd"
     script_text = (
         "@echo off\n"
         f"timeout /t {SELF_UNINSTALL_DELAY_SECONDS} /nobreak >nul\n"
@@ -856,8 +868,9 @@ def main():
     if pystray is not None:
         tray_thread = Thread(target=run_tray_icon, daemon=True)
         tray_thread.start()
-
-    hide_console_window()
+        hide_console_window()
+    else:
+        print("Tray icon unavailable. Keeping CMD visible for control.")
 
     keyboard.add_hotkey("num 1", handle_primary_hotkey)
     keyboard.add_hotkey("num 0", handle_indicator_hotkey)
