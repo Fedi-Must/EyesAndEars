@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+build/
+dist/
+*.spec
+cred_req.txt
+cred_resp.txt
+repo_create.json
+repo_create_status.txt
+temp_create_repo.cmd

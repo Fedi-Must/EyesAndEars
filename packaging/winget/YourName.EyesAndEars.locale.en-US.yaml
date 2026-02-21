@@ -1,0 +1,19 @@
+PackageIdentifier: YourName.EyesAndEars
+PackageVersion: 1.0.0
+PackageLocale: en-US
+Publisher: YourName
+PublisherUrl: https://github.com/YourName
+PublisherSupportUrl: https://github.com/YourName/EyesAndEars/issues
+Author: YourName
+PackageName: EyesAndEars
+PackageUrl: https://github.com/YourName/EyesAndEars
+License: MIT
+ShortDescription: Screenshot-to-answer assistant with local password gate.
+Description: Self-contained Windows app that captures screenshots, sends them to Gemini, and can type generated responses on demand.
+Moniker: eyesandears
+Tags:
+- ai
+- automation
+- python
+ManifestType: defaultLocale
+ManifestVersion: 1.10.0
