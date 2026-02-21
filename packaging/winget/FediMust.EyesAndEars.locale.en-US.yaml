@@ -1,12 +1,12 @@
-PackageIdentifier: YourName.EyesAndEars
+PackageIdentifier: FediMust.EyesAndEars
 PackageVersion: 1.0.0
 PackageLocale: en-US
-Publisher: YourName
-PublisherUrl: https://github.com/YourName
-PublisherSupportUrl: https://github.com/YourName/EyesAndEars/issues
-Author: YourName
+Publisher: Fedi-Must
+PublisherUrl: https://github.com/Fedi-Must
+PublisherSupportUrl: https://github.com/Fedi-Must/EyesAndEars/issues
+Author: Fedi-Must
 PackageName: EyesAndEars
-PackageUrl: https://github.com/YourName/EyesAndEars
+PackageUrl: https://github.com/Fedi-Must/EyesAndEars
 License: MIT
 ShortDescription: Screenshot-to-answer assistant with local password gate.
 Description: Self-contained Windows app that captures screenshots, sends them to Gemini, and can type generated responses on demand.

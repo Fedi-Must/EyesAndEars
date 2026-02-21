@@ -1,40 +1,30 @@
 @echo off
 setlocal
 
-set VERSION=%~1
-if "%VERSION%"=="" set VERSION=1.0.0
 set SCRIPT_DIR=%~dp0
 set PYTHON_CMD=
 
-pushd "%SCRIPT_DIR%.."
+pushd "%SCRIPT_DIR%"
 
 call :resolve_python
 if errorlevel 1 goto :fail
 
-echo [1/4] Installing build dependencies...
+echo [1/3] Installing Python dependencies...
 %PYTHON_CMD% -m pip install --upgrade pip
-%PYTHON_CMD% -m pip install -r requirements.txt pyinstaller
+%PYTHON_CMD% -m pip install -r requirements.txt
 if errorlevel 1 goto :fail
 
-echo [2/4] Building single-file EXE...
-%PYTHON_CMD% -m PyInstaller --noconfirm --clean --onefile --name EyesAndEars "import os.py"
+echo [2/3] Launching EyesAndEars...
+%PYTHON_CMD% "import os.py"
 if errorlevel 1 goto :fail
 
-echo [3/4] Creating versioned release artifact...
-copy /Y "dist\EyesAndEars.exe" "dist\EyesAndEars-%VERSION%-x64.exe" >nul
-if errorlevel 1 goto :fail
-
-echo [4/4] SHA256 (use this in winget installer manifest):
-certutil -hashfile "dist\EyesAndEars-%VERSION%-x64.exe" SHA256
-
-echo.
-echo Build complete: dist\EyesAndEars-%VERSION%-x64.exe
+echo [3/3] Done.
 popd
 exit /b 0
 
 :fail
 popd
-echo Build failed.
+echo run-local failed.
 exit /b 1
 
 :resolve_python

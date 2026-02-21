@@ -4,7 +4,7 @@ setlocal
 set SCRIPT_DIR=%~dp0
 set MANIFEST_DIR=%SCRIPT_DIR%
 set PACKAGE_ID=%~1
-if "%PACKAGE_ID%"=="" set PACKAGE_ID=YourName.EyesAndEars
+if "%PACKAGE_ID%"=="" set PACKAGE_ID=FediMust.EyesAndEars
 
 where winget >nul 2>nul
 if errorlevel 1 (
