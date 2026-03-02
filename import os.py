@@ -1,39 +1,141 @@
-import os
-import time
+import base64
+import csv
+import ctypes
+import io
 import json
-import hmac
-import getpass
-import hashlib
+import os
 import secrets
+import subprocess
 import sys
 import tempfile
-import subprocess
-import base64
-import ctypes
-import google.generativeai as genai
-import PIL.ImageGrab
-import PIL.Image
-import PIL.ImageDraw
-import pyperclip
-import keyboard
+import time
+import warnings
 from ctypes import wintypes
 from pathlib import Path
-from threading import Thread, Lock
+from threading import Event, Lock, Thread
 import tkinter as tk
+
+import keyboard
+import PIL.Image
+import PIL.ImageDraw
+import PIL.ImageGrab
+import pyperclip
+import requests
 
 try:
     import pystray
 except Exception:
     pystray = None
 
-# === SILENCE ALTS WARNINGS ===
-os.environ["GRPC_VERBOSITY"] = "ERROR"
-os.environ["GLOG_minloglevel"] = "2"
-
-# === CONFIGURATION ===
 APP_NAME = "EyesAndEars"
-PASSWORD_MIN_LENGTH = 6
-MAX_PASSWORD_ATTEMPTS = 3
+APP_VERSION = "2.1.0"
+CONFIG_FILE_NAME = "config.json"
+DEFAULT_SERVER_URL = os.environ.get("EAE_SERVER_URL", "http://localhost:8000").strip().rstrip("/")
+DEFAULT_MODEL_NAME = os.environ.get("EAE_MODEL_NAME", "gemini-2.5-flash").strip()
+DEFAULT_WINGET_PACKAGE_ID = os.environ.get("EYESANDEARS_WINGET_ID", "").strip()
+SELF_UNINSTALL_DELAY_SECONDS = 2
+API_KEY_ENV_FALLBACK = ("EYESANDEARS_API_KEY", "EAE_API_KEY")
+SW_HIDE = 0
+CRYPTPROTECT_UI_FORBIDDEN = 0x01
+
+PROMPT_TEXT = (
+    "Analyze the image provided. Your goal is to provide the direct answer/solution and NOTHING else.\n\n"
+    "RULES:\n"
+    "1. If it is a Multiple Choice Question: Output ONLY the correct letter (e.g., 'A', 'B'). Do not write the text of the option.\n"
+    "2. If it is a coding error/task: Output ONLY the corrected code block. Do not use Markdown formatting (no python ... ). Just the raw code ready to run.\n"
+    "3. If it is a general question: Output ONLY the direct answer.\n"
+    "4. ABSOLUTELY NO conversational filler, no 'Here is the answer', no explanations, no markdown backticks.\n"
+    "5. If unclear, find the most likely question on screen and answer it."
+)
+
+current_answer = ""
+current_index = 0
+last_answer = ""
+is_processing = False
+is_paused = False
+pause_pending = False
+typing_hook = None
+write_lock = Lock()
+hotkey_block_until = {
+    "primary": 0.0,
+    "indicator": 0.0,
+    "clear_ctx": 0.0,
+    "paste_all": 0.0,
+    "repeat_prev": 0.0,
+    "exit": 0.0,
+}
+
+auth_mode = "license"
+server_url = DEFAULT_SERVER_URL
+license_code = ""
+api_key = ""
+model_name = DEFAULT_MODEL_NAME
+device_id = ""
+
+session_lock = Lock()
+session_id = ""
+session_token = ""
+session_status_text = "Not authenticated"
+session_active = False
+user_email = ""
+license_hint = ""
+heartbeat_interval_seconds = 20
+heartbeat_timeout_seconds = 90
+
+local_model = None
+local_chat_session = None
+api_backend_name = "none"
+
+heartbeat_stop_event = Event()
+heartbeat_thread = None
+
+tray_icon = None
+indicator = None
+privacy_guard_thread = None
+privacy_guard_stop_event = Event()
+privacy_forced_hidden = False
+indicator_manual_hidden = False
+indicator_capture_protected = False
+
+INDICATOR_VISIBLE_BY_DEFAULT = os.environ.get("EAE_SHOW_INDICATOR", "").strip().lower() not in {"0", "false", "no", "off"}
+HIDE_INDICATOR_FROM_CAPTURE = os.environ.get("EAE_HIDE_INDICATOR_FROM_CAPTURE", "").strip().lower() not in {"0", "false", "no", "off"}
+STRICT_PRIVACY_FALLBACK = os.environ.get("EAE_STRICT_PRIVACY_FALLBACK", "").strip().lower() in {"1", "true", "yes", "on"}
+PRIVACY_GUARD_INTERVAL_SECONDS = 2.0
+PRIVACY_GUARD_PROCESSES = {
+    "discord.exe",
+    "obs64.exe",
+    "obs32.exe",
+    "teams.exe",
+    "ms-teams.exe",
+    "zoom.exe",
+    "webexmta.exe",
+    "slack.exe",
+}
+PRIVACY_MEET_BROWSERS = {
+    "chrome.exe",
+    "msedge.exe",
+    "brave.exe",
+    "opera.exe",
+    "firefox.exe",
+}
+PRIVACY_MEET_WINDOW_KEYWORDS = ("google meet", " meet", "meet ")
+
+UI_BG = "#E6EDF8"
+UI_CARD_BG = "#F4F8FF"
+UI_PANEL_BG = "#FFFFFF"
+UI_FIELD_BG = "#F9FBFF"
+UI_TEXT = "#102A56"
+UI_MUTED = "#4C6082"
+UI_BORDER = "#C7D7F2"
+UI_SOFT = "#DEE9FF"
+UI_PRIMARY = "#1459D9"
+UI_PRIMARY_ACTIVE = "#0F46AD"
+UI_PRIMARY_SOFT = "#9FBBF5"
+UI_GHOST_BG = "#EDF3FF"
+UI_GHOST_ACTIVE = "#DFEAFE"
+UI_DANGER = "#BA1A1A"
+UI_ACCENT = "#1C77FF"
+UI_FONT = "Segoe UI Variable Text"
 
 
 def resolve_install_root():
@@ -49,26 +151,29 @@ def resolve_data_dir(install_root):
         probe = portable_data_dir / ".write_probe"
         probe.write_text("ok", encoding="utf-8")
         probe.unlink()
-        return portable_data_dir, False
+        return portable_data_dir
     except Exception:
         fallback_data_dir = Path(os.environ.get("APPDATA", ".")) / APP_NAME
         fallback_data_dir.mkdir(parents=True, exist_ok=True)
-        return fallback_data_dir, True
+        return fallback_data_dir
 
 
 APP_INSTALL_ROOT = resolve_install_root()
-APP_DATA_DIR, USING_FALLBACK_DATA_DIR = resolve_data_dir(APP_INSTALL_ROOT)
-AUTH_FILE = APP_DATA_DIR / "auth.json"
-CONFIG_FILE = APP_DATA_DIR / "config.json"
-
-API_KEY_ENV_VAR = "EYESANDEARS_API_KEY"
-runtime_api_key = ""
-DEFAULT_WINGET_PACKAGE_ID = os.environ.get("EYESANDEARS_WINGET_ID", "").strip()
-SELF_UNINSTALL_DELAY_SECONDS = 2
-CRYPTPROTECT_UI_FORBIDDEN = 0x01
-SW_HIDE = 0
+APP_DATA_DIR = resolve_data_dir(APP_INSTALL_ROOT)
+CONFIG_FILE = APP_DATA_DIR / CONFIG_FILE_NAME
 
 if os.name == "nt":
+    HRESULT = getattr(wintypes, "HRESULT", ctypes.c_long)
+    WDA_NONE = 0x0
+    WDA_MONITOR = 0x1
+    WDA_EXCLUDEFROMCAPTURE = 0x11
+    GA_ROOT = 2
+    DWMWA_USE_IMMERSIVE_DARK_MODE = 20
+    DWMWA_WINDOW_CORNER_PREFERENCE = 33
+    DWMWA_SYSTEMBACKDROP_TYPE = 38
+    DWMWCP_ROUND = 2
+    DWMSBT_MAINWINDOW = 2
+
     class DATA_BLOB(ctypes.Structure):
         _fields_ = [
             ("cbData", wintypes.DWORD),
@@ -77,6 +182,9 @@ if os.name == "nt":
 
     _crypt32 = ctypes.windll.crypt32
     _kernel32 = ctypes.windll.kernel32
+    _user32 = ctypes.windll.user32
+    _dwmapi = ctypes.windll.dwmapi
+    _gdi32 = ctypes.windll.gdi32
     _crypt32.CryptProtectData.argtypes = [
         ctypes.POINTER(DATA_BLOB),
         wintypes.LPCWSTR,
@@ -99,120 +207,36 @@ if os.name == "nt":
     _crypt32.CryptUnprotectData.restype = wintypes.BOOL
     _kernel32.LocalFree.argtypes = [wintypes.HLOCAL]
     _kernel32.LocalFree.restype = wintypes.HLOCAL
-
-# Smartest Gemini model (per Gemini models doc)
-MODEL_NAME = "gemini-2.5-flash"  # you can swap to "gemini-2.5-flash" for cheaper/faster :contentReference[oaicite:2]{index=2}
-
-# Keep the SAME prompt you provided (unchanged):
-PROMPT_TEXT = (
-    "Analyze the image provided. Your goal is to provide the direct answer/solution and NOTHING else.\n\n"
-    "RULES:\n"
-    "1. If it is a Multiple Choice Question: Output ONLY the correct letter (e.g., 'A', 'B'). Do not write the text of the option.\n"
-    "2. If it is a coding error/task: Output ONLY the corrected code block. Do not use Markdown formatting (no python ... ). Just the raw code ready to run.\n"
-    "3. If it is a general question: Output ONLY the direct answer.\n"
-    "4. ABSOLUTELY NO conversational filler, no 'Here is the answer', no explanations, no markdown backticks.\n"
-    "5. If unclear, find the most likely question on screen and answer it."
-)
-
-# === GLOBAL VARIABLES ===
-current_answer = ""
-current_index = 0
-is_processing = False
-is_paused = False
-pause_pending = False
-typing_hook = None
-write_lock = Lock()
-hotkey_block_until = {"primary": 0.0, "indicator": 0.0, "exit": 0.0, "clear_ctx": 0.0}
-
-# Per-launch context objects
-model = None
-chat_session = None
-tray_icon = None
-
-# === STATUS INDICATOR ===
-class StatusIndicator:
-    def __init__(self):
-        self.root = tk.Tk()
-        self.root.overrideredirect(True)
-        self.root.attributes("-topmost", True)
-        self.root.attributes("-alpha", 1.0)
-        self.hidden = False
-
-        screen_width = self.root.winfo_screenwidth()
-        screen_height = self.root.winfo_screenheight()
-
-        size = 10
-        x = screen_width - size - 10
-        y = screen_height - size - 50
-
-        self.root.geometry(f"{size}x{size}+{x}+{y}")
-
-        self.canvas = tk.Canvas(self.root, width=size, height=size, highlightthickness=0, bg="black")
-        self.canvas.pack()
-
-        self.set_idle()
-
-    def set_idle(self):
-        self.canvas.configure(bg="#404040")
-
-    def set_processing(self):
-        self.canvas.configure(bg="#FFA500")
-
-    def set_ready(self):
-        self.canvas.configure(bg="#00FF00")
-
-    def set_paused(self):
-        self.canvas.configure(bg="#1E90FF")
-
-    def hide(self):
-        if not self.hidden:
-            self.root.withdraw()
-            self.hidden = True
-
-    def show(self):
-        if self.hidden:
-            self.root.deiconify()
-            self.root.attributes("-topmost", True)
-            self.hidden = False
-
-    def run(self):
-        self.root.mainloop()
-
-
-indicator = None
-
-def init_indicator():
-    global indicator
-    indicator = StatusIndicator()
-    indicator.run()
-
-
-# === INDICATOR HELPERS ===
-def indicator_call(func):
-    if not indicator:
-        return
-    try:
-        indicator.root.after(0, func)
-    except Exception:
-        pass
-
-def indicator_set_idle():
-    indicator_call(indicator.set_idle)
-
-def indicator_set_processing():
-    indicator_call(indicator.set_processing)
-
-def indicator_set_ready():
-    indicator_call(indicator.set_ready)
-
-def indicator_set_paused():
-    indicator_call(indicator.set_paused)
-
-def indicator_hide():
-    indicator_call(indicator.hide)
-
-def indicator_show():
-    indicator_call(indicator.show)
+    _user32.SetWindowDisplayAffinity.argtypes = [wintypes.HWND, wintypes.DWORD]
+    _user32.SetWindowDisplayAffinity.restype = wintypes.BOOL
+    _user32.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
+    _user32.GetAncestor.restype = wintypes.HWND
+    _user32.GetForegroundWindow.argtypes = []
+    _user32.GetForegroundWindow.restype = wintypes.HWND
+    _user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    _user32.GetWindowTextW.restype = ctypes.c_int
+    _user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+    _user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+    _user32.SetWindowRgn.argtypes = [wintypes.HWND, wintypes.HANDLE, wintypes.BOOL]
+    _user32.SetWindowRgn.restype = ctypes.c_int
+    _dwmapi.DwmSetWindowAttribute.argtypes = [
+        wintypes.HWND,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+    ]
+    _dwmapi.DwmSetWindowAttribute.restype = HRESULT
+    _gdi32.CreateRoundRectRgn.argtypes = [
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+    ]
+    _gdi32.CreateRoundRectRgn.restype = wintypes.HANDLE
+    _gdi32.DeleteObject.argtypes = [wintypes.HANDLE]
+    _gdi32.DeleteObject.restype = wintypes.BOOL
 
 
 def hide_console_window():
@@ -226,138 +250,148 @@ def hide_console_window():
         pass
 
 
-def build_tray_image():
-    image = PIL.Image.new("RGB", (64, 64), "#1F2937")
-    draw = PIL.ImageDraw.Draw(image)
-    draw.ellipse((14, 14, 50, 50), fill="#22C55E")
-    draw.ellipse((24, 24, 40, 40), fill="#111827")
-    return image
-
-
-def tray_toggle_indicator(icon, item):
-    if not indicator:
-        return
-    if indicator.hidden:
-        indicator_show()
-    else:
-        indicator_hide()
-
-
-def tray_exit(icon, item):
-    exit_program(trigger_uninstall=False)
-
-
-def run_tray_icon():
-    global tray_icon
-    if pystray is None:
-        return
-    tray_icon = pystray.Icon(
-        "EyesAndEars",
-        build_tray_image(),
-        "EyesAndEars",
-        pystray.Menu(
-            pystray.MenuItem("Toggle Indicator", tray_toggle_indicator),
-            pystray.MenuItem("Exit", tray_exit),
-        ),
-    )
-    tray_icon.run()
-
-
-# === PASSWORD GATE ===
-def prompt_secret(prompt_text):
+def set_window_capture_excluded(hwnd, enabled=True):
+    if os.name != "nt":
+        return False
     try:
-        return getpass.getpass(prompt_text)
-    except Exception:
-        return input(prompt_text)
-
-
-def password_hash(password, salt_hex):
-    salt = bytes.fromhex(salt_hex)
-    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 250000)
-    return digest.hex()
-
-
-def load_auth_record():
-    if not AUTH_FILE.exists():
-        return None
-    try:
-        record = json.loads(AUTH_FILE.read_text(encoding="utf-8"))
-    except Exception:
-        return None
-    if not isinstance(record, dict):
-        return None
-    if "salt" not in record or "hash" not in record:
-        return None
-    return record
-
-
-def save_auth_record(salt_hex, hash_hex):
-    APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
-    record = {"salt": salt_hex, "hash": hash_hex}
-    AUTH_FILE.write_text(json.dumps(record), encoding="utf-8")
-
-
-def setup_password():
-    print("\nFirst run setup: create a password to unlock this app.")
-    while True:
-        first = prompt_secret("New password: ").strip()
-        second = prompt_secret("Confirm password: ").strip()
-
-        if len(first) < PASSWORD_MIN_LENGTH:
-            print(f"Password must be at least {PASSWORD_MIN_LENGTH} characters.")
-            continue
-        if first != second:
-            print("Passwords do not match. Try again.")
-            continue
-
-        salt_hex = secrets.token_hex(16)
-        hash_hex = password_hash(first, salt_hex)
-        save_auth_record(salt_hex, hash_hex)
-        print("Password saved.")
-        return True
-
-
-def verify_password(record):
-    for attempt in range(1, MAX_PASSWORD_ATTEMPTS + 1):
-        entered = prompt_secret("Enter app password: ")
-        entered_hash = password_hash(entered, record["salt"])
-        if hmac.compare_digest(entered_hash, record["hash"]):
-            print("Access granted.")
-            return True
-        print(f"Invalid password ({attempt}/{MAX_PASSWORD_ATTEMPTS}).")
-    return False
-
-
-def enforce_password_gate():
-    record = load_auth_record()
-    if record is None:
-        if AUTH_FILE.exists():
-            print("Auth record is invalid. Remove auth.json to reset password.")
+        normalized = int(hwnd or 0)
+        if not normalized:
             return False
-        return setup_password()
-    print("\nPassword required.")
-    if verify_password(record):
-        return True
-    print("Too many failed attempts. Exiting.")
-    return False
-
-
-# === APP CONFIG ===
-def load_config_record():
-    if not CONFIG_FILE.exists():
-        return {}
-    try:
-        record = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+        top_level = int(_user32.GetAncestor(wintypes.HWND(normalized), GA_ROOT) or 0)
+        if top_level:
+            normalized = top_level
+        if not enabled:
+            return bool(_user32.SetWindowDisplayAffinity(wintypes.HWND(normalized), WDA_NONE))
+        # Preferred (Win10 2004+): completely exclude from capture.
+        if _user32.SetWindowDisplayAffinity(wintypes.HWND(normalized), WDA_EXCLUDEFROMCAPTURE):
+            return True
+        # Fallback: capture sees a blank/black window while user still sees it locally.
+        return bool(_user32.SetWindowDisplayAffinity(wintypes.HWND(normalized), WDA_MONITOR))
     except Exception:
-        return {}
-    if not isinstance(record, dict):
-        return {}
-    return record
+        return False
 
 
-def save_config_record(record):
-    APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
-    CONFIG_FILE.write_text(json.dumps(record), encoding="utf-8")
+def apply_capture_privacy_to_window(window, enabled=True):
+    if os.name != "nt" or window is None:
+        return False
+    try:
+        if not window.winfo_exists():
+            return False
+        window.update_idletasks()
+        return set_window_capture_excluded(window.winfo_id(), enabled=enabled)
+    except Exception:
+        return False
+
+
+def schedule_window_privacy_refresh(window, refresh_ms=1800):
+    if os.name != "nt" or not HIDE_INDICATOR_FROM_CAPTURE or window is None:
+        return
+    if getattr(window, "_eae_privacy_refresh_enabled", False):
+        return
+    window._eae_privacy_refresh_enabled = True
+
+    def _tick():
+        try:
+            if not window.winfo_exists():
+                return
+            apply_capture_privacy_to_window(window, enabled=True)
+            window.after(refresh_ms, _tick)
+        except Exception:
+            pass
+
+    try:
+        window.after(80, _tick)
+    except Exception:
+        pass
+
+
+def configure_private_window(window, *, dark=False, refresh_ms=1800):
+    apply_win11_window_style(window, dark=dark)
+    if HIDE_INDICATOR_FROM_CAPTURE:
+        apply_capture_privacy_to_window(window, enabled=True)
+        schedule_window_privacy_refresh(window, refresh_ms=refresh_ms)
+
+
+def apply_window_corner_region(window, radius):
+    if os.name != "nt" or window is None:
+        return False
+    try:
+        if not window.winfo_exists():
+            return False
+        window.update_idletasks()
+        width = int(max(1, window.winfo_width()))
+        height = int(max(1, window.winfo_height()))
+        radius = int(max(2, min(radius, width // 2, height // 2)))
+        region = _gdi32.CreateRoundRectRgn(0, 0, width + 1, height + 1, radius * 2, radius * 2)
+        if not region:
+            return False
+        hwnd = wintypes.HWND(window.winfo_id())
+        applied = bool(_user32.SetWindowRgn(hwnd, region, True))
+        if not applied:
+            _gdi32.DeleteObject(region)
+        return applied
+    except Exception:
+        return False
+
+
+def draw_rounded_canvas_rect(canvas, x1, y1, x2, y2, radius, **kwargs):
+    radius = int(max(0, min(radius, (x2 - x1) // 2, (y2 - y1) // 2)))
+    if radius <= 0:
+        return canvas.create_rectangle(x1, y1, x2, y2, **kwargs)
+    points = [
+        x1 + radius, y1,
+        x1 + radius, y1,
+        x2 - radius, y1,
+        x2 - radius, y1,
+        x2, y1,
+        x2, y1 + radius,
+        x2, y1 + radius,
+        x2, y2 - radius,
+        x2, y2 - radius,
+        x2, y2,
+        x2 - radius, y2,
+        x2 - radius, y2,
+        x1 + radius, y2,
+        x1 + radius, y2,
+        x1, y2,
+        x1, y2 - radius,
+        x1, y2 - radius,
+        x1, y1 + radius,
+        x1, y1 + radius,
+        x1, y1,
+    ]
+    return canvas.create_polygon(points, smooth=True, splinesteps=24, **kwargs)
+
+
+def apply_win11_window_style(window, dark=False):
+    if os.name != "nt":
+        return
+    try:
+        window.update_idletasks()
+        hwnd = wintypes.HWND(window.winfo_id())
+        rounded = ctypes.c_int(DWMWCP_ROUND)
+        backdrop = ctypes.c_int(DWMSBT_MAINWINDOW)
+        dark_mode = ctypes.c_int(1 if dark else 0)
+        _dwmapi.DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_WINDOW_CORNER_PREFERENCE,
+            ctypes.byref(rounded),
+            ctypes.sizeof(rounded),
+        )
+        _dwmapi.DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_SYSTEMBACKDROP_TYPE,
+            ctypes.byref(backdrop),
+            ctypes.sizeof(backdrop),
+        )
+        _dwmapi.DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_USE_IMMERSIVE_DARK_MODE,
+            ctypes.byref(dark_mode),
+            ctypes.sizeof(dark_mode),
+        )
+    except Exception:
+        pass
 
 
 def bytes_to_blob(raw_bytes):
@@ -378,11 +412,11 @@ def encrypt_with_dpapi(plain_text):
     if os.name != "nt":
         return ""
     plain_bytes = plain_text.encode("utf-8")
-    in_blob, in_buf = bytes_to_blob(plain_bytes)
+    in_blob, _ = bytes_to_blob(plain_bytes)
     out_blob = DATA_BLOB()
     if not _crypt32.CryptProtectData(
         ctypes.byref(in_blob),
-        "EyesAndEars API Key",
+        "EyesAndEars Secret",
         None,
         None,
         None,
@@ -404,8 +438,7 @@ def decrypt_with_dpapi(cipher_b64):
         cipher_bytes = base64.b64decode(cipher_b64)
     except Exception:
         return ""
-
-    in_blob, in_buf = bytes_to_blob(cipher_bytes)
+    in_blob, _ = bytes_to_blob(cipher_bytes)
     out_blob = DATA_BLOB()
     description = wintypes.LPWSTR()
     if not _crypt32.CryptUnprotectData(
@@ -418,7 +451,6 @@ def decrypt_with_dpapi(cipher_b64):
         ctypes.byref(out_blob),
     ):
         return ""
-
     try:
         plain_bytes = blob_to_bytes(out_blob)
         return plain_bytes.decode("utf-8")
@@ -430,83 +462,1300 @@ def decrypt_with_dpapi(cipher_b64):
         _kernel32.LocalFree(out_blob.pbData)
 
 
-def load_saved_api_key(record):
-    encrypted_key = str(record.get("api_key_dpapi", "")).strip()
-    if encrypted_key:
-        decrypted_key = decrypt_with_dpapi(encrypted_key)
-        if decrypted_key:
-            return decrypted_key
-
-    # Legacy fallback: migrate plaintext key to DPAPI.
-    legacy_key = str(record.get("api_key", "")).strip()
-    if legacy_key:
-        encrypted_key = encrypt_with_dpapi(legacy_key)
-        if encrypted_key:
-            record.pop("api_key", None)
-            record["api_key_dpapi"] = encrypted_key
-            save_config_record(record)
-            return legacy_key
-
-        # Do not continue using plaintext on Windows if migration fails.
-        if os.name == "nt":
-            print("Stored API key is plaintext and could not be secured. Re-enter key.")
-            record.pop("api_key", None)
-            save_config_record(record)
-            return ""
-
-        return legacy_key
-    return ""
-
-
-def prompt_api_key_cmd():
-    print("Paste your Gemini API key in this CMD window, then press Enter.")
+def load_config_record():
+    if not CONFIG_FILE.exists():
+        return {}
     try:
-        return input("Gemini API key: ").strip()
-    except EOFError:
-        return ""
+        data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            return data
+    except Exception:
+        pass
+    return {}
 
 
-def resolve_api_key():
-    env_key = os.environ.get(API_KEY_ENV_VAR, "").strip()
-    if env_key:
-        return env_key
+def save_config_record(record):
+    APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
+    CONFIG_FILE.write_text(json.dumps(record, indent=2), encoding="utf-8")
 
-    record = load_config_record()
-    saved_key = load_saved_api_key(record)
-    if saved_key:
-        return saved_key
 
-    print("\nFirst run setup: API key required.")
-    for _ in range(3):
-        entered_key = prompt_api_key_cmd()
-        if entered_key:
-            encrypted_key = encrypt_with_dpapi(entered_key)
-            record.pop("api_key", None)
-            if encrypted_key:
-                record["api_key_dpapi"] = encrypted_key
-            elif os.name != "nt":
-                record["api_key"] = entered_key
-            else:
-                print("Could not securely store API key. Try again.")
-                continue
+def load_saved_secret(record, plain_key, encrypted_key):
+    encrypted = str(record.get(encrypted_key, "")).strip()
+    if encrypted:
+        decrypted = decrypt_with_dpapi(encrypted)
+        if decrypted:
+            return decrypted
+    legacy = str(record.get(plain_key, "")).strip()
+    if legacy:
+        encrypted = encrypt_with_dpapi(legacy)
+        if encrypted:
+            record[encrypted_key] = encrypted
+            record.pop(plain_key, None)
             save_config_record(record)
-            print("API key saved for future runs.")
-            return entered_key
-        print("API key cannot be empty.")
+        return legacy
     return ""
 
 
-# === HOTKEY / STATE HELPERS ===
+def save_secret(record, plain_key, encrypted_key, value):
+    encrypted = encrypt_with_dpapi(value)
+    record.pop(plain_key, None)
+    if encrypted:
+        record[encrypted_key] = encrypted
+    elif os.name != "nt":
+        record[plain_key] = value
+    else:
+        return False
+    save_config_record(record)
+    return True
+
+
+def find_env_api_key():
+    for env_name in API_KEY_ENV_FALLBACK:
+        value = os.environ.get(env_name, "").strip()
+        if value:
+            return value
+    return ""
+
+
+def center_window(window, width, height):
+    window.update_idletasks()
+    screen_width = window.winfo_screenwidth()
+    screen_height = window.winfo_screenheight()
+    x = max(0, (screen_width - width) // 2)
+    y = max(0, (screen_height - height) // 2)
+    window.geometry(f"{width}x{height}+{x}+{y}")
+
+
+def fit_window_to_content(window, min_width=0, min_height=0, max_width=0, max_height=0):
+    try:
+        window.update_idletasks()
+        target_width = max(int(min_width), int(window.winfo_width()), int(window.winfo_reqwidth()))
+        target_height = max(int(min_height), int(window.winfo_height()), int(window.winfo_reqheight()))
+        if max_width:
+            target_width = min(target_width, int(max_width))
+        if max_height:
+            target_height = min(target_height, int(max_height))
+        center_window(window, target_width, target_height)
+    except Exception:
+        pass
+
+
+def make_dialog_shell(title, width, height, parent=None):
+    root = tk.Toplevel(parent) if parent else tk.Tk()
+    root.title(title)
+    root.configure(bg=UI_BG)
+    root.resizable(False, False)
+    center_window(root, width, height)
+    configure_private_window(root, dark=False)
+    if parent:
+        try:
+            root.transient(parent)
+        except Exception:
+            pass
+    root.lift()
+    try:
+        root.attributes("-topmost", True)
+        root.after(250, lambda: root.attributes("-topmost", False))
+    except Exception:
+        pass
+
+    shell = tk.Frame(root, bg=UI_BG, bd=0)
+    shell.pack(fill="both", expand=True, padx=18, pady=16)
+
+    accent = tk.Frame(shell, bg=UI_ACCENT, height=5, bd=0)
+    accent.pack(fill="x", pady=(0, 10))
+
+    card = tk.Frame(
+        shell,
+        bg=UI_CARD_BG,
+        highlightbackground=UI_BORDER,
+        highlightthickness=1,
+        bd=0,
+    )
+    card.pack(fill="both", expand=True)
+    return root, card
+
+
+def style_button(widget, *, primary=False, active=False):
+    if primary:
+        widget.configure(
+            bg=UI_PRIMARY,
+            fg="white",
+            activebackground=UI_PRIMARY_ACTIVE,
+            activeforeground="white",
+            highlightbackground=UI_PRIMARY,
+            highlightcolor=UI_PRIMARY,
+        )
+        return
+    if active:
+        widget.configure(
+            bg=UI_SOFT,
+            fg=UI_TEXT,
+            activebackground=UI_SOFT,
+            activeforeground=UI_TEXT,
+            highlightbackground=UI_SOFT,
+            highlightcolor=UI_SOFT,
+        )
+        return
+    widget.configure(
+        bg=UI_GHOST_BG,
+        fg=UI_TEXT,
+        activebackground=UI_GHOST_ACTIVE,
+        activeforeground=UI_TEXT,
+        highlightbackground=UI_BORDER,
+        highlightcolor=UI_BORDER,
+    )
+
+
+def show_styled_message(title, message, is_error=False, ask_retry=False, parent=None):
+    result = {"value": False}
+    message_text = str(message or "")
+    base_height = 350 if ask_retry else 330
+    line_count = message_text.count("\n") + 1
+    estimated_height = min(600, base_height + max(0, line_count - 6) * 14 + max(0, len(message_text) - 260) // 20)
+    root, card = make_dialog_shell(title, 620, estimated_height, parent=parent)
+
+    heading = "Connection issue" if ask_retry else ("Error" if is_error else "Information")
+    heading_color = UI_DANGER if is_error else UI_TEXT
+
+    header = tk.Frame(card, bg=UI_CARD_BG, bd=0)
+    header.pack(fill="x", padx=28, pady=(24, 10))
+    tk.Label(header, text=heading, bg=UI_CARD_BG, fg=heading_color, font=(UI_FONT, 20, "bold")).pack(anchor="w")
+
+    content = tk.Frame(card, bg=UI_PANEL_BG, highlightbackground=UI_BORDER, highlightthickness=1, bd=0)
+    content.pack(fill="both", expand=True, padx=28, pady=(0, 12))
+    tk.Label(
+        content,
+        text=message_text,
+        bg=UI_PANEL_BG,
+        fg=UI_TEXT,
+        font=(UI_FONT, 11),
+        justify="left",
+        wraplength=530,
+    ).pack(anchor="w", padx=16, pady=16)
+
+    button_bar = tk.Frame(card, bg=UI_CARD_BG, bd=0)
+    button_bar.pack(fill="x", padx=28, pady=(0, 22))
+
+    def close_with(value=False):
+        result["value"] = value
+        root.destroy()
+
+    if ask_retry:
+        exit_btn = tk.Button(
+            button_bar,
+            text="Exit",
+            command=lambda: close_with(False),
+            relief="flat",
+            bd=0,
+            padx=18,
+            pady=10,
+            font=(UI_FONT, 10, "bold"),
+            cursor="hand2",
+        )
+        style_button(exit_btn, primary=False)
+        exit_btn.pack(side="right")
+
+        retry_btn = tk.Button(
+            button_bar,
+            text="Retry Login",
+            command=lambda: close_with(True),
+            relief="flat",
+            bd=0,
+            padx=18,
+            pady=10,
+            font=(UI_FONT, 10, "bold"),
+            cursor="hand2",
+        )
+        style_button(retry_btn, primary=True)
+        retry_btn.pack(side="right", padx=(0, 10))
+    else:
+        close_btn = tk.Button(
+            button_bar,
+            text="OK",
+            command=root.destroy,
+            relief="flat",
+            bd=0,
+            padx=20,
+            pady=10,
+            font=(UI_FONT, 10, "bold"),
+            cursor="hand2",
+        )
+        style_button(close_btn, primary=True)
+        close_btn.pack(side="right")
+
+    fit_window_to_content(root, min_width=620, min_height=estimated_height, max_width=820, max_height=620)
+    root.protocol("WM_DELETE_WINDOW", root.destroy if not ask_retry else lambda: close_with(False))
+    root.bind("<Escape>", lambda _event: root.destroy() if not ask_retry else close_with(False))
+    if parent:
+        try:
+            root.grab_set()
+            parent.wait_window(root)
+        except Exception:
+            pass
+    else:
+        root.mainloop()
+    return bool(result["value"])
+
+
+def prompt_startup_auth(initial_server_url, initial_license, initial_api_key):
+    result = {"value": None}
+    root, card = make_dialog_shell(f"{APP_NAME} Sign In", 780, 620)
+
+    mode_var = tk.StringVar(value="license")
+    server_var = tk.StringVar(value=(initial_server_url or DEFAULT_SERVER_URL or "http://localhost:8000"))
+    license_var = tk.StringVar(value=initial_license or "")
+    api_var = tk.StringVar(value=initial_api_key or "")
+    show_api_var = tk.BooleanVar(value=False)
+    error_var = tk.StringVar(value="")
+
+    if not initial_license and initial_api_key:
+        mode_var.set("api")
+
+    header = tk.Frame(card, bg=UI_CARD_BG, bd=0)
+    header.pack(fill="x", padx=30, pady=(24, 10))
+    tk.Label(header, text="Eyes & Ears", bg=UI_CARD_BG, fg=UI_TEXT, font=(UI_FONT, 31, "bold")).pack(anchor="w", pady=(0, 2))
+    tk.Label(
+        header,
+        text="Private startup authentication",
+        bg=UI_CARD_BG,
+        fg=UI_MUTED,
+        font=(UI_FONT, 12),
+    ).pack(anchor="w")
+    tk.Label(
+        header,
+        text="Numpad 1 capture  |  Numpad 0 indicator  |  Numpad 9 quit",
+        bg=UI_CARD_BG,
+        fg=UI_MUTED,
+        font=(UI_FONT, 9),
+    ).pack(anchor="w", pady=(6, 0))
+
+    switch_shell = tk.Frame(card, bg=UI_SOFT, highlightbackground=UI_BORDER, highlightthickness=1, bd=0)
+    switch_shell.pack(fill="x", padx=30, pady=(0, 12))
+    mode_license_btn = tk.Button(
+        switch_shell,
+        text="Use Subscription Code",
+        relief="flat",
+        bd=0,
+        padx=16,
+        pady=11,
+        font=(UI_FONT, 11, "bold"),
+        cursor="hand2",
+        command=lambda: set_mode("license"),
+    )
+    mode_api_btn = tk.Button(
+        switch_shell,
+        text="Use My API Key",
+        relief="flat",
+        bd=0,
+        padx=16,
+        pady=11,
+        font=(UI_FONT, 11, "bold"),
+        cursor="hand2",
+        command=lambda: set_mode("api"),
+    )
+    mode_license_btn.pack(side="left", fill="x", expand=True, padx=(6, 3), pady=6)
+    mode_api_btn.pack(side="left", fill="x", expand=True, padx=(3, 6), pady=6)
+
+    form_panel = tk.Frame(card, bg=UI_PANEL_BG, highlightbackground=UI_BORDER, highlightthickness=1, bd=0)
+    form_panel.pack(fill="both", expand=True, padx=30, pady=(0, 12))
+    form_content = tk.Frame(form_panel, bg=UI_PANEL_BG, bd=0)
+    form_content.pack(fill="both", expand=True, padx=18, pady=16)
+
+    license_frame = tk.Frame(form_content, bg=UI_PANEL_BG, bd=0)
+    api_frame = tk.Frame(form_content, bg=UI_PANEL_BG, bd=0)
+
+    def make_labeled_entry(parent, label_text, var, *, show=None):
+        tk.Label(parent, text=label_text, bg=UI_PANEL_BG, fg=UI_TEXT, font=(UI_FONT, 10, "bold")).pack(anchor="w", pady=(0, 6))
+        field = tk.Frame(parent, bg=UI_FIELD_BG, highlightbackground=UI_BORDER, highlightthickness=1, bd=0)
+        field.pack(fill="x")
+        entry = tk.Entry(
+            field,
+            textvariable=var,
+            show=show if show else "",
+            bg=UI_FIELD_BG,
+            fg=UI_TEXT,
+            relief="flat",
+            bd=0,
+            insertbackground=UI_TEXT,
+            font=(UI_FONT, 11),
+        )
+        entry.pack(fill="x", padx=12, pady=10)
+        return entry
+
+    server_entry = make_labeled_entry(license_frame, "Server URL", server_var)
+    tk.Label(
+        license_frame,
+        text="Your subscription server endpoint",
+        bg=UI_PANEL_BG,
+        fg=UI_MUTED,
+        font=(UI_FONT, 9),
+    ).pack(anchor="w", pady=(4, 12))
+
+    license_entry = make_labeled_entry(license_frame, "Subscription code (name + 6 digits)", license_var)
+    tk.Label(
+        license_frame,
+        text="Example: FEDI123456",
+        bg=UI_PANEL_BG,
+        fg=UI_MUTED,
+        font=(UI_FONT, 9),
+    ).pack(anchor="w", pady=(4, 0))
+
+    api_entry = make_labeled_entry(api_frame, "Gemini API key", api_var, show="*")
+    api_options = tk.Frame(api_frame, bg=UI_PANEL_BG, bd=0)
+    api_options.pack(fill="x", pady=(8, 0))
+
+    def toggle_show_api():
+        show_api = not show_api_var.get()
+        show_api_var.set(show_api)
+        api_entry.configure(show="" if show_api else "*")
+        show_api_btn.configure(text="Hide API key" if show_api else "Show API key")
+
+    show_api_btn = tk.Button(
+        api_options,
+        text="Show API key",
+        command=toggle_show_api,
+        relief="flat",
+        bd=0,
+        padx=12,
+        pady=6,
+        font=(UI_FONT, 9, "bold"),
+        cursor="hand2",
+    )
+    style_button(show_api_btn, primary=False)
+    show_api_btn.pack(side="left")
+
+    tk.Label(
+        api_frame,
+        text="Stored locally with Windows data protection (DPAPI).",
+        bg=UI_PANEL_BG,
+        fg=UI_MUTED,
+        font=(UI_FONT, 9),
+    ).pack(anchor="w", pady=(10, 0))
+
+    info_row = tk.Frame(card, bg=UI_CARD_BG, bd=0)
+    info_row.pack(fill="x", padx=30, pady=(0, 2))
+    tk.Label(
+        info_row,
+        text="DPAPI-protected local secrets and capture-privacy window mode enabled",
+        bg=UI_CARD_BG,
+        fg=UI_MUTED,
+        font=(UI_FONT, 9),
+    ).pack(anchor="w")
+
+    tk.Label(card, textvariable=error_var, bg=UI_CARD_BG, fg=UI_DANGER, font=(UI_FONT, 10, "bold")).pack(
+        fill="x", anchor="w", padx=30, pady=(2, 4)
+    )
+
+    button_bar = tk.Frame(card, bg=UI_CARD_BG, bd=0)
+    button_bar.pack(fill="x", padx=30, pady=(0, 24))
+
+    def on_cancel():
+        result["value"] = None
+        root.destroy()
+
+    def on_continue():
+        error_var.set("")
+        selected_mode = mode_var.get().strip()
+        if selected_mode == "license":
+            entered_server = server_var.get().strip().rstrip("/")
+            if not entered_server:
+                entered_server = (initial_server_url or DEFAULT_SERVER_URL or "http://localhost:8000").strip().rstrip("/")
+            entered_license = license_var.get().strip()
+            if not entered_license:
+                error_var.set("Please enter your subscription code.")
+                license_entry.focus_set()
+                return
+            result["value"] = {
+                "mode": "license",
+                "server_url": entered_server,
+                "license_code": entered_license,
+            }
+        else:
+            entered_api_key = api_var.get().strip()
+            if not entered_api_key:
+                error_var.set("Please enter your Gemini API key.")
+                api_entry.focus_set()
+                return
+            result["value"] = {"mode": "api", "api_key": entered_api_key}
+        root.destroy()
+
+    cancel_btn = tk.Button(
+        button_bar,
+        text="Cancel",
+        command=on_cancel,
+        relief="flat",
+        bd=0,
+        padx=20,
+        pady=10,
+        font=(UI_FONT, 10, "bold"),
+        cursor="hand2",
+    )
+    style_button(cancel_btn, primary=False)
+    cancel_btn.pack(side="right")
+
+    continue_btn = tk.Button(
+        button_bar,
+        text="Continue",
+        command=on_continue,
+        relief="flat",
+        bd=0,
+        padx=22,
+        pady=10,
+        font=(UI_FONT, 10, "bold"),
+        cursor="hand2",
+    )
+    style_button(continue_btn, primary=True)
+    continue_btn.pack(side="right", padx=(0, 10))
+
+    def set_mode(next_mode):
+        mode_var.set(next_mode)
+        update_mode_ui()
+
+    def update_mode_ui():
+        is_license = mode_var.get() == "license"
+        style_button(mode_license_btn, active=not is_license, primary=is_license)
+        style_button(mode_api_btn, active=is_license, primary=not is_license)
+        if is_license:
+            api_frame.pack_forget()
+            license_frame.pack(fill="x", pady=(0, 8))
+            license_entry.focus_set()
+        else:
+            license_frame.pack_forget()
+            api_frame.pack(fill="x", pady=(0, 8))
+            api_entry.focus_set()
+
+    root.protocol("WM_DELETE_WINDOW", on_cancel)
+    root.bind("<Escape>", lambda _event: on_cancel())
+    root.bind("<Return>", lambda _event: on_continue())
+    update_mode_ui()
+    fit_window_to_content(root, min_width=780, min_height=620, max_width=940, max_height=760)
+    root.mainloop()
+    return result["value"]
+
+
+def gui_ask_retry_license(message):
+    parent = indicator.root if indicator and indicator.root.winfo_exists() else None
+    return show_styled_message(APP_NAME, f"{message}\n\nRetry code login?", ask_retry=True, parent=parent)
+
+
+def gui_show_error(message):
+    parent = indicator.root if indicator and indicator.root.winfo_exists() else None
+    show_styled_message(APP_NAME, message, is_error=True, parent=parent)
+
+
+def set_session_status(text, active=None):
+    global session_status_text, session_active
+    with session_lock:
+        session_status_text = text
+        if active is not None:
+            session_active = bool(active)
+    update_tray_menu()
+
+
+def update_tray_menu():
+    global tray_icon
+    try:
+        if tray_icon:
+            tray_icon.update_menu()
+    except Exception:
+        pass
+
+
+def resolve_auth_settings():
+    global auth_mode, server_url, license_code, api_key, device_id
+    record = load_config_record()
+    env_server = os.environ.get("EAE_SERVER_URL", "").strip().rstrip("/")
+    env_license = os.environ.get("EAE_LICENSE_CODE", "").strip()
+    env_api_key = find_env_api_key()
+    saved_server = str(record.get("server_url", "")).strip().rstrip("/")
+    saved_license = load_saved_secret(record, "license_code", "license_code_dpapi")
+    saved_api_key = load_saved_secret(record, "api_key", "api_key_dpapi")
+    saved_device_id = str(record.get("device_id", "")).strip()
+    if not saved_device_id:
+        saved_device_id = secrets.token_hex(16)
+        record["device_id"] = saved_device_id
+
+    selected = prompt_startup_auth(
+        initial_server_url=env_server or saved_server or DEFAULT_SERVER_URL or "http://localhost:8000",
+        initial_license=env_license or saved_license,
+        initial_api_key=env_api_key or saved_api_key,
+    )
+    if not selected:
+        return False
+
+    selected_mode = selected["mode"]
+    if selected_mode == "license":
+        selected_server = selected["server_url"]
+        selected_license = selected["license_code"]
+        record["auth_mode"] = "license"
+        record["server_url"] = selected_server
+        if not save_secret(record, "license_code", "license_code_dpapi", selected_license):
+            gui_show_error("Could not securely save your code on this machine.")
+            return False
+        auth_mode = "license"
+        server_url = selected_server
+        license_code = selected_license
+        api_key = ""
+    else:
+        selected_api_key = selected["api_key"]
+        record["auth_mode"] = "api"
+        if not save_secret(record, "api_key", "api_key_dpapi", selected_api_key):
+            gui_show_error("Could not securely save your API key on this machine.")
+            return False
+        auth_mode = "api"
+        api_key = selected_api_key
+        license_code = ""
+
+    record["device_id"] = saved_device_id
+    save_config_record(record)
+    device_id = saved_device_id
+    return True
+
+
+def request_json(method, path, token="", json_payload=None, files=None, timeout=30):
+    url = f"{server_url}{path}"
+    headers = {}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return requests.request(
+        method=method,
+        url=url,
+        headers=headers,
+        json=json_payload,
+        files=files,
+        timeout=timeout,
+    )
+
+
+def authenticate_license_session():
+    global session_id, session_token, user_email, license_hint
+    global heartbeat_interval_seconds, heartbeat_timeout_seconds
+    payload = {
+        "license_code": license_code,
+        "device_id": device_id,
+        "device_name": os.environ.get("COMPUTERNAME", os.environ.get("HOSTNAME", "Windows")),
+        "app_version": APP_VERSION,
+    }
+    try:
+        response = request_json("POST", "/api/v1/client/authenticate", json_payload=payload, timeout=20)
+    except Exception as exc:
+        return False, f"Could not connect to server.\n{exc}"
+
+    try:
+        data = response.json()
+    except Exception:
+        return False, f"Server returned non-JSON response ({response.status_code})."
+    if not response.ok:
+        message = data.get("detail") if isinstance(data, dict) else ""
+        return False, f"Authentication request failed ({response.status_code}). {message}"
+    if not data.get("success"):
+        return False, data.get("message", "Authentication denied.")
+
+    with session_lock:
+        session_id = data.get("session_id", "")
+        session_token = data.get("session_token", "")
+        user_email = data.get("user_email", "")
+        license_hint = data.get("license_hint", "")
+        heartbeat_interval_seconds = int(data.get("heartbeat_interval_seconds", 20))
+        heartbeat_timeout_seconds = int(data.get("heartbeat_timeout_seconds", 90))
+    set_session_status("Code mode active / Session active", active=True)
+    return True, "Authenticated"
+
+
+def ensure_license_mode_ready():
+    global server_url, license_code
+    while True:
+        ok, message = authenticate_license_session()
+        if ok:
+            return True
+        set_session_status(f"Code mode disconnected: {message}", active=False)
+        if not gui_ask_retry_license(f"Login failed: {message}"):
+            return False
+        selected = prompt_startup_auth(server_url, license_code, "")
+        if not selected or selected.get("mode") != "license":
+            return False
+        server_url = selected["server_url"]
+        license_code = selected["license_code"]
+        record = load_config_record()
+        record["auth_mode"] = "license"
+        record["server_url"] = server_url
+        if not save_secret(record, "license_code", "license_code_dpapi", license_code):
+            gui_show_error("Could not securely save the code.")
+            return False
+
+
+class _SimpleApiResponse:
+    def __init__(self, text):
+        self.text = str(text or "")
+
+
+class ModernGenAiSession:
+    def __init__(self, module, local_api_key, local_model_name):
+        self.module = module
+        self.client = module.Client(api_key=local_api_key)
+        self.model_name = local_model_name
+
+    def reset(self):
+        return
+
+    def _coerce_payload(self, payload):
+        parts = []
+        for item in payload:
+            if isinstance(item, PIL.Image.Image):
+                stream = io.BytesIO()
+                item.save(stream, format="PNG")
+                image_bytes = stream.getvalue()
+                part_type = getattr(getattr(self.module, "types", None), "Part", None)
+                if part_type and hasattr(part_type, "from_bytes"):
+                    parts.append(part_type.from_bytes(data=image_bytes, mime_type="image/png"))
+                else:
+                    parts.append({"mime_type": "image/png", "data": image_bytes})
+            else:
+                parts.append(str(item))
+        return parts
+
+    def send_message(self, payload):
+        contents = self._coerce_payload(payload)
+        response = self.client.models.generate_content(model=self.model_name, contents=contents)
+        return _SimpleApiResponse(extract_text_from_genai_response(response))
+
+
+def extract_text_from_genai_response(response):
+    direct_text = getattr(response, "text", "") or ""
+    if str(direct_text).strip():
+        return str(direct_text).strip()
+
+    collected = []
+    candidates = getattr(response, "candidates", None) or []
+    for candidate in candidates:
+        content = getattr(candidate, "content", None)
+        if not content:
+            continue
+        parts = getattr(content, "parts", None) or []
+        for part in parts:
+            text = getattr(part, "text", None)
+            if text:
+                collected.append(str(text))
+    return "\n".join(collected).strip()
+
+
+def resolve_genai_backend():
+    try:
+        from google import genai as modern_genai
+
+        return "google.genai", modern_genai, ""
+    except Exception as modern_exc:
+        modern_error = str(modern_exc)
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", FutureWarning)
+            import google.generativeai as legacy_genai
+
+        return "google.generativeai", legacy_genai, ""
+    except Exception as legacy_exc:
+        return "", None, f"google.genai unavailable ({modern_error}); google.generativeai unavailable ({legacy_exc})"
+
+
+def ensure_api_mode_ready():
+    global local_model, local_chat_session, api_backend_name
+    if not api_key:
+        gui_show_error("API key is empty.")
+        return False
+    try:
+        backend_name, backend_module, backend_error = resolve_genai_backend()
+        if not backend_module:
+            raise RuntimeError(backend_error or "No Gemini SDK available.")
+
+        if backend_name == "google.genai":
+            local_model = None
+            local_chat_session = ModernGenAiSession(backend_module, api_key, model_name)
+        else:
+            backend_module.configure(api_key=api_key)
+            generation_config = {"temperature": 0.0, "top_p": 1.0, "top_k": 1}
+            local_model = backend_module.GenerativeModel(model_name, generation_config=generation_config)
+            local_chat_session = local_model.start_chat(history=[])
+        api_backend_name = backend_name
+    except Exception as exc:
+        gui_show_error(f"Could not initialize API mode.\n{exc}")
+        return False
+    set_session_status(f"API mode active ({api_backend_name})", active=True)
+    return True
+
+
+def initialize_auth_mode():
+    if auth_mode == "license":
+        return ensure_license_mode_ready()
+    return ensure_api_mode_ready()
+
+
+def end_remote_session():
+    local_session_id = ""
+    local_session_token = ""
+    with session_lock:
+        local_session_id = session_id
+        local_session_token = session_token
+    if not local_session_token:
+        return
+    try:
+        request_json(
+            "POST",
+            "/api/v1/client/end-session",
+            token=local_session_token,
+            json_payload={"session_id": local_session_id},
+            timeout=12,
+        )
+    except Exception:
+        pass
+
+
+def heartbeat_loop():
+    while not heartbeat_stop_event.wait(max(8, heartbeat_interval_seconds)):
+        if auth_mode != "license":
+            continue
+        with session_lock:
+            local_active = session_active
+            local_session_id = session_id
+            local_session_token = session_token
+        if not local_active or not local_session_token:
+            continue
+        try:
+            response = request_json(
+                "POST",
+                "/api/v1/client/heartbeat",
+                token=local_session_token,
+                json_payload={"session_id": local_session_id},
+                timeout=15,
+            )
+            if not response.ok:
+                set_session_status("Code mode session lost (heartbeat failed)", active=False)
+                disable_typing_mode()
+                indicator_set_idle()
+        except Exception:
+            set_session_status("Code mode disconnected (network error)", active=False)
+            disable_typing_mode()
+            indicator_set_idle()
+
+
+def start_heartbeat():
+    global heartbeat_thread
+    heartbeat_stop_event.clear()
+    heartbeat_thread = Thread(target=heartbeat_loop, daemon=True)
+    heartbeat_thread.start()
+
+
+def list_running_process_snapshot():
+    running_names = set()
+    pid_to_name = {}
+    if os.name != "nt":
+        return running_names, pid_to_name
+    try:
+        completed = subprocess.run(
+            ["tasklist", "/FO", "CSV", "/NH"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="ignore",
+            timeout=4,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except Exception:
+        return running_names, pid_to_name
+
+    if completed.returncode != 0:
+        return running_names, pid_to_name
+
+    for row in csv.reader(io.StringIO(completed.stdout)):
+        if len(row) < 2:
+            continue
+        name = str(row[0]).strip().lower()
+        if not name:
+            continue
+        running_names.add(name)
+        try:
+            pid_to_name[int(str(row[1]).strip())] = name
+        except Exception:
+            pass
+    return running_names, pid_to_name
+
+
+def is_google_meet_window_active(pid_to_name):
+    if os.name != "nt":
+        return False
+    try:
+        hwnd = _user32.GetForegroundWindow()
+        if not hwnd:
+            return False
+        title_buffer = ctypes.create_unicode_buffer(512)
+        if _user32.GetWindowTextW(hwnd, title_buffer, len(title_buffer)) <= 0:
+            return False
+        title = str(title_buffer.value or "").strip().lower()
+        if not title or not any(keyword in title for keyword in PRIVACY_MEET_WINDOW_KEYWORDS):
+            return False
+        process_id = wintypes.DWORD(0)
+        _user32.GetWindowThreadProcessId(hwnd, ctypes.byref(process_id))
+        return pid_to_name.get(int(process_id.value), "") in PRIVACY_MEET_BROWSERS
+    except Exception:
+        return False
+
+
+def privacy_guard_loop():
+    global privacy_forced_hidden
+    while not privacy_guard_stop_event.is_set():
+        should_force_hide = False
+        if STRICT_PRIVACY_FALLBACK:
+            running, pid_to_name = list_running_process_snapshot()
+            capture_process_active = bool(running.intersection(PRIVACY_GUARD_PROCESSES)) or is_google_meet_window_active(pid_to_name)
+            if capture_process_active and not indicator_capture_protected:
+                should_force_hide = True
+
+        if should_force_hide != privacy_forced_hidden:
+            privacy_forced_hidden = should_force_hide
+            if privacy_forced_hidden:
+                indicator_hide()
+            else:
+                if not indicator_manual_hidden:
+                    indicator_show()
+
+        if privacy_guard_stop_event.wait(PRIVACY_GUARD_INTERVAL_SECONDS):
+            break
+
+
+def start_privacy_guard():
+    global privacy_guard_thread
+    if os.name != "nt" or not STRICT_PRIVACY_FALLBACK:
+        return
+    privacy_guard_stop_event.clear()
+    privacy_guard_thread = Thread(target=privacy_guard_loop, daemon=True)
+    privacy_guard_thread.start()
+
+
+class StatusIndicator:
+    def __init__(self):
+        self.root = tk.Tk()
+        self.root.overrideredirect(True)
+        self.root.attributes("-topmost", True)
+        try:
+            self.root.attributes("-toolwindow", True)
+        except Exception:
+            pass
+        self.hidden = False
+        self.current_char = ""
+        self.current_color = "#404040"
+        self.answer_preview = ""
+        self.base_size = 20
+        self.collapsed_width = self.base_size
+        self.collapsed_height = self.base_size
+        self.expanded_width = 400
+        self.expanded_height = 132
+        self.panel_corner_radius = 14
+        self.square_corner_radius = 6
+        self.control_hint_text = (
+            "Controls\n"
+            "Numpad 1: Capture / Pause / Resume\n"
+            "Numpad 0: Toggle Indicator\n"
+            "Numpad 2: Clear Pending\n"
+            "Numpad 3: Paste All\n"
+            "Numpad 4: Repeat Last\n"
+            "Numpad 9: Exit"
+        )
+        self.current_width = self.collapsed_width
+        self.current_height = self.collapsed_height
+        self.target_width = self.collapsed_width
+        self.target_height = self.collapsed_height
+        self.animation_after_id = None
+        screen_width = self.root.winfo_screenwidth()
+        screen_height = self.root.winfo_screenheight()
+        x = screen_width - self.current_width - 10
+        y = screen_height - self.current_height - 50
+        self.root.geometry(f"{self.current_width}x{self.current_height}+{x}+{y}")
+        self.canvas = tk.Canvas(
+            self.root,
+            width=self.current_width,
+            height=self.current_height,
+            highlightthickness=0,
+            bd=0,
+            bg="#081224",
+        )
+        self.canvas.pack()
+        self.canvas.bind("<Enter>", self._on_hover_enter)
+        self.canvas.bind("<Leave>", self._on_hover_leave)
+        self.canvas.bind("<Button-1>", self._on_click_toggle)
+        configure_private_window(self.root, dark=True, refresh_ms=1200)
+        self._apply_window_rounding()
+        self._apply_capture_privacy()
+        self.set_idle()
+
+    def _apply_capture_privacy(self):
+        global indicator_capture_protected
+        if not HIDE_INDICATOR_FROM_CAPTURE:
+            indicator_capture_protected = False
+            return
+        try:
+            indicator_capture_protected = bool(apply_capture_privacy_to_window(self.root, enabled=True))
+        except Exception:
+            indicator_capture_protected = False
+
+    def _apply_window_rounding(self):
+        if os.name != "nt":
+            return
+        radius = 8 if self.current_width <= self.collapsed_width + 2 else self.panel_corner_radius
+        apply_window_corner_region(self.root, radius)
+
+    def _is_idle_state(self):
+        return self.current_color == "#404040"
+
+    def _can_expand(self):
+        return bool(self.answer_preview) or self._is_idle_state()
+
+    def set_idle(self):
+        self.current_char = ""
+        self.current_color = "#404040"
+        if not self.hidden and not self.answer_preview and self.current_width <= self.collapsed_width + 2:
+            self._animate_to(self.expanded_width, self.expanded_height)
+        self._redraw()
+
+    def set_processing(self):
+        self.current_char = ""
+        self.current_color = "#FFA500"
+        if self.current_width > self.collapsed_width and not self.answer_preview:
+            self._collapse_now()
+        self._redraw()
+
+    def set_ready(self):
+        self.current_char = ""
+        self.current_color = "#00FF00"
+        if self.current_width > self.collapsed_width and not self.answer_preview:
+            self._collapse_now()
+        self._redraw()
+
+    def set_paused(self):
+        self.current_char = ""
+        self.current_color = "#1E90FF"
+        if self.current_width > self.collapsed_width and not self.answer_preview:
+            self._collapse_now()
+        self._redraw()
+
+    def show_answer_char(self, value):
+        char = (value or "").strip()[:1]
+        self.current_char = char
+        self.current_color = "#00A34B"
+        self._redraw()
+
+    def set_answer_preview(self, value):
+        self.answer_preview = str(value or "").strip()
+        self._redraw()
+
+    def _on_hover_enter(self, _event):
+        if self.hidden:
+            return
+        if self._can_expand():
+            self._animate_to(self.expanded_width, self.expanded_height)
+
+    def _on_hover_leave(self, _event):
+        if self.hidden:
+            return
+        self._collapse_now()
+
+    def _on_click_toggle(self, _event):
+        if self.hidden or not self._can_expand():
+            return
+        expanded = self.current_width >= self.expanded_width - 6
+        if expanded:
+            self._animate_to(self.collapsed_width, self.collapsed_height)
+        else:
+            self._animate_to(self.expanded_width, self.expanded_height)
+
+    def _collapse_now(self):
+        self.target_width = self.collapsed_width
+        self.target_height = self.collapsed_height
+        if self.animation_after_id is not None:
+            try:
+                self.root.after_cancel(self.animation_after_id)
+            except Exception:
+                pass
+            self.animation_after_id = None
+        self._set_geometry(self.collapsed_width, self.collapsed_height)
+        self._redraw()
+
+    def _set_geometry(self, width, height):
+        self.current_width = width
+        self.current_height = height
+        screen_width = self.root.winfo_screenwidth()
+        screen_height = self.root.winfo_screenheight()
+        x = screen_width - width - 10
+        y = screen_height - height - 50
+        self.root.geometry(f"{width}x{height}+{x}+{y}")
+        self.canvas.configure(width=width, height=height)
+        self._apply_window_rounding()
+        self._apply_capture_privacy()
+
+    def _animate_to(self, target_width, target_height):
+        self.target_width = target_width
+        self.target_height = target_height
+
+        if self.animation_after_id is not None:
+            return
+
+        def _step():
+            self.animation_after_id = None
+
+            def _next(current, target):
+                if current == target:
+                    return current
+                delta = target - current
+                step = max(1, abs(delta) // 4)
+                if delta < 0:
+                    step = -step
+                candidate = current + step
+                if (delta > 0 and candidate > target) or (delta < 0 and candidate < target):
+                    return target
+                return candidate
+
+            next_width = _next(self.current_width, self.target_width)
+            next_height = _next(self.current_height, self.target_height)
+            self._set_geometry(next_width, next_height)
+            self._redraw()
+
+            if next_width != self.target_width or next_height != self.target_height:
+                self.animation_after_id = self.root.after(16, _step)
+
+        _step()
+
+    def _redraw(self):
+        width = self.current_width
+        height = self.current_height
+        self.canvas.delete("all")
+
+        if width > self.collapsed_width or height > self.collapsed_height:
+            draw_rounded_canvas_rect(
+                self.canvas,
+                0,
+                0,
+                width - 1,
+                height - 1,
+                self.panel_corner_radius,
+                fill="#081224",
+                outline="#1F3458",
+            )
+
+        square_x1 = max(0, width - self.base_size)
+        square_y1 = max(0, height - self.base_size)
+        draw_rounded_canvas_rect(
+            self.canvas,
+            square_x1,
+            square_y1,
+            width - 1,
+            height - 1,
+            self.square_corner_radius,
+            fill=self.current_color,
+            outline="",
+        )
+
+        if self.current_char:
+            self.canvas.create_text(
+                square_x1 + self.base_size // 2,
+                square_y1 + self.base_size // 2,
+                text=self.current_char.upper(),
+                fill="white",
+                font=(UI_FONT, 8, "bold"),
+            )
+
+        expanded = width >= self.expanded_width - 6 and height >= self.expanded_height - 6
+        if expanded and self.answer_preview:
+            self.canvas.create_text(
+                10,
+                10,
+                text=self.answer_preview,
+                fill="#EAF2FF",
+                font=(UI_FONT, 9),
+                anchor="nw",
+                justify="left",
+                width=max(50, width - 34),
+            )
+        elif expanded and self._is_idle_state():
+            self.canvas.create_text(
+                12,
+                10,
+                text=self.control_hint_text,
+                fill="#CFDFFF",
+                font=(UI_FONT, 9),
+                anchor="nw",
+                justify="left",
+                width=max(70, width - 30),
+            )
+
+    def hide(self):
+        if not self.hidden:
+            self.root.withdraw()
+            self.hidden = True
+
+    def show(self):
+        if self.hidden:
+            self.root.deiconify()
+            self.root.attributes("-topmost", True)
+            self._apply_window_rounding()
+            self._apply_capture_privacy()
+            self.hidden = False
+            self._redraw()
+
+    def run(self):
+        self.root.mainloop()
+
+
+def init_indicator():
+    global indicator
+    indicator = StatusIndicator()
+    indicator.run()
+
+
+def indicator_call(func):
+    if not indicator:
+        return
+    try:
+        indicator.root.after(0, func)
+    except Exception:
+        pass
+
+
+def indicator_set_idle():
+    indicator_call(indicator.set_idle)
+
+
+def indicator_set_processing():
+    indicator_call(indicator.set_processing)
+
+
+def indicator_set_ready():
+    indicator_call(indicator.set_ready)
+
+
+def indicator_set_paused():
+    indicator_call(indicator.set_paused)
+
+
+def indicator_show_answer_char(value):
+    indicator_call(lambda: indicator.show_answer_char(value))
+
+
+def indicator_set_answer_preview(value):
+    indicator_call(lambda: indicator.set_answer_preview(value))
+
+
+def indicator_hide():
+    indicator_call(indicator.hide)
+
+
+def indicator_show():
+    if privacy_forced_hidden:
+        return
+    indicator_call(indicator.show)
+
+
+def set_indicator_manual_visibility(hidden):
+    global indicator_manual_hidden
+    indicator_manual_hidden = bool(hidden)
+    if hidden:
+        indicator_hide()
+    else:
+        indicator_show()
+
+
+def get_status_text():
+    with session_lock:
+        return session_status_text
+
+
+def show_status_ui():
+    status = get_status_text()
+    if auth_mode == "license":
+        details = (
+            f"Mode: Subscription Code\n"
+            f"Status: {status}\n"
+            f"Server: {server_url}\n"
+            f"User: {user_email or '-'}\n"
+            f"Code: {license_hint or '-'}"
+        )
+    else:
+        masked = f"***{api_key[-4:]}" if api_key else "-"
+        details = (
+            f"Mode: API Key\n"
+            f"Status: {status}\n"
+            f"Backend: {api_backend_name}\n"
+            f"Model: {model_name}\n"
+            f"API Key: {masked}"
+        )
+
+    def _display():
+        parent = indicator.root if indicator and indicator.root.winfo_exists() else None
+        show_styled_message(f"{APP_NAME} Status", details, is_error=False, parent=parent)
+
+    try:
+        if indicator and indicator.root.winfo_exists():
+            indicator.root.after(0, _display)
+        else:
+            _display()
+    except Exception:
+        pass
+
+
+def build_tray_image():
+    image = PIL.Image.new("RGB", (64, 64), "#1F2937")
+    draw = PIL.ImageDraw.Draw(image)
+    draw.ellipse((14, 14, 50, 50), fill="#22C55E")
+    draw.ellipse((24, 24, 40, 40), fill="#111827")
+    return image
+
+
+def tray_status_label(_):
+    return f"Status: {get_status_text()}"
+
+
+def tray_open_ui(icon, item):
+    show_status_ui()
+
+
+def tray_toggle_indicator(icon, item):
+    if not indicator:
+        return
+    toggle_indicator_visibility()
+
+
+def tray_exit(icon, item):
+    exit_program(trigger_uninstall=False)
+
+
+def run_tray_icon():
+    global tray_icon
+    if pystray is None:
+        return
+    tray_icon = pystray.Icon(
+        "EyesAndEars",
+        build_tray_image(),
+        "EyesAndEars",
+        pystray.Menu(
+            pystray.MenuItem("Open/Show UI", tray_open_ui),
+            pystray.MenuItem(tray_status_label, None, enabled=False),
+            pystray.MenuItem("Toggle Indicator", tray_toggle_indicator),
+            pystray.MenuItem("Quit", tray_exit),
+        ),
+    )
+    tray_icon.run()
+
+
 def block_hotkey(action, seconds=0.25):
     hotkey_block_until[action] = time.monotonic() + seconds
 
+
 def hotkey_blocked(action):
     return time.monotonic() < hotkey_block_until[action]
+
 
 def enable_typing_mode():
     global typing_hook
     if typing_hook is None:
         typing_hook = keyboard.on_press(on_smart_type, suppress=True)
+
 
 def disable_typing_mode():
     global typing_hook
@@ -514,8 +1763,10 @@ def disable_typing_mode():
         keyboard.unhook(typing_hook)
         typing_hook = None
 
+
 def has_pending_answer():
     return bool(current_answer) and current_index < len(current_answer)
+
 
 def clear_answer_state():
     global current_answer, current_index, is_paused, pause_pending
@@ -524,36 +1775,64 @@ def clear_answer_state():
     is_paused = False
     pause_pending = False
 
-def is_keypad_event(event):
-    return bool(getattr(event, "is_keypad", False))
 
-NUMPAD_PRIMARY_NAMES = {"num 1", "1", "end"}
-NUMPAD_INDICATOR_NAMES = {"num 0", "0", "insert"}
-NUMPAD_EXIT_NAMES = {"num 9", "9", "page up"}
-NUMPAD_CLEAR_CTX_NAMES = {"num 2", "2", "down"}  # added
+def reset_api_context():
+    global local_chat_session
+    if local_chat_session is None:
+        return
+    try:
+        if hasattr(local_chat_session, "reset"):
+            local_chat_session.reset()
+            return
+        if local_model is not None:
+            local_chat_session = local_model.start_chat(history=[])
+    except Exception:
+        pass
 
 
 def get_numpad_action(event):
-    if not is_keypad_event(event):
-        return None
-    if event.name in NUMPAD_PRIMARY_NAMES:
-        return "primary"
-    if event.name in NUMPAD_INDICATOR_NAMES:
-        return "indicator"
-    if event.name in NUMPAD_CLEAR_CTX_NAMES:
-        return "clear_ctx"
-    if event.name in NUMPAD_EXIT_NAMES:
-        return "exit"
-    return None
+    name = (event.name or "").strip().lower()
+    named_actions = {
+        "num 1": "primary",
+        "numpad 1": "primary",
+        "num 0": "indicator",
+        "numpad 0": "indicator",
+        "num 2": "clear_ctx",
+        "numpad 2": "clear_ctx",
+        "num 3": "paste_all",
+        "numpad 3": "paste_all",
+        "num 4": "repeat_prev",
+        "numpad 4": "repeat_prev",
+        "num 9": "exit",
+        "numpad 9": "exit",
+    }
+    if name in named_actions:
+        return named_actions[name]
+
+    if bool(getattr(event, "is_keypad", False)):
+        keypad_aliases = {
+            "1": "primary",
+            "0": "indicator",
+            "2": "clear_ctx",
+            "3": "paste_all",
+            "4": "repeat_prev",
+            "9": "exit",
+            "end": "primary",
+            "insert": "indicator",
+            "down": "clear_ctx",
+            "page down": "paste_all",
+            "pagedown": "paste_all",
+            "left": "repeat_prev",
+            "page up": "exit",
+            "pageup": "exit",
+        }
+        return keypad_aliases.get(name, "")
+    return ""
 
 
 def toggle_pause_pending():
     global pause_pending
     pause_pending = not pause_pending
-    if pause_pending:
-        print("\n[PAUSE QUEUED] Will pause when answer arrives.")
-    else:
-        print("\n[PAUSE UNQUEUED] Will auto-type when ready.")
 
 
 def toggle_pause():
@@ -564,11 +1843,9 @@ def toggle_pause():
     if is_paused:
         disable_typing_mode()
         indicator_set_paused()
-        print("\n[PAUSED] Press Numpad 1 to resume.")
     else:
         indicator_set_ready()
         enable_typing_mode()
-        print("\n[RESUMED] Type to output the answer.")
 
 
 def handle_primary_action():
@@ -578,18 +1855,16 @@ def handle_primary_action():
     if has_pending_answer():
         toggle_pause()
         return
-    Thread(target=process_screenshot).start()
+    Thread(target=process_screenshot, daemon=True).start()
 
 
 def toggle_indicator_visibility():
     if not indicator:
         return
     if indicator.hidden:
-        indicator_show()
-        print("\nIndicator shown.")
+        set_indicator_manual_visibility(False)
     else:
-        indicator_hide()
-        print("\nIndicator hidden.")
+        set_indicator_manual_visibility(True)
 
 
 def handle_primary_hotkey():
@@ -604,6 +1879,59 @@ def handle_indicator_hotkey():
     toggle_indicator_visibility()
 
 
+def handle_clear_ctx_hotkey():
+    if hotkey_blocked("clear_ctx"):
+        return
+    run_clear_ctx_action()
+
+
+def run_clear_ctx_action():
+    clear_answer_state()
+    if auth_mode == "api":
+        reset_api_context()
+    disable_typing_mode()
+    indicator_set_idle()
+
+
+def handle_paste_all_hotkey():
+    if hotkey_blocked("paste_all"):
+        return
+    run_paste_all_action()
+
+
+def run_paste_all_action():
+    global current_index
+    if not current_answer or current_index >= len(current_answer):
+        return
+    remaining = current_answer[current_index:]
+    disable_typing_mode()
+    with write_lock:
+        keyboard.write(remaining)
+        current_index = len(current_answer)
+    indicator_set_idle()
+    clear_answer_state()
+
+
+def handle_repeat_prev_hotkey():
+    if hotkey_blocked("repeat_prev"):
+        return
+    run_repeat_prev_action()
+
+
+def run_repeat_prev_action():
+    global current_answer, current_index, is_paused, pause_pending
+    if not last_answer:
+        return
+    disable_typing_mode()
+    indicator_set_answer_preview(last_answer)
+    current_answer = last_answer
+    current_index = 0
+    is_paused = False
+    pause_pending = False
+    indicator_set_ready()
+    enable_typing_mode()
+
+
 def handle_exit_hotkey():
     if hotkey_blocked("exit"):
         return
@@ -611,99 +1939,126 @@ def handle_exit_hotkey():
 
 
 def clean_response_text(text):
-    """Clean and normalize the response text"""
     import re
+
     text = text.replace("\r\n", "\n").replace("\r", "\n")
-    lines = [line.rstrip() for line in text.split("\n")]
-    text = "\n".join(lines).strip()
-    if "\n" not in text:
-        text = re.sub(r"\s+", " ", text)
+    text = text.replace("```", "").strip()
+    lines = [line.strip() for line in text.split("\n")]
+    while lines and not lines[0]:
+        lines.pop(0)
+    while lines and not lines[-1]:
+        lines.pop()
+
+    code_prefixes = (
+        "def ", "class ", "import ", "from ", "if ", "elif ", "else:", "for ", "while ",
+        "try:", "except", "finally:", "return ", "let ", "const ", "var ", "function ",
+        "public ", "private ", "protected ", "#include", "using ", "SELECT ", "INSERT ",
+        "UPDATE ", "DELETE ", "<!doctype", "<html", "{", "}",
+    )
+
+    looks_like_code = any(
+        line and (
+            line.startswith(code_prefixes)
+            or line.endswith("{")
+            or line.endswith("}")
+            or (";" in line and any(ch in line for ch in "{}()"))
+        )
+        for line in lines
+    )
+
+    if not lines:
+        return ""
+
+    if looks_like_code:
+        compact = []
+        blank_streak = 0
+        for line in lines:
+            if not line:
+                blank_streak += 1
+                if blank_streak > 1:
+                    continue
+            else:
+                blank_streak = 0
+            compact.append(line)
+        return "\n".join(compact).strip()
+
+    flattened = " ".join(line for line in lines if line)
+    flattened = re.sub(r"\s+", " ", flattened).strip()
+    return flattened
+
+
+def infer_via_license_server(image_bytes, local_token):
+    files = {"file": ("capture.png", image_bytes, "image/png")}
+    response = request_json("POST", "/api/v1/client/infer", token=local_token, files=files, timeout=80)
+    if response.status_code == 401:
+        set_session_status("Code mode session expired. Restart app.", active=False)
+        raise RuntimeError("Session expired or invalid.")
+    response.raise_for_status()
+    return str(response.json().get("text", ""))
+
+
+def infer_via_api_key(screenshot):
+    if local_chat_session is None:
+        raise RuntimeError("API mode not initialized.")
+    response = local_chat_session.send_message([PROMPT_TEXT, screenshot])
+    text = getattr(response, "text", "") or ""
+    if not text.strip():
+        raise RuntimeError("No response text from model.")
     return text
 
 
-# === GEMINI CONTEXT (PER LAUNCH) ===
-def reset_chat_context():
-    """Clears per-launch context by creating a fresh chat session."""
-    global chat_session, model
-    if model is None:
-        return
-    chat_session = model.start_chat(history=[])
-    print("\n[CONTEXT CLEARED] Next capture starts fresh.")
-
-
-def handle_clear_ctx_hotkey():
-    if hotkey_blocked("clear_ctx"):
-        return
-    reset_chat_context()
-
-
-# === CORE LOGIC ===
 def process_screenshot():
-    global current_answer, current_index, is_processing, is_paused, pause_pending
-    global chat_session
-
+    global current_answer, current_index, last_answer, is_processing, is_paused, pause_pending
     if is_processing:
         return
+
+    if auth_mode == "license":
+        with session_lock:
+            local_active = session_active
+            local_token = session_token
+        if not local_active or not local_token:
+            set_session_status("Code mode inactive - re-login required", active=False)
+            gui_show_error("Session inactive. Restart app and login with code.")
+            return
+    else:
+        local_token = ""
+
     is_processing = True
     is_paused = False
-
     disable_typing_mode()
     indicator_set_processing()
-    print("\n[1/3] Capturing screenshot...")
-
     try:
         screenshot = PIL.ImageGrab.grab()
-        print(f"[2/3] Sending to {MODEL_NAME} (Gemini chat w/ context)...")
+        stream = io.BytesIO()
+        screenshot.save(stream, format="PNG")
+        image_bytes = stream.getvalue()
 
-        # Use chat_session for per-launch memory
-        # Keep your exact prompt; send prompt + image as parts
-        response = chat_session.send_message([PROMPT_TEXT, screenshot])
+        raw_text = infer_via_license_server(image_bytes, local_token) if auth_mode == "license" else infer_via_api_key(screenshot)
+        final_text = clean_response_text(raw_text)
+        if not final_text:
+            raise RuntimeError("No response text returned.")
 
-        if response and hasattr(response, "text"):
-            final_text = response.text.strip()
-        else:
-            final_text = "Error: No response received from model"
-
-        final_text = clean_response_text(final_text)
-
+        last_answer = final_text
+        indicator_set_answer_preview(final_text)
         current_answer = final_text
         current_index = 0
-
         pyperclip.copy(final_text)
-
-        print(f"[3/3] Ready! Answer: {final_text[:100]}...")
-        print(f"Length: {len(final_text)} chars.")
-
+        if len(final_text) == 1:
+            disable_typing_mode()
+            indicator_show_answer_char(final_text)
+            clear_answer_state()
+            return
         if pause_pending:
             pause_pending = False
             is_paused = True
             indicator_set_paused()
-            print("[READY - PAUSED] Press Numpad 1 to resume.")
         else:
-            print("Start typing...")
             indicator_set_ready()
             enable_typing_mode()
-
-    except Exception as e:
-        print(f"\nError: {str(e)}")
-
-        msg = str(e).lower()
-        if "model" in msg and "not found" in msg:
-            print(f"\n!!! MODEL ERROR !!!")
-            print(f"Model '{MODEL_NAME}' might not exist or you don't have access.")
-            print("Try using: 'gemini-2.5-flash' or check your Google AI Studio model access.")
-        elif "429" in msg:
-            print("\n!!! RATE LIMIT ERROR !!! Wait and try again.")
-        elif "quota" in msg:
-            print("\n!!! QUOTA EXCEEDED !!! Check your Gemini / AI Studio quota.")
-        elif "api key" in msg or "permission" in msg or "unauthorized" in msg:
-            print("\n!!! AUTH ERROR !!! Check your API key.")
-        else:
-            print("\nGeneral error occurred. Check API key and internet connection.")
-
+    except Exception as exc:
+        print(f"Inference error: {exc}")
         indicator_set_idle()
         clear_answer_state()
-
     finally:
         is_processing = False
 
@@ -720,6 +2075,7 @@ def detect_winget_package_id_from_path():
 
 def sanitize_package_id(raw_value):
     import re
+
     candidate = str(raw_value).strip()
     if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{1,127}", candidate):
         return candidate
@@ -732,15 +2088,10 @@ def resolve_winget_package_id():
     return sanitize_package_id(detect_winget_package_id_from_path())
 
 
-def can_self_uninstall():
-    return bool(resolve_winget_package_id())
-
-
 def schedule_self_uninstall():
     package_id = resolve_winget_package_id()
     if not package_id:
         return False
-
     uninstall_script = Path(tempfile.gettempdir()) / f"eyesandears-self-uninstall-{secrets.token_hex(8)}.cmd"
     script_text = (
         "@echo off\n"
@@ -749,7 +2100,6 @@ def schedule_self_uninstall():
         "del /f /q \"%~f0\"\n"
     )
     uninstall_script.write_text(script_text, encoding="utf-8")
-
     subprocess.Popen(
         ["cmd", "/c", str(uninstall_script)],
         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
@@ -759,8 +2109,12 @@ def schedule_self_uninstall():
 
 
 def exit_program(trigger_uninstall=False):
-    print("\nExiting and clearing runtime-sensitive data...")
     global tray_icon
+    heartbeat_stop_event.set()
+    privacy_guard_stop_event.set()
+    if auth_mode == "license":
+        end_remote_session()
+    set_session_status("Stopped", active=False)
     disable_typing_mode()
     clear_answer_state()
     try:
@@ -777,106 +2131,72 @@ def exit_program(trigger_uninstall=False):
         except Exception:
             pass
     if trigger_uninstall:
-        if schedule_self_uninstall():
-            print("Winget uninstall scheduled.")
-        else:
-            print("Winget uninstall skipped (package ID unavailable).")
+        schedule_self_uninstall()
     os._exit(0)
 
 
 def on_smart_type(event):
     global current_index
-
     action = get_numpad_action(event)
-    if action:
-        if event.event_type == "down":
-            block_hotkey(action)
-            if action == "primary":
-                handle_primary_action()
-            elif action == "indicator":
-                toggle_indicator_visibility()
-            elif action == "clear_ctx":
-                reset_chat_context()
-            else:
-                exit_program(trigger_uninstall=True)
+    if action and event.event_type == "down":
+        block_hotkey(action)
+        if action == "primary":
+            handle_primary_action()
+        elif action == "indicator":
+            toggle_indicator_visibility()
+        elif action == "clear_ctx":
+            run_clear_ctx_action()
+        elif action == "paste_all":
+            run_paste_all_action()
+        elif action == "repeat_prev":
+            run_repeat_prev_action()
+        elif action == "exit":
+            exit_program(trigger_uninstall=True)
         return
-
-    # Ignore special keys
     if len(event.name) > 1 and event.name != "space":
         return
-
-    # Ignore if holding modifiers
     if keyboard.is_pressed("ctrl") or keyboard.is_pressed("alt") or keyboard.is_pressed("win"):
         return
-
-    # Recursion protection
     if write_lock.locked():
         return
-
-    # Type the chunk
     if event.event_type == "down":
         if current_answer and current_index < len(current_answer):
             with write_lock:
                 char = current_answer[current_index]
                 keyboard.write(char)
                 current_index += 1
-
             if current_index >= len(current_answer):
-                print("\nFinished typing answer. Keyboard restored.")
                 disable_typing_mode()
                 indicator_set_idle()
                 clear_answer_state()
 
 
-def configure_genai():
-    global model, chat_session, runtime_api_key
-    runtime_api_key = resolve_api_key()
-    if not runtime_api_key:
-        print(f"Set {API_KEY_ENV_VAR} or enter your key on first run.")
-        return False
-
-    genai.configure(api_key=runtime_api_key)
-
-    # You can lock it down to be less “chatty”
-    generation_config = {
-        "temperature": 0.0,
-        "top_p": 1.0,
-        "top_k": 1,
-    }
-
-    model = genai.GenerativeModel(
-        MODEL_NAME,
-        generation_config=generation_config,
-    )
-
-    # Per-launch context starts here
-    chat_session = model.start_chat(history=[])
-    return True
-
-
 def main():
-    if not enforce_password_gate():
+    global indicator_manual_hidden
+    hide_console_window()
+    if not resolve_auth_settings():
         return
-
-    if not configure_genai():
+    if not initialize_auth_mode():
         return
+    if auth_mode == "license":
+        start_heartbeat()
 
     indicator_thread = Thread(target=init_indicator, daemon=True)
     indicator_thread.start()
-    time.sleep(0.5)
-
+    time.sleep(0.35)
+    start_privacy_guard()
+    indicator_manual_hidden = not INDICATOR_VISIBLE_BY_DEFAULT
+    set_indicator_manual_visibility(indicator_manual_hidden)
     if pystray is not None:
         tray_thread = Thread(target=run_tray_icon, daemon=True)
         tray_thread.start()
-        hide_console_window()
-    else:
-        print("Tray icon unavailable. Keeping CMD visible for control.")
 
     keyboard.add_hotkey("num 1", handle_primary_hotkey)
     keyboard.add_hotkey("num 0", handle_indicator_hotkey)
     keyboard.add_hotkey("num 2", handle_clear_ctx_hotkey)
+    keyboard.add_hotkey("num 3", handle_paste_all_hotkey)
+    keyboard.add_hotkey("num 4", handle_repeat_prev_hotkey)
     keyboard.add_hotkey("num 9", handle_exit_hotkey)
-
     keyboard.wait()
 
 
