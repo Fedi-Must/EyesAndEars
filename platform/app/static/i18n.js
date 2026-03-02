@@ -618,7 +618,11 @@
 
     document.querySelectorAll("[data-i18n]").forEach((node) => {
       const key = node.getAttribute("data-i18n");
-      const value = translate(key, resolvedLang);
+      if (!node.dataset.i18nDefault) {
+        node.dataset.i18nDefault = node.textContent || "";
+      }
+      const translated = translate(key, resolvedLang);
+      const value = translated === key ? (node.dataset.i18nDefault || key) : translated;
       if (node.hasAttribute("data-i18n-no-scramble")) {
         node.textContent = value;
       } else {
@@ -628,17 +632,31 @@
 
     document.querySelectorAll("[data-i18n-html]").forEach((node) => {
       const key = node.getAttribute("data-i18n-html");
-      node.innerHTML = translate(key, resolvedLang);
+      if (!node.dataset.i18nHtmlDefault) {
+        node.dataset.i18nHtmlDefault = node.innerHTML || "";
+      }
+      const translated = translate(key, resolvedLang);
+      node.innerHTML = translated === key ? (node.dataset.i18nHtmlDefault || key) : translated;
     });
 
     document.querySelectorAll("[data-i18n-placeholder]").forEach((node) => {
       const key = node.getAttribute("data-i18n-placeholder");
-      node.setAttribute("placeholder", translate(key, resolvedLang));
+      if (!node.dataset.i18nPlaceholderDefault) {
+        node.dataset.i18nPlaceholderDefault = node.getAttribute("placeholder") || "";
+      }
+      const translated = translate(key, resolvedLang);
+      const value = translated === key ? (node.dataset.i18nPlaceholderDefault || "") : translated;
+      node.setAttribute("placeholder", value);
     });
 
     document.querySelectorAll("[data-i18n-aria-label]").forEach((node) => {
       const key = node.getAttribute("data-i18n-aria-label");
-      node.setAttribute("aria-label", translate(key, resolvedLang));
+      if (!node.dataset.i18nAriaDefault) {
+        node.dataset.i18nAriaDefault = node.getAttribute("aria-label") || "";
+      }
+      const translated = translate(key, resolvedLang);
+      const value = translated === key ? (node.dataset.i18nAriaDefault || "") : translated;
+      node.setAttribute("aria-label", value);
     });
 
     document.querySelectorAll("[data-lang-btn]").forEach((node) => {
