@@ -30,7 +30,8 @@ except Exception:
 APP_NAME = "EyesAndEars"
 APP_VERSION = "2.1.0"
 CONFIG_FILE_NAME = "config.json"
-DEFAULT_SERVER_URL = os.environ.get("EAE_SERVER_URL", "http://localhost:8000").strip().rstrip("/")
+HARDCODED_SERVER_URL = "http://localhost:8000"
+DEFAULT_SERVER_URL = HARDCODED_SERVER_URL.strip().rstrip("/")
 DEFAULT_MODEL_NAME = os.environ.get("EAE_MODEL_NAME", "gemini-2.5-flash").strip()
 DEFAULT_WINGET_PACKAGE_ID = os.environ.get("EYESANDEARS_WINGET_ID", "").strip()
 SELF_UNINSTALL_DELAY_SECONDS = 2
@@ -96,6 +97,9 @@ privacy_guard_stop_event = Event()
 privacy_forced_hidden = False
 indicator_manual_hidden = False
 indicator_capture_protected = False
+indicator_blob_size_key = str(os.environ.get("EAE_BLOB_SIZE", "medium")).strip().lower().replace("-", "_").replace(" ", "_")
+if indicator_blob_size_key not in {"very_small", "small", "medium", "large"}:
+    indicator_blob_size_key = "medium"
 
 INDICATOR_VISIBLE_BY_DEFAULT = os.environ.get("EAE_SHOW_INDICATOR", "").strip().lower() not in {"0", "false", "no", "off"}
 HIDE_INDICATOR_FROM_CAPTURE = os.environ.get("EAE_HIDE_INDICATOR_FROM_CAPTURE", "").strip().lower() not in {"0", "false", "no", "off"}
@@ -136,6 +140,25 @@ UI_GHOST_ACTIVE = "#DFEAFE"
 UI_DANGER = "#BA1A1A"
 UI_ACCENT = "#1C77FF"
 UI_FONT = "Segoe UI Variable Text"
+INDICATOR_BLOB_SIZES = {
+    "very_small": 12,
+    "small": 16,
+    "medium": 20,
+    "large": 26,
+}
+INDICATOR_BLOB_SIZE_LABELS = {
+    "very_small": "Very Small",
+    "small": "Small",
+    "medium": "Medium",
+    "large": "Large",
+}
+
+
+def normalize_indicator_blob_size(value):
+    normalized = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+    if normalized in INDICATOR_BLOB_SIZES:
+        return normalized
+    return "medium"
 
 
 def resolve_install_root():
@@ -335,32 +358,45 @@ def apply_window_corner_region(window, radius):
 
 
 def draw_rounded_canvas_rect(canvas, x1, y1, x2, y2, radius, **kwargs):
+    fill = kwargs.get("fill", "")
+    outline = kwargs.get("outline", "")
+    line_width = int(max(1, kwargs.get("width", 1)))
+    x1 = int(x1)
+    y1 = int(y1)
+    x2 = int(x2)
+    y2 = int(y2)
+    if x2 <= x1 or y2 <= y1:
+        return []
+
     radius = int(max(0, min(radius, (x2 - x1) // 2, (y2 - y1) // 2)))
-    if radius <= 0:
-        return canvas.create_rectangle(x1, y1, x2, y2, **kwargs)
-    points = [
-        x1 + radius, y1,
-        x1 + radius, y1,
-        x2 - radius, y1,
-        x2 - radius, y1,
-        x2, y1,
-        x2, y1 + radius,
-        x2, y1 + radius,
-        x2, y2 - radius,
-        x2, y2 - radius,
-        x2, y2,
-        x2 - radius, y2,
-        x2 - radius, y2,
-        x1 + radius, y2,
-        x1 + radius, y2,
-        x1, y2,
-        x1, y2 - radius,
-        x1, y2 - radius,
-        x1, y1 + radius,
-        x1, y1 + radius,
-        x1, y1,
-    ]
-    return canvas.create_polygon(points, smooth=True, splinesteps=24, **kwargs)
+
+    def _draw_fill(rx1, ry1, rx2, ry2, rr, color):
+        if rr <= 0:
+            return [canvas.create_rectangle(rx1, ry1, rx2, ry2, fill=color, outline="")]
+        items = []
+        items.append(canvas.create_rectangle(rx1 + rr, ry1, rx2 - rr, ry2, fill=color, outline=""))
+        items.append(canvas.create_rectangle(rx1, ry1 + rr, rx2, ry2 - rr, fill=color, outline=""))
+        items.append(canvas.create_oval(rx1, ry1, rx1 + rr * 2, ry1 + rr * 2, fill=color, outline=""))
+        items.append(canvas.create_oval(rx2 - rr * 2, ry1, rx2, ry1 + rr * 2, fill=color, outline=""))
+        items.append(canvas.create_oval(rx1, ry2 - rr * 2, rx1 + rr * 2, ry2, fill=color, outline=""))
+        items.append(canvas.create_oval(rx2 - rr * 2, ry2 - rr * 2, rx2, ry2, fill=color, outline=""))
+        return items
+
+    items = []
+    if outline:
+        items.extend(_draw_fill(x1, y1, x2, y2, radius, outline))
+        inset = min(line_width, max(1, min((x2 - x1) // 2, (y2 - y1) // 2)))
+        inner_x1 = x1 + inset
+        inner_y1 = y1 + inset
+        inner_x2 = x2 - inset
+        inner_y2 = y2 - inset
+        if inner_x2 > inner_x1 and inner_y2 > inner_y1 and fill:
+            items.extend(_draw_fill(inner_x1, inner_y1, inner_x2, inner_y2, max(0, radius - inset), fill))
+    elif fill:
+        items.extend(_draw_fill(x1, y1, x2, y2, radius, fill))
+    else:
+        items.append(canvas.create_rectangle(x1, y1, x2, y2, outline=""))
+    return items
 
 
 def apply_win11_window_style(window, dark=False):
@@ -607,6 +643,19 @@ def style_button(widget, *, primary=False, active=False):
     )
 
 
+def style_button_disabled(widget):
+    widget.configure(
+        state="disabled",
+        bg="#E2E7F2",
+        fg="#7C879E",
+        activebackground="#E2E7F2",
+        activeforeground="#7C879E",
+        highlightbackground="#D0D9EA",
+        highlightcolor="#D0D9EA",
+        cursor="arrow",
+    )
+
+
 def show_styled_message(title, message, is_error=False, ask_retry=False, parent=None):
     result = {"value": False}
     message_text = str(message or "")
@@ -698,19 +747,21 @@ def show_styled_message(title, message, is_error=False, ask_retry=False, parent=
     return bool(result["value"])
 
 
-def prompt_startup_auth(initial_server_url, initial_license, initial_api_key):
+def prompt_startup_auth(initial_server_url, initial_license, initial_api_key, initial_blob_size="medium"):
+    _ = initial_server_url
     result = {"value": None}
-    root, card = make_dialog_shell(f"{APP_NAME} Sign In", 780, 620)
+    root, card = make_dialog_shell(f"{APP_NAME} Sign In", 840, 700)
 
-    mode_var = tk.StringVar(value="license")
-    server_var = tk.StringVar(value=(initial_server_url or DEFAULT_SERVER_URL or "http://localhost:8000"))
+    mode_var = tk.StringVar(value="api")
+    blob_size_var = tk.StringVar(value=normalize_indicator_blob_size(initial_blob_size))
     license_var = tk.StringVar(value=initial_license or "")
     api_var = tk.StringVar(value=initial_api_key or "")
     show_api_var = tk.BooleanVar(value=False)
     error_var = tk.StringVar(value="")
-
-    if not initial_license and initial_api_key:
-        mode_var.set("api")
+    subscription_unlocked_var = tk.BooleanVar(value=False)
+    subscription_state_var = tk.StringVar(value="Subscription code mode: Coming soon")
+    konami_sequence = ("up", "up", "down", "down", "left", "right", "left", "right", "b", "a", "return")
+    konami_state = {"index": 0, "just_unlocked": False}
 
     header = tk.Frame(card, bg=UI_CARD_BG, bd=0)
     header.pack(fill="x", padx=30, pady=(24, 10))
@@ -728,6 +779,13 @@ def prompt_startup_auth(initial_server_url, initial_license, initial_api_key):
         bg=UI_CARD_BG,
         fg=UI_MUTED,
         font=(UI_FONT, 9),
+    ).pack(anchor="w", pady=(6, 0))
+    tk.Label(
+        header,
+        textvariable=subscription_state_var,
+        bg=UI_CARD_BG,
+        fg=UI_MUTED,
+        font=(UI_FONT, 9, "bold"),
     ).pack(anchor="w", pady=(6, 0))
 
     switch_shell = tk.Frame(card, bg=UI_SOFT, highlightbackground=UI_BORDER, highlightthickness=1, bd=0)
@@ -762,6 +820,105 @@ def prompt_startup_auth(initial_server_url, initial_license, initial_api_key):
     form_content = tk.Frame(form_panel, bg=UI_PANEL_BG, bd=0)
     form_content.pack(fill="both", expand=True, padx=18, pady=16)
 
+    blob_settings = tk.Frame(form_content, bg=UI_PANEL_BG, bd=0)
+    blob_settings.pack(fill="x", pady=(0, 14))
+    tk.Label(blob_settings, text="Indicator Blob Size", bg=UI_PANEL_BG, fg=UI_TEXT, font=(UI_FONT, 10, "bold")).pack(anchor="w")
+
+    blob_buttons_row = tk.Frame(blob_settings, bg=UI_PANEL_BG, bd=0)
+    blob_buttons_row.pack(fill="x", pady=(6, 8))
+
+    blob_preview_shell = tk.Frame(blob_settings, bg=UI_FIELD_BG, highlightbackground=UI_BORDER, highlightthickness=1, bd=0)
+    blob_preview_shell.pack(fill="x")
+    blob_preview_canvas = tk.Canvas(
+        blob_preview_shell,
+        width=250,
+        height=86,
+        highlightthickness=0,
+        bd=0,
+        bg=UI_FIELD_BG,
+    )
+    blob_preview_canvas.pack(fill="x", padx=8, pady=8)
+
+    blob_size_buttons = {}
+
+    def redraw_blob_preview():
+        preview_width = int(max(200, blob_preview_canvas.winfo_width()))
+        preview_height = int(max(78, blob_preview_canvas.winfo_height()))
+        blob_preview_canvas.delete("all")
+        draw_rounded_canvas_rect(
+            blob_preview_canvas,
+            0,
+            0,
+            preview_width - 1,
+            preview_height - 1,
+            12,
+            fill="#081224",
+            outline="#1F3458",
+        )
+        current_key = normalize_indicator_blob_size(blob_size_var.get())
+        blob_size = int(INDICATOR_BLOB_SIZES[current_key])
+        chip_x2 = preview_width - 14
+        chip_y2 = preview_height - 14
+        chip_x1 = chip_x2 - blob_size
+        chip_y1 = chip_y2 - blob_size
+        draw_rounded_canvas_rect(
+            blob_preview_canvas,
+            chip_x1,
+            chip_y1,
+            chip_x2,
+            chip_y2,
+            max(3, blob_size // 3),
+            fill="#404040",
+            outline="",
+        )
+        blob_preview_canvas.create_text(
+            12,
+            10,
+            text=f"Preview: {INDICATOR_BLOB_SIZE_LABELS[current_key]}",
+            fill="#EAF2FF",
+            anchor="nw",
+            font=(UI_FONT, 9, "bold"),
+        )
+        blob_preview_canvas.create_text(
+            12,
+            30,
+            text="Gray status chip shown at bottom-right of the indicator.",
+            fill="#CBD9F5",
+            anchor="nw",
+            font=(UI_FONT, 9),
+        )
+
+    def set_blob_size(next_size):
+        blob_size_var.set(normalize_indicator_blob_size(next_size))
+        update_blob_size_ui()
+
+    def update_blob_size_ui():
+        selected = normalize_indicator_blob_size(blob_size_var.get())
+        for size_key, button in blob_size_buttons.items():
+            if size_key == selected:
+                style_button(button, primary=True)
+            else:
+                style_button(button, primary=False)
+        redraw_blob_preview()
+
+    for size_key in ("very_small", "small", "medium", "large"):
+        btn = tk.Button(
+            blob_buttons_row,
+            text=INDICATOR_BLOB_SIZE_LABELS[size_key],
+            command=lambda value=size_key: set_blob_size(value),
+            relief="flat",
+            bd=0,
+            padx=12,
+            pady=8,
+            font=(UI_FONT, 9, "bold"),
+            cursor="hand2",
+        )
+        style_button(btn, primary=False)
+        btn.pack(side="left", padx=(0, 8))
+        blob_size_buttons[size_key] = btn
+
+    blob_preview_canvas.bind("<Configure>", lambda _event: redraw_blob_preview())
+
     license_frame = tk.Frame(form_content, bg=UI_PANEL_BG, bd=0)
     api_frame = tk.Frame(form_content, bg=UI_PANEL_BG, bd=0)
 
@@ -783,19 +940,10 @@ def prompt_startup_auth(initial_server_url, initial_license, initial_api_key):
         entry.pack(fill="x", padx=12, pady=10)
         return entry
 
-    server_entry = make_labeled_entry(license_frame, "Server URL", server_var)
-    tk.Label(
-        license_frame,
-        text="Your subscription server endpoint",
-        bg=UI_PANEL_BG,
-        fg=UI_MUTED,
-        font=(UI_FONT, 9),
-    ).pack(anchor="w", pady=(4, 12))
-
     license_entry = make_labeled_entry(license_frame, "Subscription code (name + 6 digits)", license_var)
     tk.Label(
         license_frame,
-        text="Example: FEDI123456",
+        text="Example: FEDI123456\nServer endpoint is managed internally.",
         bg=UI_PANEL_BG,
         fg=UI_MUTED,
         font=(UI_FONT, 9),
@@ -858,9 +1006,11 @@ def prompt_startup_auth(initial_server_url, initial_license, initial_api_key):
         error_var.set("")
         selected_mode = mode_var.get().strip()
         if selected_mode == "license":
-            entered_server = server_var.get().strip().rstrip("/")
-            if not entered_server:
-                entered_server = (initial_server_url or DEFAULT_SERVER_URL or "http://localhost:8000").strip().rstrip("/")
+            if not subscription_unlocked_var.get():
+                error_var.set("Subscription code mode is coming soon.")
+                mode_var.set("api")
+                update_mode_ui()
+                return
             entered_license = license_var.get().strip()
             if not entered_license:
                 error_var.set("Please enter your subscription code.")
@@ -868,8 +1018,9 @@ def prompt_startup_auth(initial_server_url, initial_license, initial_api_key):
                 return
             result["value"] = {
                 "mode": "license",
-                "server_url": entered_server,
+                "server_url": DEFAULT_SERVER_URL,
                 "license_code": entered_license,
+                "blob_size": normalize_indicator_blob_size(blob_size_var.get()),
             }
         else:
             entered_api_key = api_var.get().strip()
@@ -877,7 +1028,11 @@ def prompt_startup_auth(initial_server_url, initial_license, initial_api_key):
                 error_var.set("Please enter your Gemini API key.")
                 api_entry.focus_set()
                 return
-            result["value"] = {"mode": "api", "api_key": entered_api_key}
+            result["value"] = {
+                "mode": "api",
+                "api_key": entered_api_key,
+                "blob_size": normalize_indicator_blob_size(blob_size_var.get()),
+            }
         root.destroy()
 
     cancel_btn = tk.Button(
@@ -909,12 +1064,22 @@ def prompt_startup_auth(initial_server_url, initial_license, initial_api_key):
     continue_btn.pack(side="right", padx=(0, 10))
 
     def set_mode(next_mode):
+        if next_mode == "license" and not subscription_unlocked_var.get():
+            error_var.set("Subscription code mode is coming soon.")
+            mode_var.set("api")
+            update_mode_ui()
+            return
         mode_var.set(next_mode)
         update_mode_ui()
 
     def update_mode_ui():
         is_license = mode_var.get() == "license"
-        style_button(mode_license_btn, active=not is_license, primary=is_license)
+        if subscription_unlocked_var.get():
+            mode_license_btn.configure(state="normal", text="Use Subscription Code", cursor="hand2")
+            style_button(mode_license_btn, active=not is_license, primary=is_license)
+        else:
+            mode_license_btn.configure(text="Subscription Code (Coming Soon)")
+            style_button_disabled(mode_license_btn)
         style_button(mode_api_btn, active=is_license, primary=not is_license)
         if is_license:
             api_frame.pack_forget()
@@ -924,12 +1089,46 @@ def prompt_startup_auth(initial_server_url, initial_license, initial_api_key):
             license_frame.pack_forget()
             api_frame.pack(fill="x", pady=(0, 8))
             api_entry.focus_set()
+        fit_window_to_content(root, min_width=840, min_height=700, max_width=980, max_height=820)
+
+    def on_konami_key(event):
+        key = str(getattr(event, "keysym", "") or "").strip().lower()
+        if key == "enter":
+            key = "return"
+        if not key:
+            return
+        expected = konami_sequence[konami_state["index"]]
+        if key == expected:
+            konami_state["index"] += 1
+        elif key == konami_sequence[0]:
+            konami_state["index"] = 1
+        else:
+            konami_state["index"] = 0
+
+        if konami_state["index"] >= len(konami_sequence):
+            konami_state["index"] = 0
+            if not subscription_unlocked_var.get():
+                subscription_unlocked_var.set(True)
+                subscription_state_var.set("Developer unlock active: Subscription code enabled")
+                error_var.set("")
+                mode_var.set("license")
+                update_mode_ui()
+                konami_state["just_unlocked"] = True
+
+    def on_return_key(_event):
+        if konami_state.get("just_unlocked"):
+            konami_state["just_unlocked"] = False
+            return "break"
+        on_continue()
+        return "break"
 
     root.protocol("WM_DELETE_WINDOW", on_cancel)
     root.bind("<Escape>", lambda _event: on_cancel())
-    root.bind("<Return>", lambda _event: on_continue())
+    root.bind("<Return>", on_return_key)
+    root.bind("<KeyPress>", on_konami_key)
+    update_blob_size_ui()
     update_mode_ui()
-    fit_window_to_content(root, min_width=780, min_height=620, max_width=940, max_height=760)
+    root.after(80, lambda: fit_window_to_content(root, min_width=840, min_height=700, max_width=980, max_height=820))
     root.mainloop()
     return result["value"]
 
@@ -963,30 +1162,37 @@ def update_tray_menu():
 
 
 def resolve_auth_settings():
-    global auth_mode, server_url, license_code, api_key, device_id
+    global auth_mode, server_url, license_code, api_key, device_id, indicator_blob_size_key
     record = load_config_record()
-    env_server = os.environ.get("EAE_SERVER_URL", "").strip().rstrip("/")
     env_license = os.environ.get("EAE_LICENSE_CODE", "").strip()
     env_api_key = find_env_api_key()
-    saved_server = str(record.get("server_url", "")).strip().rstrip("/")
+    env_blob_size_raw = os.environ.get("EAE_BLOB_SIZE", "").strip()
+    env_blob_size = normalize_indicator_blob_size(env_blob_size_raw) if env_blob_size_raw else ""
     saved_license = load_saved_secret(record, "license_code", "license_code_dpapi")
     saved_api_key = load_saved_secret(record, "api_key", "api_key_dpapi")
+    saved_blob_size = normalize_indicator_blob_size(record.get("indicator_blob_size", ""))
     saved_device_id = str(record.get("device_id", "")).strip()
     if not saved_device_id:
         saved_device_id = secrets.token_hex(16)
         record["device_id"] = saved_device_id
 
+    initial_blob_size = env_blob_size or saved_blob_size or indicator_blob_size_key
     selected = prompt_startup_auth(
-        initial_server_url=env_server or saved_server or DEFAULT_SERVER_URL or "http://localhost:8000",
+        initial_server_url=DEFAULT_SERVER_URL,
         initial_license=env_license or saved_license,
         initial_api_key=env_api_key or saved_api_key,
+        initial_blob_size=initial_blob_size,
     )
     if not selected:
         return False
 
+    selected_blob_size = normalize_indicator_blob_size(selected.get("blob_size", initial_blob_size))
+    record["indicator_blob_size"] = selected_blob_size
+    indicator_blob_size_key = selected_blob_size
+
     selected_mode = selected["mode"]
     if selected_mode == "license":
-        selected_server = selected["server_url"]
+        selected_server = DEFAULT_SERVER_URL
         selected_license = selected["license_code"]
         record["auth_mode"] = "license"
         record["server_url"] = selected_server
@@ -1064,7 +1270,7 @@ def authenticate_license_session():
 
 
 def ensure_license_mode_ready():
-    global server_url, license_code
+    global server_url, license_code, indicator_blob_size_key
     while True:
         ok, message = authenticate_license_session()
         if ok:
@@ -1072,14 +1278,16 @@ def ensure_license_mode_ready():
         set_session_status(f"Code mode disconnected: {message}", active=False)
         if not gui_ask_retry_license(f"Login failed: {message}"):
             return False
-        selected = prompt_startup_auth(server_url, license_code, "")
+        selected = prompt_startup_auth(server_url, license_code, "", indicator_blob_size_key)
         if not selected or selected.get("mode") != "license":
             return False
-        server_url = selected["server_url"]
+        server_url = DEFAULT_SERVER_URL
         license_code = selected["license_code"]
+        indicator_blob_size_key = normalize_indicator_blob_size(selected.get("blob_size", indicator_blob_size_key))
         record = load_config_record()
         record["auth_mode"] = "license"
         record["server_url"] = server_url
+        record["indicator_blob_size"] = indicator_blob_size_key
         if not save_secret(record, "license_code", "license_code_dpapi", license_code):
             gui_show_error("Could not securely save the code.")
             return False
@@ -1343,7 +1551,7 @@ class StatusIndicator:
         self.current_char = ""
         self.current_color = "#404040"
         self.answer_preview = ""
-        self.base_size = 20
+        self.base_size = int(INDICATOR_BLOB_SIZES.get(indicator_blob_size_key, INDICATOR_BLOB_SIZES["medium"]))
         self.collapsed_width = self.base_size
         self.collapsed_height = self.base_size
         self.expanded_width = 400
@@ -1870,13 +2078,34 @@ def toggle_indicator_visibility():
 def handle_primary_hotkey():
     if hotkey_blocked("primary"):
         return
+    clean_hotkey_digit_artifact("primary")
     handle_primary_action()
 
 
 def handle_indicator_hotkey():
     if hotkey_blocked("indicator"):
         return
+    clean_hotkey_digit_artifact("indicator")
     toggle_indicator_visibility()
+
+
+def is_idle_or_paused_state():
+    if is_processing:
+        return False
+    if is_paused:
+        return True
+    return not has_pending_answer()
+
+
+def clean_hotkey_digit_artifact(action):
+    if action not in {"primary", "indicator"}:
+        return
+    if not is_idle_or_paused_state():
+        return
+    try:
+        keyboard.send("backspace")
+    except Exception:
+        pass
 
 
 def handle_clear_ctx_hotkey():

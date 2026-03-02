@@ -1,51 +1,67 @@
 # EyesAndEars
 
-## Prototype overview
+Desktop app + subscription licensing platform.
 
-EyesAndEars is a prototype "on-demand Copilot" for screen issues.
-This uses Gemini since the free tier allows all users to use Gemini 2.5 for a series of long requests. You can, however, pay Google and upgrade your Gemini API key and version if needed.
+## What changed
 
-- You press `Numpad 1` to capture the current screen.
-- The screenshot is sent to Gemini with a strict prompt to return only the direct fix/answer.
-- The app then lets you type naturally, but each keypress outputs the next character from the generated answer.
-- This gives a controlled "type-every-letter" flow instead of auto-pasting full text at once.
+- Desktop startup now includes:
+  - `Use Your Own API Key` (active)
+  - `Subscription Code (Coming Soon)` (disabled for normal users)
+- Startup UI now includes indicator blob size selection:
+  - `Very Small`, `Small`, `Medium`, `Large`
+  - live preview in the sign-in window
+- Checkout flow now uses Flouci (Tunisian payment gateway).
+- Subscription code mode authenticates with licensing server.
+- One active desktop session per license is enforced server-side.
+- Tray-first desktop UX with no persistent console/taskbar clutter.
 
-Made this tool since it helped me with coding and various tasks, since it's faster than opening websites and having to manually input in questions and waiting for a reply to copy it.
+## Project parts
 
-## Local run
+- Desktop app: root (`import os.py`)
+- Web/backend/admin/licensing platform: [`platform/README.md`](platform/README.md)
 
-1. Run:
+## Desktop local run
+
+1. Start backend platform first (see `platform/README.md`).
+2. Run desktop app:
    - `run-local.cmd`
 
-On first launch, the app asks you to create:
-- an app password
-- your Gemini API key
+Or manually:
 
-Optional: you can still provide the key via `EYESANDEARS_API_KEY`.
-After setup, the CMD window auto-hides and the app continues in background with a tray icon.
+```bat
+python -m pip install -r requirements.txt
+python "import os.py"
+```
 
-## Security notes
+Server URL is currently hardcoded in `import os.py`:
+- `HARDCODED_SERVER_URL = "http://localhost:8000"`
+- Update this constant directly before release/deployment (for example your Azure endpoint).
 
-- App password is stored as salted PBKDF2-SHA256 hash.
-- On Windows, Gemini API key is stored with DPAPI encryption (user-bound).
-- Legacy plaintext API keys are automatically migrated to DPAPI.
-- `Numpad 9` triggers app exit and winget uninstall only when a sanitized package ID is detected.
+## Website/Backend quick run
+
+From repo root:
+
+```bat
+run-platform.cmd
+```
+
+This script installs dependencies, starts DB/mail services (Docker if available), runs migrations, and launches the site.
+
+On each launch, the app prompts for:
+- `Use Your Own API Key`
+- `Subscription Code (Coming Soon)` (publicly locked for now)
+
+The app stores code/API key with DPAPI on Windows (fallback plaintext only on non-Windows).
 
 ## Hotkeys
 
-- `Numpad 1`: Capture / Pause / Resume
-- `Numpad 0`: Hide/Show indicator
-- `Numpad 2`: Clear chat context
-- `Numpad 9`: Exit and trigger `winget uninstall` (when launched from winget install)
+- `Numpad 1`: Capture / Pause / Resume typing output
+- `Numpad 0`: Toggle indicator visibility
+- `Numpad 2`: Clear pending answer
+- `Numpad 3`: Paste remaining answer instantly
+- `Numpad 4`: Reload last answer
+- `Numpad 9`: Quit (and winget self-uninstall trigger when applicable)
 
 ## Winget packaging
 
 See `packaging/winget/README.md`.
-
-## End-user winget commands
-
-- Install: `winget install eyesandears`
-- Fallback install: `winget install --id FediMust.EyesAndEars -e`
-- Uninstall (full portable cleanup): `winget uninstall --id FediMust.EyesAndEars -e --purge`
-
-When launched from a winget install, pressing `Numpad 9` exits and triggers uninstall automatically.
