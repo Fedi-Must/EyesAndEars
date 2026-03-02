@@ -1,6 +1,6 @@
 # yaml-language-server: $schema=https://aka.ms/winget-manifest.defaultLocale.1.10.0.schema.json
 PackageIdentifier: FediMust.EyesAndEars
-PackageVersion: 1.0.0
+PackageVersion: "2.1.0"
 PackageLocale: en-US
 Publisher: Fedi-Must
 PublisherUrl: https://github.com/Fedi-Must
@@ -9,8 +9,8 @@ Author: Fedi-Must
 PackageName: EyesAndEars
 PackageUrl: https://github.com/Fedi-Must/EyesAndEars
 License: MIT
-ShortDescription: Screenshot-to-answer assistant with local password gate.
-Description: Self-contained Windows app that captures screenshots, sends them to Gemini, and can type generated responses on demand.
+ShortDescription: Screenshot-to-answer assistant with hotkey typing workflow.
+Description: Self-contained Windows app that captures screenshots, queries Gemini, and can type generated responses on demand with an always-on indicator.
 Moniker: eyesandears
 Tags:
 - ai

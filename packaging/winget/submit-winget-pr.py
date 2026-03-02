@@ -14,7 +14,7 @@ UPSTREAM_OWNER = "microsoft"
 UPSTREAM_REPO = "winget-pkgs"
 FORK_OWNER = "Fedi-Must"
 PACKAGE_IDENTIFIER = "FediMust.EyesAndEars"
-PACKAGE_VERSION = "1.0.0"
+PACKAGE_VERSION = "2.1.0"
 BASE_BRANCH = "master"
 
 
@@ -125,12 +125,12 @@ def upsert_file(token, branch_name, repo_path, local_path, message):
     github_request("PUT", url, token, payload)
 
 
-def create_or_get_pr(token, branch_name):
+def create_or_get_pr(token, branch_name, package_version):
     create_pr_url = f"https://api.github.com/repos/{UPSTREAM_OWNER}/{UPSTREAM_REPO}/pulls"
-    title = f"New package: {PACKAGE_IDENTIFIER} {PACKAGE_VERSION}"
+    title = f"New package: {PACKAGE_IDENTIFIER} {package_version}"
     body = (
         f"## Summary\n"
-        f"- Adds `{PACKAGE_IDENTIFIER}` version `{PACKAGE_VERSION}`\n"
+        f"- Adds `{PACKAGE_IDENTIFIER}` version `{package_version}`\n"
         f"- Installer type: portable\n"
         f"- Installer source: GitHub release asset\n"
     )
@@ -198,7 +198,7 @@ def main():
             f"Add {PACKAGE_IDENTIFIER} {args.version}",
         )
 
-    pr_url = create_or_get_pr(token, branch_name)
+    pr_url = create_or_get_pr(token, branch_name, args.version)
     print("pr_url=" + pr_url)
 
 
