@@ -1,6 +1,7 @@
 __pycache__/
 *.pyc
 .eyesandears/
+.pytest_cache/
 build/
 dist/
 *.spec
@@ -10,3 +11,11 @@ cred_resp.txt
 repo_create.json
 repo_create_status.txt
 temp_create_repo.cmd
+.tmp-ar-state.json
+44516
+indicator-debug.png
+indicator-seq/
+indicator-seq-2/
+verify-*.png
+run-platform.cmd
+platform/

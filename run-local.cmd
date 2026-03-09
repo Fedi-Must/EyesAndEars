@@ -15,7 +15,7 @@ echo [1/3] Installing Python dependencies...
 if errorlevel 1 goto :fail
 
 echo [2/3] Launching EyesAndEars...
-%PYTHON_CMD% "import os.py"
+%PYTHON_CMD% "eyesandears.py"
 if errorlevel 1 goto :fail
 
 echo [3/3] Done.

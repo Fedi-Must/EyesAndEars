@@ -1,51 +1,29 @@
 # EyesAndEars
 
-Desktop app + subscription licensing platform.
+Windows desktop capture assistant with local setup UI, tray control, and release packaging.
 
-## What changed
+## Public repo scope
 
-- Desktop startup now includes:
-  - `Use Your Own API Key` (active)
-  - `Subscription Code (Coming Soon)` (disabled for normal users)
-- Startup UI now includes indicator blob size selection:
-  - `Very Small`, `Small`, `Medium`, `Large`
-  - live preview in the sign-in window
-- Checkout flow now uses Flouci (Tunisian payment gateway).
-- Subscription code mode authenticates with licensing server.
-- One active desktop session per license is enforced server-side.
-- Tray-first desktop UX with no persistent console/taskbar clutter.
+This repository contains the open-source desktop app and packaging scripts only.
 
-## Project parts
+The website, admin panel, checkout flow, and licensing backend are kept private and are not part of this public repo.
 
-- Desktop app: root (`import os.py`)
-- Web/backend/admin/licensing platform: [`platform/README.md`](platform/README.md)
+## Run locally
 
-## Desktop local run
+Use:
 
-1. Start backend platform first (see `platform/README.md`).
-2. Run desktop app:
-   - `run-local.cmd`
+- `run-local.cmd`
 
 Or manually:
 
 ```bat
 python -m pip install -r requirements.txt
-python "import os.py"
+python "eyesandears.py"
 ```
 
-Server URL is currently hardcoded in `import os.py`:
+Server URL is currently hardcoded in `eyesandears.py`:
 - `HARDCODED_SERVER_URL = "http://localhost:8000"`
-- Update this constant directly before release/deployment (for example your Azure endpoint).
-
-## Website/Backend quick run
-
-From repo root:
-
-```bat
-run-platform.cmd
-```
-
-This script installs dependencies, starts DB/mail services (Docker if available), runs migrations, and launches the site.
+- Update this constant directly before release/deployment so the desktop app points at your private backend.
 
 On each launch, the app prompts for:
 - `Use Your Own API Key`

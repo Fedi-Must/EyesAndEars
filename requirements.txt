@@ -5,3 +5,4 @@ pyperclip
 keyboard
 pystray
 requests
+pywebview
