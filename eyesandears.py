@@ -14,7 +14,6 @@ import subprocess
 import sys
 import tempfile
 import time
-import warnings
 import webbrowser
 from ctypes import wintypes
 from datetime import datetime, timezone
@@ -6306,15 +6305,7 @@ def resolve_genai_backend():
 
         return "google.genai", modern_genai, ""
     except Exception as modern_exc:
-        modern_error = str(modern_exc)
-    try:
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", FutureWarning)
-            import google.generativeai as legacy_genai
-
-        return "google.generativeai", legacy_genai, ""
-    except Exception as legacy_exc:
-        return "", None, f"google.genai unavailable ({modern_error}); google.generativeai unavailable ({legacy_exc})"
+        return "", None, f"google.genai unavailable ({modern_exc})"
 
 
 def initialize_api_runtime():
@@ -6332,14 +6323,7 @@ def initialize_api_runtime():
             "chat_session": ModernGenAiSession(backend_module, api_key, model_name),
         }
 
-    backend_module.configure(api_key=api_key)
-    generation_config = {"temperature": 0.0, "top_p": 1.0, "top_k": 1}
-    model = backend_module.GenerativeModel(model_name, generation_config=generation_config)
-    return {
-        "backend_name": backend_name,
-        "model": model,
-        "chat_session": model.start_chat(history=[]),
-    }
+    raise RuntimeError(tr("error.no_sdk", detail="Unsupported Gemini SDK backend."))
 
 
 def ensure_api_mode_ready():

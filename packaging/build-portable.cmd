@@ -6,6 +6,18 @@ if "%VERSION%"=="" set VERSION=1.0.0
 set SCRIPT_DIR=%~dp0
 set ICON_PATH=%SCRIPT_DIR%assets\eyesandears.ico
 set PYTHON_CMD=
+set PYI_EXCLUDES=^
+ --exclude-module pandas ^
+ --exclude-module scipy ^
+ --exclude-module pyarrow ^
+ --exclude-module openpyxl ^
+ --exclude-module sqlalchemy ^
+ --exclude-module pytest ^
+ --exclude-module matplotlib ^
+ --exclude-module IPython ^
+ --exclude-module ipywidgets ^
+ --exclude-module numpy ^
+ --exclude-module pygame
 
 pushd "%SCRIPT_DIR%.."
 
@@ -18,7 +30,7 @@ echo [1/4] Installing build dependencies...
 if errorlevel 1 goto :fail
 
 echo [2/4] Building single-file GUI EXE...
-%PYTHON_CMD% -m PyInstaller --noconfirm --clean --onefile --windowed --icon "%ICON_PATH%" --name EyesAndEars "eyesandears.py"
+%PYTHON_CMD% -m PyInstaller --noconfirm --clean --onefile --windowed --icon "%ICON_PATH%" --name EyesAndEars %PYI_EXCLUDES% "eyesandears.py"
 if errorlevel 1 goto :fail
 
 echo [3/4] Creating versioned release artifact...

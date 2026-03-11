@@ -1,5 +1,4 @@
 google-genai
-google-generativeai
 Pillow
 pyperclip
 keyboard
