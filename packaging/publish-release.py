@@ -103,9 +103,9 @@ def delete_existing_asset_if_needed(token, release, asset_name):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--version", default="1.0.0")
+    parser.add_argument("--version", default="2.2.0")
     parser.add_argument("--username", default="Fedi-Must")
-    parser.add_argument("--asset", default="dist/EyesAndEars-1.0.0-x64.exe")
+    parser.add_argument("--asset", default="dist/EyesAndEars-2.2.0-x64.exe")
     args = parser.parse_args()
 
     if not os.path.exists(args.asset):

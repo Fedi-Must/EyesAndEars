@@ -17,6 +17,7 @@ import time
 import warnings
 import webbrowser
 from ctypes import wintypes
+from datetime import datetime, timezone
 from pathlib import Path
 from threading import Event, Lock, Thread, current_thread
 import tkinter as tk
@@ -52,24 +53,64 @@ except Exception:
     webview = None
 
 APP_NAME = "EyesAndEars"
-APP_VERSION = "2.1.0"
+APP_VERSION = "2.2.0"
 if not logging.getLogger().handlers:
     logging.basicConfig(level=logging.WARNING, format="%(levelname)s [%(name)s] %(message)s")
 logger = logging.getLogger(APP_NAME)
 
 CONFIG_FILE_NAME = "config.json"
-HARDCODED_SERVER_URL = "http://localhost:8000"
+HARDCODED_SERVER_URL = os.environ.get(
+    "EAE_SERVER_URL",
+    "https://eyesandears-platform-vercel.vercel.app",
+).strip()
 DEFAULT_SERVER_URL = HARDCODED_SERVER_URL.strip().rstrip("/")
-DEFAULT_MODEL_NAME = os.environ.get("EAE_MODEL_NAME", "gemini-2.5-flash").strip()
+DEFAULT_WEBSITE_URL = os.environ.get("EAE_WEBSITE_URL", DEFAULT_SERVER_URL).strip().rstrip("/") or DEFAULT_SERVER_URL
+FREE_MODEL_NAME = "gemini-2.5-flash"
+DEFAULT_MODEL_NAME = FREE_MODEL_NAME
 DEFAULT_WINGET_PACKAGE_ID = os.environ.get("EYESANDEARS_WINGET_ID", "").strip()
+DEFAULT_RELEASE_REPO = os.environ.get("EYESANDEARS_RELEASE_REPO", "Fedi-Must/EyesAndEars").strip() or "Fedi-Must/EyesAndEars"
+DEFAULT_RELEASES_API_URL = os.environ.get(
+    "EYESANDEARS_RELEASES_API_URL",
+    f"https://api.github.com/repos/{DEFAULT_RELEASE_REPO}/releases/latest",
+).strip()
+DEFAULT_RELEASES_PAGE_URL = os.environ.get(
+    "EYESANDEARS_RELEASES_PAGE_URL",
+    f"https://github.com/{DEFAULT_RELEASE_REPO}/releases/latest",
+).strip()
+AUTO_UPDATE_ENABLED = os.environ.get("EYESANDEARS_AUTO_UPDATE", "1").strip().lower() not in {"0", "false", "no", "off"}
 SELF_UNINSTALL_DELAY_SECONDS = 2
 API_KEY_ENV_FALLBACK = ("EYESANDEARS_API_KEY", "EAE_API_KEY")
 PRO_MODELS_ENV = "EAE_PRO_MODELS_JSON"
+TRUSTED_TIME_URLS_ENV = "EAE_TRUSTED_TIME_URLS"
 HTTP_SESSION = requests.Session()
+DEFAULT_TRUSTED_TIME_URLS = (
+    "https://worldtimeapi.org/api/timezone/Etc/UTC",
+    "https://timeapi.io/api/Time/current/zone?timeZone=UTC",
+)
+TRUSTED_TIME_URLS = tuple(
+    url
+    for url in (
+        part.strip()
+        for part in str(os.environ.get(TRUSTED_TIME_URLS_ENV, "") or "").split(",")
+    )
+    if url
+) or DEFAULT_TRUSTED_TIME_URLS
 
 SW_HIDE = 0
 CRYPTPROTECT_UI_FORBIDDEN = 0x01
 FAST_UPLOAD_JPEG_QUALITY = 82
+ANSWER_PREVIEW_RETENTION_SECONDS = 5.0
+TRUSTED_TIME_TIMEOUT_SECONDS = 8
+PRO_AUTH_FAILURE_WINDOW_SECONDS = 30 * 60
+PRO_AUTH_LOCKOUT_BASE_SECONDS = 30
+PRO_AUTH_FIRST_LOCKOUT_FAILURE = 3
+PRO_AUTH_HARD_LOCKOUT_FAILURE = 9
+PRO_AUTH_HARD_LOCKOUT_SECONDS = 24 * 60 * 60
+PRO_AUTH_HIDDEN_DIR_NAME = ".runtime"
+PRO_AUTH_HIDDEN_FILE_NAME = "session.idx"
+INVALID_FILE_ATTRIBUTES = 0xFFFFFFFF
+FILE_ATTRIBUTE_HIDDEN = 0x2
+FILE_ATTRIBUTE_NOT_CONTENT_INDEXED = 0x2000
 WM_NCLBUTTONDOWN = 0x00A1
 HTLEFT = 10
 HTRIGHT = 11
@@ -205,7 +246,7 @@ ALLOWED_HOTKEY_BINDINGS = {
     "f12": {"scan_code": 88, "keypad": None, "label": "F12"},
 }
 DEFAULT_HOTKEY_MODE = "numpad"
-POST_TYPE_GUARD_SECONDS = 3.0
+POST_TYPE_GUARD_SECONDS = ANSWER_PREVIEW_RETENTION_SECONDS
 
 command_key_mode = DEFAULT_HOTKEY_MODE
 command_hotkeys = dict(DEFAULT_COMMAND_HOTKEYS[DEFAULT_HOTKEY_MODE])
@@ -242,6 +283,7 @@ device_id = ""
 ui_language = "en"
 indicator_position_key = "bottom_right"
 selected_pro_model_key = ""
+ui_theme_preference = "system"
 
 session_lock = Lock()
 session_id = ""
@@ -252,6 +294,7 @@ user_email = ""
 license_hint = ""
 heartbeat_interval_seconds = 20
 heartbeat_timeout_seconds = 90
+startup_preflight_license_auth = None
 
 local_model = None
 local_chat_session = None
@@ -259,6 +302,9 @@ api_backend_name = "none"
 
 heartbeat_stop_event = Event()
 heartbeat_thread = None
+update_state_lock = Lock()
+update_check_started = False
+update_in_progress = False
 
 tray_icon = None
 indicator = None
@@ -267,11 +313,11 @@ privacy_guard_stop_event = Event()
 privacy_forced_hidden = False
 indicator_manual_hidden = False
 indicator_capture_protected = False
-capture_privacy_enabled = True
 startup_progress_window = None
 settings_window_lock = Lock()
 settings_window_open = False
 config_file_lock = Lock()
+pro_auth_guard_lock = Lock()
 process_snapshot_cache_lock = Lock()
 process_snapshot_cache_at = 0.0
 process_snapshot_cache_running = set()
@@ -455,6 +501,7 @@ TRANSLATIONS = {
         "auth.settings": "Settings",
         "auth.settings.copy": "Language, startup screen, indicator location, appearance, and hotkeys.",
         "auth.settings.done": "Done",
+        "auth.open_site": "Open website",
         "auth.window.minimize": "Minimize",
         "auth.window.maximize": "Maximize",
         "auth.window.restore": "Restore",
@@ -463,22 +510,29 @@ TRANSLATIONS = {
         "auth.mode.free": "Free mode",
         "auth.mode.free.help": "Use your own Gemini API key",
         "auth.mode.pro": "Pro mode",
-        "auth.mode.pro.help": "Use your subscription code",
+        "auth.mode.pro.help": "Use your secret key",
         "auth.section.startup": "Startup",
         "auth.startup_screen.label": "Loading screen",
         "auth.startup_screen.copy": "Disable this to launch directly without the animated splash screen.",
         "auth.startup_screen.enabled": "Enabled",
         "auth.startup_screen.disabled": "Disabled",
         "auth.section.appearance": "Appearance",
+        "auth.section.theme": "Theme",
+        "auth.theme.copy": "Pick whether the setup windows follow your system or stay in one mode.",
+        "theme.system": "System",
+        "theme.dark": "Dark",
+        "theme.light": "Light",
         "auth.section.indicator_size": "Indicator size",
         "auth.section.indicator_position": "Indicator placement",
         "auth.section.free": "Use your own Gemini API key",
-        "auth.section.pro": "Connect to Pro mode",
+        "auth.section.pro": "Connect with your secret key",
         "auth.section.hotkeys": "Hotkeys",
         "auth.hotkeys.copy": "Click an action, then press the replacement key. Letters are not allowed.",
         "auth.hotkeys.waiting": "Press a new key...",
         "auth.hotkeys.invalid": "Letters and unsupported keys are not allowed here.",
         "auth.hotkeys.duplicate": "That key is already assigned to another action.",
+        "auth.hotkeys.reset": "Reset to default numpad",
+        "auth.hotkeys.reset_done": "Default numpad controls restored.",
         "auth.hotkey.primary": "Capture / Pause / Resume",
         "auth.hotkey.indicator": "Toggle indicator",
         "auth.hotkey.clear_ctx": "Clear pending",
@@ -494,21 +548,22 @@ TRANSLATIONS = {
         "auth.api.link": "Don't have a key ? Get one here",
         "auth.api.note": "Stored locally with Windows data protection (DPAPI).",
         "auth.api.helper": "We verify your key by initializing Gemini. A local format check only blocks obvious garbage.",
-        "auth.pro.label": "Subscription code",
-        "auth.pro.placeholder": "Enter your Pro code",
+        "auth.pro.label": "Secret key",
+        "auth.pro.placeholder": "Enter your secret key",
         "auth.pro.note": "The server endpoint stays managed inside the app.",
         "auth.pro.model": "Preferred Pro model",
-        "auth.pro.model.note": "Model options come from app configuration and can change later.",
+        "auth.pro.model.note": "Current Gemini screenshot models that support direct text answers.",
         "auth.preview.title": "Indicator location",
         "auth.preview.copy": "The floating indicator stays native, smooth, and capture-protected.",
         "auth.security": "Windows privacy protections and secure local secret storage stay enabled.",
         "auth.continue": "Continue",
+        "auth.continue.loading": "Checking...",
         "auth.cancel": "Cancel",
         "auth.validation.api.empty": "Enter your Gemini API key.",
         "auth.validation.api.short": "This key looks too short. Remove accidental truncation and try again.",
         "auth.validation.api.whitespace": "Remove spaces or line breaks from the API key and try again.",
         "auth.validation.api.shape": "This key still looks malformed. Check for extra characters and try again.",
-        "auth.validation.pro.empty": "Enter your subscription code.",
+        "auth.validation.pro.empty": "Enter your secret key.",
         "auth.status.free": "Free mode checks your API key locally on this device.",
         "auth.status.pro": "Pro mode signs you in with your subscription session.",
         "position.top_left": "Top left",
@@ -540,14 +595,21 @@ TRANSLATIONS = {
         "tray.toggle": "Toggle indicator",
         "tray.capture_disable": "Allow screenshots for debugging",
         "tray.capture_enable": "Re-enable screenshot hiding",
+        "tray.check_updates": "Check for updates",
         "tray.quit": "Quit",
         "tray.status": "Status: {status}",
+        "update.current": "EyesAndEars is already up to date.",
+        "update.available": "Updating to version {version}. EyesAndEars will restart.",
+        "update.failed": "Update failed: {detail}",
         "error.save_code": "Could not securely save your code on this machine.",
         "error.save_api": "Could not securely save your API key on this machine.",
         "error.connect_server": "Could not connect to the server.\n{detail}",
         "error.server_non_json": "The server returned an unexpected response ({status_code}).",
         "error.auth_failed": "Authentication request failed ({status_code}). {detail}",
         "error.auth_denied": "Authentication denied.",
+        "error.pro_lockout_wait": "Too many incorrect secret key attempts. Try again in {seconds} seconds.",
+        "error.pro_lockout_locked": "Too many incorrect secret key attempts. This device is locked for {seconds} seconds.",
+        "error.pro_time_unavailable": "Couldn't verify trusted online time. Check your connection and try again.",
         "error.api_empty": "API key is empty.",
         "error.no_sdk": "Could not initialize API mode.\n{detail}",
         "error.api_credits": "Your API key ran out of credits.\nAdd credits or enter a new key.",
@@ -569,6 +631,7 @@ TRANSLATIONS = {
         "status.api_required": "Free mode inactive - API key required",
         "status.stopped": "Stopped",
         "status.not_authenticated": "Not authenticated",
+        "indicator.cooldown": "Typing finished. Controls unlock in {seconds}s.",
     },
     "fr": {
         "lang.en": "Anglais",
@@ -606,6 +669,7 @@ TRANSLATIONS = {
         "auth.settings": "Reglages",
         "auth.settings.copy": "Langue, ecran de demarrage, emplacement de l'indicateur, apparence et raccourcis.",
         "auth.settings.done": "Terminer",
+        "auth.open_site": "Ouvrir le site",
         "auth.window.minimize": "Reduire",
         "auth.window.maximize": "Agrandir",
         "auth.window.restore": "Restaurer",
@@ -614,22 +678,29 @@ TRANSLATIONS = {
         "auth.mode.free": "Mode gratuit",
         "auth.mode.free.help": "Utiliser votre propre cle Gemini",
         "auth.mode.pro": "Mode Pro",
-        "auth.mode.pro.help": "Utiliser votre code d'abonnement",
+        "auth.mode.pro.help": "Utiliser votre cle secrete",
         "auth.section.startup": "Demarrage",
         "auth.startup_screen.label": "Ecran de chargement",
         "auth.startup_screen.copy": "Desactivez ceci pour lancer directement l'application sans l'ecran anime.",
         "auth.startup_screen.enabled": "Active",
         "auth.startup_screen.disabled": "Desactive",
         "auth.section.appearance": "Apparence",
+        "auth.section.theme": "Theme",
+        "auth.theme.copy": "Choisissez si la configuration suit le systeme ou reste dans un mode fixe.",
+        "theme.system": "Systeme",
+        "theme.dark": "Sombre",
+        "theme.light": "Clair",
         "auth.section.indicator_size": "Taille de l'indicateur",
         "auth.section.indicator_position": "Position de l'indicateur",
         "auth.section.free": "Utiliser votre propre cle Gemini",
-        "auth.section.pro": "Connexion au mode Pro",
+        "auth.section.pro": "Connexion avec votre cle secrete",
         "auth.section.hotkeys": "Raccourcis",
         "auth.hotkeys.copy": "Cliquez sur une action puis appuyez sur la nouvelle touche. Les lettres sont interdites.",
         "auth.hotkeys.waiting": "Appuyez sur une nouvelle touche...",
         "auth.hotkeys.invalid": "Les lettres et les touches non prises en charge sont interdites ici.",
         "auth.hotkeys.duplicate": "Cette touche est deja utilisee par une autre action.",
+        "auth.hotkeys.reset": "Reinitialiser au pave numerique",
+        "auth.hotkeys.reset_done": "Les controles numeriques par defaut ont ete restaures.",
         "auth.hotkey.primary": "Capturer / Pause / Reprendre",
         "auth.hotkey.indicator": "Afficher ou masquer l'indicateur",
         "auth.hotkey.clear_ctx": "Effacer l'attente",
@@ -645,21 +716,22 @@ TRANSLATIONS = {
         "auth.api.link": "Pas de cle ? Obtenez-en une ici",
         "auth.api.note": "Stockee localement avec la protection Windows (DPAPI).",
         "auth.api.helper": "Nous verifions votre cle en initialisant Gemini. Le controle local ne bloque que les erreurs evidentes.",
-        "auth.pro.label": "Code d'abonnement",
-        "auth.pro.placeholder": "Entrez votre code Pro",
+        "auth.pro.label": "Cle secrete",
+        "auth.pro.placeholder": "Entrez votre cle secrete",
         "auth.pro.note": "Le point d'acces serveur reste gere dans l'application.",
         "auth.pro.model": "Modele Pro prefere",
-        "auth.pro.model.note": "Les choix de modele viennent de la configuration de l'application et peuvent evoluer.",
+        "auth.pro.model.note": "Modeles Gemini actuels pour les captures avec reponse texte directe.",
         "auth.preview.title": "Emplacement de l'indicateur",
         "auth.preview.copy": "L'indicateur flottant reste natif, fluide et protege des captures.",
         "auth.security": "Les protections de confidentialite Windows et le stockage local securise restent actifs.",
         "auth.continue": "Continuer",
+        "auth.continue.loading": "Verification...",
         "auth.cancel": "Annuler",
         "auth.validation.api.empty": "Entrez votre cle API Gemini.",
         "auth.validation.api.short": "Cette cle semble trop courte. Verifiez si elle a ete tronquee.",
         "auth.validation.api.whitespace": "Supprimez les espaces ou retours a la ligne de la cle API.",
         "auth.validation.api.shape": "Cette cle semble mal formee. Verifiez les caracteres supplementaires.",
-        "auth.validation.pro.empty": "Entrez votre code d'abonnement.",
+        "auth.validation.pro.empty": "Entrez votre cle secrete.",
         "auth.status.free": "Le mode gratuit verifie votre cle API localement sur cet appareil.",
         "auth.status.pro": "Le mode Pro ouvre votre session d'abonnement.",
         "position.top_left": "Haut gauche",
@@ -691,14 +763,21 @@ TRANSLATIONS = {
         "tray.toggle": "Afficher ou masquer l'indicateur",
         "tray.capture_disable": "Autoriser les captures pour le debug",
         "tray.capture_enable": "Reactiver le masquage des captures",
+        "tray.check_updates": "Verifier les mises a jour",
         "tray.quit": "Quitter",
         "tray.status": "Statut : {status}",
+        "update.current": "EyesAndEars est deja a jour.",
+        "update.available": "Mise a jour vers la version {version}. EyesAndEars va redemarrer.",
+        "update.failed": "La mise a jour a echoue : {detail}",
         "error.save_code": "Impossible d'enregistrer votre code de maniere securisee sur cette machine.",
         "error.save_api": "Impossible d'enregistrer votre cle API de maniere securisee sur cette machine.",
         "error.connect_server": "Impossible de se connecter au serveur.\n{detail}",
         "error.server_non_json": "Le serveur a renvoye une reponse inattendue ({status_code}).",
         "error.auth_failed": "La demande d'authentification a echoue ({status_code}). {detail}",
         "error.auth_denied": "Authentification refusee.",
+        "error.pro_lockout_wait": "Trop de tentatives incorrectes pour la cle secrete. Reessayez dans {seconds} secondes.",
+        "error.pro_lockout_locked": "Trop de tentatives incorrectes pour la cle secrete. Cet appareil est bloque pour {seconds} secondes.",
+        "error.pro_time_unavailable": "Impossible de verifier l'heure en ligne. Verifiez votre connexion puis reessayez.",
         "error.api_empty": "La cle API est vide.",
         "error.no_sdk": "Impossible d'initialiser le mode API.\n{detail}",
         "error.api_credits": "Votre cle API n'a plus de credits.\nAjoutez des credits ou entrez une nouvelle cle.",
@@ -720,6 +799,7 @@ TRANSLATIONS = {
         "status.api_required": "Mode gratuit inactif - cle API requise",
         "status.stopped": "Arrete",
         "status.not_authenticated": "Non authentifie",
+        "indicator.cooldown": "Saisie terminee. Les commandes reviennent dans {seconds}s.",
     },
 }
 
@@ -727,17 +807,47 @@ DEFAULT_PRO_MODEL_OPTIONS = [
     {
         "id": "pro-auto",
         "label": "Auto",
-        "description": "Let the service choose the best available Pro model.",
+        "description": "Use the server default Pro model.",
     },
     {
-        "id": "gemini-2.5-pro",
-        "label": "Gemini 2.5 Pro",
-        "description": "Highest reasoning quality when available.",
+        "id": "gemini-3-flash-preview",
+        "label": "Gemini 3 Flash Preview",
+        "description": "Current fastest Gemini 3 preview for Pro users.",
+    },
+    {
+        "id": "gemini-3.1-flash-lite-preview",
+        "label": "Gemini 3.1 Flash-Lite Preview",
+        "description": "Lowest-latency Gemini 3.1 option for lightweight Pro work.",
+    },
+    {
+        "id": "gemini-3.1-pro-preview",
+        "label": "Gemini 3.1 Pro Preview",
+        "description": "Highest-quality Gemini 3.1 reasoning preview.",
     },
     {
         "id": "gemini-2.5-flash",
         "label": "Gemini 2.5 Flash",
         "description": "Faster replies with lower latency.",
+    },
+    {
+        "id": "gemini-2.5-flash-preview-09-2025",
+        "label": "Gemini 2.5 Flash Preview (09-2025)",
+        "description": "Pinned Gemini 2.5 Flash preview build.",
+    },
+    {
+        "id": "gemini-2.5-flash-lite",
+        "label": "Gemini 2.5 Flash Lite",
+        "description": "Cheaper Gemini 2.5 Flash Lite for lightweight prompts.",
+    },
+    {
+        "id": "gemini-2.5-flash-lite-preview-09-2025",
+        "label": "Gemini 2.5 Flash Lite Preview (09-2025)",
+        "description": "Pinned Gemini 2.5 Flash Lite preview build.",
+    },
+    {
+        "id": "gemini-2.5-pro",
+        "label": "Gemini 2.5 Pro",
+        "description": "Highest reasoning quality when available.",
     },
 ]
 
@@ -783,6 +893,22 @@ def detect_system_dark_mode():
         return False
 
 
+def normalize_theme_preference(value):
+    normalized = str(value or "").strip().lower()
+    if normalized in {"dark", "light", "system"}:
+        return normalized
+    return "system"
+
+
+def resolve_theme_dark(preference=None):
+    selected = normalize_theme_preference(preference if preference is not None else ui_theme_preference)
+    if selected == "dark":
+        return True
+    if selected == "light":
+        return False
+    return detect_system_dark_mode()
+
+
 def apply_ui_theme(use_dark):
     global system_dark_theme_enabled
     system_dark_theme_enabled = bool(use_dark)
@@ -790,7 +916,13 @@ def apply_ui_theme(use_dark):
     globals().update(palette)
 
 
-apply_ui_theme(detect_system_dark_mode())
+def apply_ui_theme_preference(preference=None):
+    global ui_theme_preference
+    ui_theme_preference = normalize_theme_preference(preference)
+    apply_ui_theme(resolve_theme_dark(ui_theme_preference))
+
+
+apply_ui_theme_preference(os.environ.get("EAE_THEME", ui_theme_preference))
 
 
 def normalize_language(value):
@@ -1064,6 +1196,106 @@ def normalize_server_url(value):
     return normalized
 
 
+def decode_json_response(response, context_label):
+    try:
+        return response.json()
+    except Exception:
+        content_type = str(response.headers.get("content-type", "") or "").strip().lower()
+        try:
+            snippet = str(response.text or "").strip()
+        except Exception:
+            snippet = ""
+        snippet = " ".join(snippet.split())[:220]
+        logger.warning(
+            "%s returned non-JSON data (status %s, content-type=%s, body=%r).",
+            context_label,
+            getattr(response, "status_code", "?"),
+            content_type or "unknown",
+            snippet,
+            exc_info=True,
+        )
+        return None
+
+
+def open_default_website():
+    target = str(DEFAULT_WEBSITE_URL or "").strip()
+    if not target:
+        return False
+    try:
+        parsed = urlparse(target)
+    except Exception:
+        return False
+    if parsed.scheme not in {"http", "https"}:
+        return False
+    try:
+        return bool(webbrowser.open(target, new=2))
+    except Exception:
+        return False
+
+
+def clear_startup_preflight_license_auth():
+    global startup_preflight_license_auth
+    startup_preflight_license_auth = None
+
+
+def cache_startup_preflight_license_auth(license_value, device_value, data):
+    global startup_preflight_license_auth
+    if not isinstance(data, dict):
+        startup_preflight_license_auth = None
+        return
+    startup_preflight_license_auth = {
+        "license_code": str(license_value or "").strip(),
+        "device_id": str(device_value or "").strip(),
+        "data": dict(data),
+    }
+
+
+def consume_startup_preflight_license_auth(license_value, device_value):
+    global startup_preflight_license_auth
+    cached = startup_preflight_license_auth if isinstance(startup_preflight_license_auth, dict) else None
+    if not cached:
+        return None
+    if (
+        str(cached.get("license_code", "")).strip() != str(license_value or "").strip()
+        or str(cached.get("device_id", "")).strip() != str(device_value or "").strip()
+    ):
+        return None
+    startup_preflight_license_auth = None
+    data = cached.get("data")
+    return dict(data) if isinstance(data, dict) else None
+
+
+def perform_license_auth_request(license_value, device_value):
+    payload = {
+        "license_code": str(license_value or "").strip(),
+        "device_id": str(device_value or "").strip(),
+        "device_name": os.environ.get("COMPUTERNAME", os.environ.get("HOSTNAME", "Windows")),
+        "app_version": APP_VERSION,
+    }
+    try:
+        response = request_json("POST", "/api/v1/client/authenticate", json_payload=payload, timeout=20)
+    except Exception as exc:
+        logger.warning("License authentication request failed.", exc_info=True)
+        return False, tr("error.connect_server", detail=exc), None, "network_error"
+
+    data = decode_json_response(response, "License authentication")
+    if data is None:
+        return False, tr("error.server_non_json", status_code=response.status_code), None, "server_non_json"
+    if not response.ok:
+        message = data.get("detail") if isinstance(data, dict) else ""
+        logger.warning("License authentication failed with status %s.", response.status_code)
+        return False, tr("error.auth_failed", status_code=response.status_code, detail=message), None, "http_error"
+    if not data.get("success"):
+        denial_message = str(data.get("message", tr("error.auth_denied")) or "").strip()
+        logger.info("License authentication denied by server.")
+        if license_message_is_lockout(denial_message):
+            return False, denial_message, None, "lockout"
+        if license_message_is_invalid_secret(denial_message):
+            return False, denial_message, None, "invalid_secret"
+        return False, denial_message or tr("error.auth_denied"), None, "denied"
+    return True, tr("startup.ready"), data, "ok"
+
+
 def resolve_install_root():
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent
@@ -1087,6 +1319,8 @@ def resolve_data_dir(install_root):
 APP_INSTALL_ROOT = resolve_install_root()
 APP_DATA_DIR = resolve_data_dir(APP_INSTALL_ROOT)
 CONFIG_FILE = APP_DATA_DIR / CONFIG_FILE_NAME
+PRO_AUTH_RUNTIME_DIR = APP_DATA_DIR / PRO_AUTH_HIDDEN_DIR_NAME
+PRO_AUTH_LOCK_FILE = PRO_AUTH_RUNTIME_DIR / PRO_AUTH_HIDDEN_FILE_NAME
 
 if os.name == "nt":
     HRESULT = getattr(wintypes, "HRESULT", ctypes.c_long)
@@ -1633,14 +1867,15 @@ def decrypt_with_dpapi(cipher_b64):
 
 
 def load_config_record():
-    if not CONFIG_FILE.exists():
-        return {}
-    try:
-        data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
-        if isinstance(data, dict):
-            return data
-    except Exception:
-        pass
+    with config_file_lock:
+        if not CONFIG_FILE.exists():
+            return {}
+        try:
+            data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return data
+        except Exception:
+            pass
     return {}
 
 
@@ -1688,6 +1923,298 @@ def save_secret(record, plain_key, encrypted_key, value):
         return False
     save_config_record(record)
     return True
+
+
+def set_hidden_path_flag(path):
+    if os.name != "nt":
+        return False
+    try:
+        normalized = str(Path(path))
+        get_attributes = getattr(ctypes.windll.kernel32, "GetFileAttributesW", None)
+        set_attributes = getattr(ctypes.windll.kernel32, "SetFileAttributesW", None)
+        if get_attributes is None or set_attributes is None:
+            return False
+        current_attributes = int(get_attributes(normalized))
+        if current_attributes == INVALID_FILE_ATTRIBUTES:
+            current_attributes = 0
+        desired_attributes = current_attributes | FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_NOT_CONTENT_INDEXED
+        if desired_attributes != current_attributes:
+            return bool(set_attributes(normalized, desired_attributes))
+        return True
+    except Exception:
+        logger.debug("Failed to mark hidden runtime path: %s", path, exc_info=True)
+        return False
+
+
+def ensure_pro_auth_runtime_dir():
+    PRO_AUTH_RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+    set_hidden_path_flag(PRO_AUTH_RUNTIME_DIR)
+    return PRO_AUTH_RUNTIME_DIR
+
+
+def normalize_pro_auth_guard_state(payload=None):
+    data = payload if isinstance(payload, dict) else {}
+    normalized = {
+        "version": 1,
+        "failure_count": 0,
+        "last_failure_at": 0,
+        "locked_at": 0,
+        "locked_until": 0,
+        "hard_locked": False,
+        "time_source": "",
+    }
+    for key in ("version", "failure_count", "last_failure_at", "locked_at", "locked_until"):
+        try:
+            normalized[key] = max(0, int(data.get(key, normalized[key])))
+        except Exception:
+            pass
+    normalized["hard_locked"] = bool(data.get("hard_locked", False))
+    normalized["time_source"] = str(data.get("time_source", "") or "").strip()[:255]
+    return normalized
+
+
+def load_pro_auth_guard_state():
+    with pro_auth_guard_lock:
+        if not PRO_AUTH_LOCK_FILE.exists():
+            return normalize_pro_auth_guard_state()
+        try:
+            raw_payload = PRO_AUTH_LOCK_FILE.read_text(encoding="utf-8").strip()
+        except Exception:
+            return normalize_pro_auth_guard_state()
+    if not raw_payload:
+        return normalize_pro_auth_guard_state()
+    if os.name == "nt":
+        plain_payload = decrypt_with_dpapi(raw_payload)
+    else:
+        try:
+            plain_payload = base64.b64decode(raw_payload).decode("utf-8")
+        except Exception:
+            plain_payload = ""
+    if not plain_payload:
+        return normalize_pro_auth_guard_state()
+    try:
+        decoded = json.loads(plain_payload)
+    except Exception:
+        decoded = {}
+    return normalize_pro_auth_guard_state(decoded)
+
+
+def save_pro_auth_guard_state(payload):
+    state = normalize_pro_auth_guard_state(payload)
+    should_clear = (
+        state["failure_count"] <= 0
+        and state["last_failure_at"] <= 0
+        and state["locked_at"] <= 0
+        and state["locked_until"] <= 0
+        and not state["hard_locked"]
+    )
+    ensure_pro_auth_runtime_dir()
+    with pro_auth_guard_lock:
+        if should_clear:
+            try:
+                if PRO_AUTH_LOCK_FILE.exists():
+                    PRO_AUTH_LOCK_FILE.unlink()
+            except Exception:
+                pass
+            return
+        serialized = json.dumps(state, separators=(",", ":"), sort_keys=True)
+        if os.name == "nt":
+            stored_payload = encrypt_with_dpapi(serialized)
+            if not stored_payload:
+                raise RuntimeError("Could not protect Pro auth guard state with DPAPI.")
+        else:
+            stored_payload = base64.b64encode(serialized.encode("utf-8")).decode("ascii")
+        temp_path = PRO_AUTH_RUNTIME_DIR / f"{PRO_AUTH_HIDDEN_FILE_NAME}.{secrets.token_hex(6)}.tmp"
+        temp_path.write_text(stored_payload, encoding="utf-8")
+        try:
+            os.replace(temp_path, PRO_AUTH_LOCK_FILE)
+            set_hidden_path_flag(PRO_AUTH_LOCK_FILE)
+        finally:
+            try:
+                if temp_path.exists():
+                    temp_path.unlink()
+            except Exception:
+                pass
+
+
+def clear_pro_auth_guard_state():
+    save_pro_auth_guard_state({})
+
+
+def parse_remote_utc_epoch(value):
+    text = str(value or "").strip()
+    if not text:
+        return 0
+    try:
+        normalized = text.replace("Z", "+00:00")
+        normalized = re.sub(r"\.(\d{6})\d+(?=([+-]\d{2}:\d{2})?$)", r".\1", normalized)
+        parsed = datetime.fromisoformat(normalized)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return max(0, int(parsed.timestamp()))
+    except Exception:
+        return 0
+
+
+def extract_trusted_epoch_from_payload(payload):
+    if not isinstance(payload, dict):
+        return 0
+    for key in ("unixtime", "unixTime", "timestamp"):
+        raw_value = payload.get(key)
+        if isinstance(raw_value, (int, float)):
+            return max(0, int(raw_value))
+        try:
+            candidate = int(str(raw_value or "").strip())
+            if candidate > 0:
+                return candidate
+        except Exception:
+            pass
+    for key in ("utc_datetime", "utcDateTime", "datetime", "dateTime", "currentDateTime"):
+        candidate = parse_remote_utc_epoch(payload.get(key))
+        if candidate > 0:
+            return candidate
+    return 0
+
+
+def fetch_trusted_utc_epoch():
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": f"{APP_NAME}/{APP_VERSION}",
+    }
+    failures = []
+    for url in TRUSTED_TIME_URLS:
+        try:
+            response = HTTP_SESSION.get(url, headers=headers, timeout=TRUSTED_TIME_TIMEOUT_SECONDS, allow_redirects=True)
+        except requests.RequestException as exc:
+            failures.append(f"{url} ({exc})")
+            continue
+        if not response.ok:
+            failures.append(f"{url} (status {response.status_code})")
+            continue
+        try:
+            payload = response.json()
+        except Exception:
+            failures.append(f"{url} (non-JSON)")
+            continue
+        trusted_epoch = extract_trusted_epoch_from_payload(payload)
+        if trusted_epoch > 0:
+            return trusted_epoch, url
+        failures.append(f"{url} (missing time value)")
+    if failures:
+        logger.warning("Trusted online time lookup failed: %s", "; ".join(failures[:3]))
+    raise RuntimeError(tr("error.pro_time_unavailable"))
+
+
+def license_message_is_lockout(message):
+    text = str(message or "").strip().lower()
+    return "too many incorrect secret key attempts" in text
+
+
+def license_message_is_invalid_secret(message):
+    text = str(message or "").strip().lower()
+    return "incorrect secret key" in text
+
+
+def extract_lockout_seconds_from_message(message):
+    text = str(message or "").strip().lower()
+    if not text:
+        return 0, False
+    seconds_match = re.search(r"(\d+)\s+seconds?", text)
+    if seconds_match:
+        seconds_value = max(0, int(seconds_match.group(1)))
+        return seconds_value, "locked for" in text
+    hours_match = re.search(r"(\d+)\s+hours?", text)
+    if hours_match:
+        return max(0, int(hours_match.group(1))) * 3600, True
+    return 0, False
+
+
+def pro_auth_lockout_duration_for_failure_count(failure_count):
+    count = max(0, int(failure_count or 0))
+    if count >= PRO_AUTH_HARD_LOCKOUT_FAILURE:
+        return PRO_AUTH_HARD_LOCKOUT_SECONDS, True
+    if count < PRO_AUTH_FIRST_LOCKOUT_FAILURE:
+        return 0, False
+    lockout_level = max(0, count - 2)
+    return PRO_AUTH_LOCKOUT_BASE_SECONDS * (2 ** max(0, lockout_level - 1)), False
+
+
+def build_pro_auth_lockout_message(seconds, hard_locked=False):
+    remaining_seconds = max(1, int(math.ceil(float(seconds or 0))))
+    key = "error.pro_lockout_locked" if hard_locked else "error.pro_lockout_wait"
+    return tr(key, seconds=remaining_seconds)
+
+
+def inspect_pro_auth_guard(now_epoch):
+    current_time = max(0, int(now_epoch or 0))
+    state = load_pro_auth_guard_state()
+    changed = False
+    if state["locked_until"] > 0 and current_time >= state["locked_until"]:
+        state = normalize_pro_auth_guard_state()
+        changed = True
+    elif state["failure_count"] > 0 and state["last_failure_at"] > 0:
+        if current_time - state["last_failure_at"] > PRO_AUTH_FAILURE_WINDOW_SECONDS:
+            state = normalize_pro_auth_guard_state()
+            changed = True
+    if changed:
+        save_pro_auth_guard_state(state)
+    if state["locked_until"] > current_time:
+        remaining = max(1, state["locked_until"] - current_time)
+        return True, remaining, bool(state["hard_locked"]), state
+    return False, 0, False, state
+
+
+def get_live_pro_auth_lockout_state():
+    try:
+        trusted_now, _time_source = fetch_trusted_utc_epoch()
+    except Exception:
+        return 0, False
+    is_locked, remaining_seconds, hard_locked, _state = inspect_pro_auth_guard(trusted_now)
+    if not is_locked or remaining_seconds <= 0:
+        return 0, False
+    return int(max(1, remaining_seconds)), bool(hard_locked)
+
+
+def record_local_pro_auth_failure(now_epoch, time_source=""):
+    current_time = max(0, int(now_epoch or 0))
+    _, _, _, state = inspect_pro_auth_guard(current_time)
+    if state["failure_count"] > 0 and state["last_failure_at"] > 0:
+        if current_time - state["last_failure_at"] > PRO_AUTH_FAILURE_WINDOW_SECONDS:
+            state = normalize_pro_auth_guard_state()
+    state["failure_count"] = max(0, int(state.get("failure_count", 0))) + 1
+    state["last_failure_at"] = current_time
+    state["time_source"] = str(time_source or "").strip()[:255]
+    lockout_seconds, hard_locked = pro_auth_lockout_duration_for_failure_count(state["failure_count"])
+    if lockout_seconds > 0:
+        state["locked_at"] = current_time
+        state["locked_until"] = current_time + lockout_seconds
+        state["hard_locked"] = bool(hard_locked)
+    else:
+        state["locked_at"] = 0
+        state["locked_until"] = 0
+        state["hard_locked"] = False
+    save_pro_auth_guard_state(state)
+    if lockout_seconds > 0:
+        return build_pro_auth_lockout_message(lockout_seconds, hard_locked=hard_locked)
+    return ""
+
+
+def sync_local_pro_auth_lockout(now_epoch, server_message, time_source=""):
+    lockout_seconds, hard_locked = extract_lockout_seconds_from_message(server_message)
+    if lockout_seconds <= 0:
+        return str(server_message or tr("error.auth_denied"))
+    state = load_pro_auth_guard_state()
+    state["failure_count"] = max(
+        int(state.get("failure_count", 0) or 0),
+        PRO_AUTH_HARD_LOCKOUT_FAILURE if hard_locked else PRO_AUTH_FIRST_LOCKOUT_FAILURE,
+    )
+    state["last_failure_at"] = max(0, int(now_epoch or 0))
+    state["locked_at"] = max(0, int(now_epoch or 0))
+    state["locked_until"] = state["locked_at"] + lockout_seconds
+    state["hard_locked"] = bool(hard_locked)
+    state["time_source"] = str(time_source or "").strip()[:255]
+    save_pro_auth_guard_state(state)
+    return build_pro_auth_lockout_message(lockout_seconds, hard_locked=hard_locked)
 
 
 def find_env_api_key():
@@ -2460,7 +2987,14 @@ def show_styled_message(title, message, is_error=False, ask_retry=False, parent=
     return bool(result["value"])
 
 
-def prompt_startup_auth_legacy(initial_server_url, initial_license, initial_api_key, initial_blob_size="medium", initial_mode="api"):
+def prompt_startup_auth_legacy(
+    initial_server_url,
+    initial_license,
+    initial_api_key,
+    initial_blob_size="medium",
+    initial_mode="api",
+    initial_error="",
+):
     _ = initial_server_url
     result = {"value": None}
     root, card = make_dialog_shell(tr("auth.window_title"), 920, 760)
@@ -2487,15 +3021,18 @@ def prompt_startup_auth_legacy(initial_server_url, initial_license, initial_api_
     license_var = tk.StringVar(value=initial_license or "")
     api_var = tk.StringVar(value=initial_api_key or "")
     show_api_var = tk.BooleanVar(value=False)
-    error_var = tk.StringVar(value="")
+    error_var = tk.StringVar(value=str(initial_error or ""))
     subscription_unlocked_var = tk.BooleanVar(value=True)
     subscription_state_var = tk.StringVar(value="")
     wrap_labels = []
 
     header = tk.Frame(card, bg=UI_CARD_BG, bd=0)
     header.pack(fill="x", padx=30, pady=(24, 10))
-    title_label = tk.Label(header, text="", bg=UI_CARD_BG, fg=UI_TEXT, font=(UI_FONT, 31, "bold"))
+    title_label = tk.Label(header, text="", bg=UI_CARD_BG, fg=UI_TEXT, font=(UI_FONT, 31, "bold"), cursor="hand2")
     title_label.pack(anchor="w", pady=(0, 2))
+    title_label.bind("<Button-1>", lambda _event: open_default_website(), add="+")
+    title_label.bind("<Enter>", lambda _event: title_label.configure(fg=UI_ACCENT), add="+")
+    title_label.bind("<Leave>", lambda _event: title_label.configure(fg=UI_TEXT), add="+")
     subtitle_label = tk.Label(
         header,
         text="",
@@ -2805,6 +3342,7 @@ def prompt_startup_auth_legacy(initial_server_url, initial_license, initial_api_
         return label, entry
 
     license_label_widget, license_entry = make_labeled_entry(license_frame, "", license_var)
+    license_entry.bind("<KeyRelease>", lambda _event: error_var.set(""), add="+")
     license_hint_label = tk.Label(
         license_frame,
         text="",
@@ -2847,6 +3385,7 @@ def prompt_startup_auth_legacy(initial_server_url, initial_license, initial_api_
     wrap_labels.append(pro_model_hint_label)
 
     api_label_widget, api_entry = make_labeled_entry(api_frame, "", api_var, show="*")
+    api_entry.bind("<KeyRelease>", lambda _event: error_var.set(""), add="+")
     api_options = tk.Frame(api_frame, bg=UI_PANEL_BG, bd=0)
     api_options.pack(fill="x", pady=(8, 0))
 
@@ -3273,7 +3812,7 @@ class AuthShellBridge:
 
     def submit(self, payload):
         if not isinstance(payload, dict):
-            return False
+            return {"ok": False, "error": "Invalid setup payload."}
         hotkeys, hotkey_mode, hotkeys_customized = resolve_command_hotkey_state(
             payload.get("hotkeys"),
             payload.get("hotkey_mode", command_key_mode),
@@ -3281,6 +3820,7 @@ class AuthShellBridge:
         normalized = {
             "mode": "license" if str(payload.get("mode", "")).strip().lower() == "license" else "api",
             "language": normalize_language(payload.get("language", ui_language)),
+            "theme": normalize_theme_preference(payload.get("theme", ui_theme_preference)),
             "blob_size": normalize_indicator_blob_size(payload.get("blob_size", indicator_blob_size_key)),
             "indicator_position": normalize_indicator_position(payload.get("indicator_position", indicator_position_key)),
             "show_startup_screen": normalize_startup_loading_screen_enabled(payload.get("show_startup_screen", startup_loading_screen_enabled)),
@@ -3291,10 +3831,56 @@ class AuthShellBridge:
         }
         if normalized["mode"] == "license":
             normalized["license_code"] = str(payload.get("license_code", "") or "").strip()
+            try:
+                trusted_now, trusted_time_source = fetch_trusted_utc_epoch()
+            except Exception as exc:
+                clear_startup_preflight_license_auth()
+                return {"ok": False, "error": str(exc or tr("error.pro_time_unavailable"))}
+            is_locked, remaining_seconds, hard_locked, _guard_state = inspect_pro_auth_guard(trusted_now)
+            if is_locked:
+                clear_startup_preflight_license_auth()
+                return {
+                    "ok": False,
+                    "error": build_pro_auth_lockout_message(remaining_seconds, hard_locked=hard_locked),
+                    "lockout_seconds": int(max(1, remaining_seconds)),
+                    "lockout_hard": bool(hard_locked),
+                }
+            ok, message, auth_data, reason = perform_license_auth_request(normalized["license_code"], device_id)
+            if not ok:
+                clear_startup_preflight_license_auth()
+                lockout_seconds = 0
+                lockout_hard = False
+                if reason == "lockout":
+                    try:
+                        message = sync_local_pro_auth_lockout(trusted_now, message, time_source=trusted_time_source)
+                    except Exception:
+                        logger.warning("Could not persist server-side Pro auth lockout state.", exc_info=True)
+                    lockout_seconds, lockout_hard = extract_lockout_seconds_from_message(message)
+                elif reason == "invalid_secret":
+                    try:
+                        local_lockout_message = record_local_pro_auth_failure(trusted_now, time_source=trusted_time_source)
+                    except Exception:
+                        logger.warning("Could not persist local Pro auth failure state.", exc_info=True)
+                        local_lockout_message = ""
+                    if local_lockout_message:
+                        message = local_lockout_message
+                        lockout_seconds, lockout_hard = extract_lockout_seconds_from_message(local_lockout_message)
+                result = {"ok": False, "error": str(message or tr("error.auth_denied"))}
+                if lockout_seconds > 0:
+                    result["lockout_seconds"] = int(max(1, lockout_seconds))
+                    result["lockout_hard"] = bool(lockout_hard)
+                return result
+            try:
+                clear_pro_auth_guard_state()
+            except Exception:
+                logger.warning("Could not clear local Pro auth failure state after successful sign-in.", exc_info=True)
+            cache_startup_preflight_license_auth(normalized["license_code"], device_id, auth_data)
         else:
             normalized["api_key"] = str(payload.get("api_key", "") or "").strip()
+            clear_startup_preflight_license_auth()
         self._result = normalized
-        return self.close()
+        self.close()
+        return {"ok": True}
 
     def close(self):
         try:
@@ -3397,6 +3983,13 @@ class AuthShellBridge:
         if not target:
             return False
         try:
+            parsed = urlparse(target)
+        except Exception:
+            return False
+        if parsed.scheme not in {"http", "https"}:
+            logger.warning("open_external blocked non-http(s) URL scheme: %s", parsed.scheme)
+            return False
+        try:
             return bool(webbrowser.open(target, new=2))
         except Exception:
             return False
@@ -3408,11 +4001,13 @@ def build_auth_shell_html(initial_state):
         "initialState": dict(initial_state),
         "hotkeyActionIds": list(HOTKEY_ACTION_ORDER),
         "allowedHotkeys": dict(ALLOWED_HOTKEY_BINDINGS),
+        "defaultNumpadHotkeys": get_default_command_hotkeys("numpad"),
         "sizeIds": list(INDICATOR_BLOB_SIZES.keys()),
         "positionIds": list(INDICATOR_POSITIONS.keys()),
         "positionPoints": dict(INDICATOR_PREVIEW_POINTS),
         "proModels": list(PRO_MODEL_OPTIONS),
         "apiKeyUrl": "https://aistudio.google.com/api-keys",
+        "websiteUrl": DEFAULT_WEBSITE_URL,
         "themeDark": bool(system_dark_theme_enabled),
     }
     template = r"""
@@ -3497,6 +4092,38 @@ def build_auth_shell_html(initial_state):
       gap: 12px;
       min-width: 0;
     }
+    .window-brand-link,
+    .hero-title-link {
+      padding: 0;
+      border: none;
+      background: transparent;
+      color: inherit;
+      font: inherit;
+      text-align: left;
+      cursor: pointer;
+      transition: color 180ms ease, transform 180ms ease, text-shadow 180ms ease;
+    }
+    .window-brand-link {
+      display: inline-flex;
+      align-items: center;
+      gap: 12px;
+      min-width: 0;
+      border-radius: 14px;
+    }
+    .window-brand-link:hover,
+    .window-brand-link:focus-visible,
+    .hero-title-link:hover,
+    .hero-title-link:focus-visible {
+      color: #7fb6ff;
+      text-shadow: 0 0 18px rgba(91, 162, 255, 0.26);
+      transform: translateY(-1px);
+      outline: none;
+    }
+    .window-drag-fill {
+      min-width: 28px;
+      flex: 1 1 auto;
+      align-self: stretch;
+    }
     .window-brand-mark {
       width: 18px;
       height: 18px;
@@ -3579,6 +4206,17 @@ def build_auth_shell_html(initial_state):
       font-size: clamp(32px, 5vw, 52px);
       line-height: 1;
       letter-spacing: -0.04em;
+    }
+    .hero-title-link {
+      width: fit-content;
+      max-width: 100%;
+      font-size: clamp(32px, 5vw, 52px);
+      line-height: 1;
+      letter-spacing: -0.04em;
+      font-weight: 700;
+    }
+    .hero-title-link #title {
+      display: block;
     }
     .subtitle { color: var(--muted); max-width: 540px; line-height: 1.55; }
     .card {
@@ -3667,9 +4305,41 @@ def build_auth_shell_html(initial_state):
     }
     .ghost { background: rgba(255,255,255,0.06); }
     .primary {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 10px;
       background: linear-gradient(180deg, #54a2ff, #1d6deb);
       border-color: rgba(120,183,255,0.56);
       box-shadow: 0 18px 36px rgba(26,92,205,0.35);
+    }
+    .primary:disabled,
+    .ghost:disabled,
+    .segment:disabled,
+    .pill:disabled {
+      cursor: default;
+      opacity: 0.78;
+      transform: none !important;
+    }
+    .primary.loading {
+      box-shadow: 0 18px 36px rgba(26,92,205,0.28);
+    }
+    .button-spinner {
+      width: 16px;
+      height: 16px;
+      display: none;
+      border-radius: 999px;
+      border: 2px solid rgba(255,255,255,0.28);
+      border-top-color: rgba(255,255,255,0.96);
+      animation: authSpin 820ms linear infinite;
+      flex: 0 0 auto;
+    }
+    .primary.loading .button-spinner {
+      display: inline-block;
+    }
+    @keyframes authSpin {
+      from { transform: rotate(0deg); }
+      to { transform: rotate(360deg); }
     }
     .field {
       display: flex;
@@ -3814,6 +4484,43 @@ def build_auth_shell_html(initial_state):
     }
     .text-link:hover {
       color: var(--text);
+    }
+    .model-options {
+      display: grid;
+      gap: 10px;
+      margin-top: 14px;
+    }
+    .model-option {
+      width: 100%;
+      display: grid;
+      gap: 4px;
+      text-align: left;
+      padding: 14px 16px;
+      border-radius: 18px;
+      border: 1px solid var(--border);
+      background: rgba(255,255,255,0.05);
+      color: var(--text);
+      cursor: pointer;
+      transition: 180ms ease;
+    }
+    .model-option:hover {
+      transform: translateY(-1px);
+      background: rgba(255,255,255,0.08);
+    }
+    .model-option.active {
+      background: linear-gradient(180deg, rgba(59,140,255,0.22), rgba(20,39,69,0.92));
+      border-color: rgba(120,183,255,0.58);
+      box-shadow: 0 16px 30px rgba(14,34,66,0.24);
+    }
+    .model-option-title {
+      font-size: 14px;
+      font-weight: 700;
+      letter-spacing: -0.01em;
+    }
+    .model-option-copy {
+      font-size: 12px;
+      color: var(--muted);
+      line-height: 1.45;
     }
     .hotkey-list {
       display: grid;
@@ -4031,12 +4738,13 @@ def build_auth_shell_html(initial_state):
 <body class="theme-dark">
   <div class="window-shell">
     <header class="window-bar">
-      <div class="window-drag-zone pywebview-drag-region">
-        <div class="window-brand">
+      <div class="window-drag-zone">
+        <button class="window-brand-link" id="windowBrandLink" type="button">
           <div class="window-brand-mark"></div>
           <div class="window-caption" id="windowCaption"></div>
-        </div>
+        </button>
         <div class="window-status" id="windowStatus"></div>
+        <div class="window-drag-fill pywebview-drag-region"></div>
       </div>
       <div class="window-controls">
         <button class="chrome-control" id="settingsToggleButton" type="button" aria-label="Settings"></button>
@@ -4048,7 +4756,7 @@ def build_auth_shell_html(initial_state):
     <main class="app">
       <section class="hero">
         <div class="hero-copy">
-          <h1 id="title"></h1>
+          <button class="hero-title-link" id="titleButton" type="button"><span id="title"></span></button>
           <p class="subtitle" id="subtitle"></p>
         </div>
         <div class="modes">
@@ -4088,7 +4796,10 @@ def build_auth_shell_html(initial_state):
         <div class="error" id="errorText"></div>
         <div class="actions">
           <button class="ghost" id="cancelButton" type="button"></button>
-          <button class="primary" id="continueButton" type="button"></button>
+          <button class="primary" id="continueButton" type="button">
+            <span class="button-spinner" id="continueSpinner"></span>
+            <span id="continueButtonLabel"></span>
+          </button>
         </div>
       </section>
     </main>
@@ -4124,12 +4835,18 @@ def build_auth_shell_html(initial_state):
         </div>
         <div class="card">
           <div class="section" id="appearanceTitle"></div>
+          <label class="label" id="themeTitle"></label>
+          <div class="segment-wrap" id="themeButtons"></div>
+          <p class="helper" id="themeCopy" style="margin: 12px 0 14px;"></p>
           <label class="label" id="sizeTitle"></label>
           <div class="sizes" id="sizeButtons"></div>
         </div>
         <div class="card">
           <div class="section" id="hotkeysTitle"></div>
           <p class="helper" id="hotkeysCopy"></p>
+          <div class="actions" style="justify-content: flex-start; margin: 12px 0 0; padding-top: 0;">
+            <button class="ghost" id="hotkeysResetButton" type="button" style="min-width: 0; padding: 10px 16px;"></button>
+          </div>
           <div class="hotkey-list" id="hotkeyList"></div>
           <p class="helper hotkey-feedback" id="hotkeysFeedback" style="margin-top: 12px;"></p>
           <p class="helper" id="securityCopy" style="margin-top: 12px;"></p>
@@ -4137,7 +4854,8 @@ def build_auth_shell_html(initial_state):
         <div class="card" id="modelSettingsCard">
           <div class="section" id="proSectionTitle"></div>
           <label class="label" id="modelLabel"></label>
-          <div class="field"><select id="modelSelect"></select></div>
+          <input id="modelSelect" type="hidden" value="">
+          <div class="model-options" id="modelOptions"></div>
           <p class="helper" id="modelNote" style="margin-top: 12px;"></p>
         </div>
       </div>
@@ -4158,6 +4876,7 @@ def build_auth_shell_html(initial_state):
     const state = Object.assign({
       mode: 'api',
       language: 'en',
+      theme: 'system',
       blob_size: 'medium',
       indicator_position: 'bottom_right',
       show_startup_screen: true,
@@ -4165,22 +4884,29 @@ def build_auth_shell_html(initial_state):
       hotkey_mode: 'numpad',
       pro_model: '',
       api_key: '',
-      license_code: ''
+      license_code: '',
+      error_message: '',
+      lockout_until_ms: 0,
+      lockout_hard: false
     }, bootstrap.initialState || {});
     const hotkeyActionIds = bootstrap.hotkeyActionIds || [];
     const allowedHotkeys = bootstrap.allowedHotkeys || {};
+    const defaultNumpadHotkeys = bootstrap.defaultNumpadHotkeys || {};
     const sizeIds = bootstrap.sizeIds || [];
     const positionIds = bootstrap.positionIds || [];
     const positionPoints = bootstrap.positionPoints || {};
     const proModels = bootstrap.proModels || [];
     const apiKeyUrl = bootstrap.apiKeyUrl || '';
+    const websiteUrl = bootstrap.websiteUrl || '';
     let themeDark = !!bootstrap.themeDark;
     let closePending = false;
     let settingsOpen = false;
     let awaitingHotkeyAction = '';
+    let hotkeyFeedbackKey = 'auth.hotkeys.copy';
     let windowMaximized = false;
+    let isSubmitting = false;
+    let lockoutTickHandle = null;
     const themeMedia = window.matchMedia ? window.matchMedia('(prefers-color-scheme: dark)') : null;
-    if (themeMedia && typeof themeMedia.matches === 'boolean') themeDark = themeMedia.matches;
 
     function t(key, vars) {
       let text = (((copy[state.language] || {})[key]) || ((copy.en || {})[key]) || key);
@@ -4191,6 +4917,76 @@ def build_auth_shell_html(initial_state):
     function setText(id, value) {
       const node = document.getElementById(id);
       if (node) node.textContent = value;
+    }
+
+    function nextPaint() {
+      return new Promise((resolve) => {
+        if (typeof window.requestAnimationFrame === 'function') {
+          window.requestAnimationFrame(() => resolve());
+          return;
+        }
+        window.setTimeout(resolve, 0);
+      });
+    }
+
+    function renderSubmitButton() {
+      const button = document.getElementById('continueButton');
+      if (!button) return;
+      button.classList.toggle('loading', isSubmitting);
+      button.disabled = !!isSubmitting || currentLockoutSeconds() > 0;
+      button.setAttribute('aria-busy', isSubmitting ? 'true' : 'false');
+      setText('continueButtonLabel', isSubmitting ? t('auth.continue.loading') : t('auth.continue'));
+    }
+
+    function currentLockoutSeconds() {
+      const remainingMs = Math.max(0, Number(state.lockout_until_ms || 0) - Date.now());
+      if (remainingMs <= 0) return 0;
+      return Math.max(1, Math.ceil(remainingMs / 1000));
+    }
+
+    function clearLockoutState() {
+      state.lockout_until_ms = 0;
+      state.lockout_hard = false;
+    }
+
+    function setLockoutState(seconds, hardLocked) {
+      const normalizedSeconds = Math.max(0, Number(seconds || 0));
+      if (normalizedSeconds <= 0) {
+        clearLockoutState();
+        return;
+      }
+      state.lockout_until_ms = Date.now() + (normalizedSeconds * 1000);
+      state.lockout_hard = !!hardLocked;
+    }
+
+    function lockoutMessage() {
+      const remaining = currentLockoutSeconds();
+      if (remaining <= 0) return '';
+      return t(state.lockout_hard ? 'error.pro_lockout_locked' : 'error.pro_lockout_wait', { seconds: remaining });
+    }
+
+    function renderLockoutState() {
+      const remaining = currentLockoutSeconds();
+      if (remaining > 0) {
+        state.error_message = lockoutMessage();
+        setText('errorText', state.error_message);
+      } else if (state.lockout_until_ms) {
+        clearLockoutState();
+        state.error_message = '';
+        setText('errorText', '');
+      }
+      renderSubmitButton();
+    }
+
+    function ensureLockoutTicker() {
+      if (lockoutTickHandle !== null) return;
+      lockoutTickHandle = window.setInterval(() => {
+        renderLockoutState();
+      }, 250);
+    }
+
+    if (Number(state.lockout_seconds || 0) > 0) {
+      setLockoutState(state.lockout_seconds, !!state.lockout_hard);
     }
 
     function iconSvg(name) {
@@ -4230,8 +5026,15 @@ def build_auth_shell_html(initial_state):
       return state.mode === 'license' ? t('auth.status.pro') : t('auth.status.free');
     }
 
+    function resolveThemeDarkJs() {
+      if (state.theme === 'dark') return true;
+      if (state.theme === 'light') return false;
+      if (themeMedia && typeof themeMedia.matches === 'boolean') return !!themeMedia.matches;
+      return !!bootstrap.themeDark;
+    }
+
     function settingsSummaryText() {
-      return `${t(`lang.${state.language}`)} / ${t(`position.${state.indicator_position}`)} / ${t(`size.${state.blob_size}`)}`;
+      return `${t(`lang.${state.language}`)} / ${t(`theme.${state.theme}`)} / ${t(`position.${state.indicator_position}`)} / ${t(`size.${state.blob_size}`)}`;
     }
 
     function hotkeyBindingLabelJs(bindingKey) {
@@ -4320,7 +5123,8 @@ def build_auth_shell_html(initial_state):
         button.textContent = awaitingHotkeyAction === action ? t('auth.hotkeys.waiting') : hotkeyBindingLabelJs(state.hotkeys[action]);
         button.onclick = () => {
           awaitingHotkeyAction = awaitingHotkeyAction === action ? '' : action;
-          setText('hotkeysFeedback', awaitingHotkeyAction ? t('auth.hotkeys.waiting') : t('auth.hotkeys.copy'));
+          hotkeyFeedbackKey = awaitingHotkeyAction ? 'auth.hotkeys.waiting' : 'auth.hotkeys.copy';
+          setText('hotkeysFeedback', t(hotkeyFeedbackKey));
           renderHotkeys();
         };
         row.appendChild(label);
@@ -4334,25 +5138,38 @@ def build_auth_shell_html(initial_state):
       event.preventDefault();
       event.stopPropagation();
       if (event.ctrlKey || event.altKey || event.metaKey) {
-        setText('hotkeysFeedback', t('auth.hotkeys.invalid'));
+        hotkeyFeedbackKey = 'auth.hotkeys.invalid';
+        setText('hotkeysFeedback', t(hotkeyFeedbackKey));
         return true;
       }
       const bindingKey = normalizeHotkeyEvent(event);
       if (!bindingKey) {
-        setText('hotkeysFeedback', t('auth.hotkeys.invalid'));
+        hotkeyFeedbackKey = 'auth.hotkeys.invalid';
+        setText('hotkeysFeedback', t(hotkeyFeedbackKey));
         return true;
       }
       const duplicateAction = hotkeyActionIds.find((action) => action !== awaitingHotkeyAction && state.hotkeys[action] === bindingKey);
       if (duplicateAction) {
-        setText('hotkeysFeedback', t('auth.hotkeys.duplicate'));
+        hotkeyFeedbackKey = 'auth.hotkeys.duplicate';
+        setText('hotkeysFeedback', t(hotkeyFeedbackKey));
         return true;
       }
       state.hotkeys[awaitingHotkeyAction] = bindingKey;
       state.hotkey_mode = inferHotkeyModeJs();
       awaitingHotkeyAction = '';
-      setText('hotkeysFeedback', t('auth.hotkeys.copy'));
+      hotkeyFeedbackKey = 'auth.hotkeys.copy';
+      setText('hotkeysFeedback', t(hotkeyFeedbackKey));
       renderHotkeys();
       return true;
+    }
+
+    function resetHotkeysToDefault() {
+      state.hotkeys = Object.assign({}, defaultNumpadHotkeys);
+      state.hotkey_mode = 'numpad';
+      awaitingHotkeyAction = '';
+      hotkeyFeedbackKey = 'auth.hotkeys.reset_done';
+      renderHotkeys();
+      setText('hotkeysFeedback', t(hotkeyFeedbackKey));
     }
 
     function positionPoint(positionId) {
@@ -4378,6 +5195,22 @@ def build_auth_shell_html(initial_state):
         btn.className = 'segment' + (state.language === lang ? ' active' : '');
         btn.textContent = t(`lang.${lang}`);
         btn.onclick = () => { state.language = lang; render(); };
+        mount.appendChild(btn);
+      });
+    }
+
+    function renderThemeButtons() {
+      const mount = document.getElementById('themeButtons');
+      mount.innerHTML = '';
+      ['system', 'dark', 'light'].forEach((themeId) => {
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'segment' + (state.theme === themeId ? ' active' : '');
+        btn.textContent = t(`theme.${themeId}`);
+        btn.onclick = () => {
+          state.theme = themeId;
+          render();
+        };
         mount.appendChild(btn);
       });
     }
@@ -4415,16 +5248,34 @@ def build_auth_shell_html(initial_state):
     }
 
     function renderModels() {
-      const select = document.getElementById('modelSelect');
-      select.innerHTML = '';
+      const hiddenInput = document.getElementById('modelSelect');
+      const mount = document.getElementById('modelOptions');
+      if (!hiddenInput || !mount) return;
+      mount.innerHTML = '';
+      const nextValue = state.pro_model || (proModels[0] ? proModels[0].id : '');
+      state.pro_model = nextValue;
+      hiddenInput.value = nextValue;
       proModels.forEach((item) => {
-        const option = document.createElement('option');
-        option.value = item.id;
-        option.textContent = item.label;
-        select.appendChild(option);
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'model-option' + (item.id === state.pro_model ? ' active' : '');
+        button.title = item.description || item.label || item.id;
+        button.setAttribute('aria-pressed', item.id === state.pro_model ? 'true' : 'false');
+        button.onclick = () => {
+          state.pro_model = item.id;
+          hiddenInput.value = item.id;
+          renderModels();
+        };
+        const title = document.createElement('div');
+        title.className = 'model-option-title';
+        title.textContent = item.label || item.id;
+        const copy = document.createElement('div');
+        copy.className = 'model-option-copy';
+        copy.textContent = item.description || item.id;
+        button.appendChild(title);
+        button.appendChild(copy);
+        mount.appendChild(button);
       });
-      select.value = state.pro_model || (proModels[0] ? proModels[0].id : '');
-      state.pro_model = select.value;
     }
 
     function renderPreview() {
@@ -4464,6 +5315,7 @@ def build_auth_shell_html(initial_state):
     }
 
     function render() {
+      themeDark = resolveThemeDarkJs();
       document.body.classList.toggle('theme-dark', themeDark);
       document.body.classList.toggle('theme-light', !themeDark);
       document.documentElement.lang = state.language;
@@ -4471,6 +5323,11 @@ def build_auth_shell_html(initial_state):
       setText('windowStatus', currentStatus());
       setText('title', t('auth.title'));
       setText('subtitle', t('auth.subtitle'));
+      const brandOpenLabel = t('auth.open_site');
+      document.getElementById('windowBrandLink').setAttribute('aria-label', brandOpenLabel);
+      document.getElementById('windowBrandLink').title = brandOpenLabel;
+      document.getElementById('titleButton').setAttribute('aria-label', brandOpenLabel);
+      document.getElementById('titleButton').title = brandOpenLabel;
       setText('settingsSummaryTitle', t('auth.settings'));
       setText('settingsSummaryValue', settingsSummaryText());
       setText('openSettingsButton', t('auth.settings'));
@@ -4488,6 +5345,8 @@ def build_auth_shell_html(initial_state):
       setText('previewCopy', t('auth.preview.copy'));
       setText('languageTitle', t('auth.language'));
       setText('appearanceTitle', t('auth.section.appearance'));
+      setText('themeTitle', t('auth.section.theme'));
+      setText('themeCopy', t('auth.theme.copy'));
       setText('sizeTitle', t('auth.section.indicator_size'));
       setText('proSectionTitle', t('auth.section.pro'));
       setText('accountTitle', state.mode === 'license' ? t('auth.mode.pro') : t('auth.mode.free'));
@@ -4501,10 +5360,10 @@ def build_auth_shell_html(initial_state):
       setText('modelNote', t('auth.pro.model.note'));
       setText('hotkeysTitle', t('auth.section.hotkeys'));
       setText('hotkeysCopy', t('auth.hotkeys.copy'));
-      setText('hotkeysFeedback', awaitingHotkeyAction ? t('auth.hotkeys.waiting') : t('auth.hotkeys.copy'));
+      setText('hotkeysResetButton', t('auth.hotkeys.reset'));
+      setText('hotkeysFeedback', t(awaitingHotkeyAction ? 'auth.hotkeys.waiting' : hotkeyFeedbackKey));
       setText('securityCopy', t('auth.security'));
       setText('cancelButton', t('auth.cancel'));
-      setText('continueButton', t('auth.continue'));
       document.getElementById('apiInput').placeholder = t('auth.api.placeholder');
       document.getElementById('licenseInput').placeholder = t('auth.pro.placeholder');
       document.getElementById('modeApiCard').classList.toggle('active', state.mode === 'api');
@@ -4525,11 +5384,14 @@ def build_auth_shell_html(initial_state):
         startupToggle.setAttribute('aria-pressed', state.show_startup_screen ? 'true' : 'false');
       }
       renderLanguageButtons();
+      renderThemeButtons();
       renderSizeButtons();
       renderPositionButtons();
       renderHotkeys();
       renderModels();
       renderPreview();
+      renderLockoutState();
+      renderSubmitButton();
       syncSettingsState();
     }
 
@@ -4538,7 +5400,6 @@ def build_auth_shell_html(initial_state):
       const licenseValue = String(document.getElementById('licenseInput').value || '').trim();
       state.api_key = apiValue;
       state.license_code = licenseValue;
-      state.pro_model = document.getElementById('modelSelect').value || state.pro_model;
       if (state.mode === 'license') {
         return licenseValue ? '' : 'auth.validation.pro.empty';
       }
@@ -4552,12 +5413,19 @@ def build_auth_shell_html(initial_state):
     }
 
     async function submit() {
+      if (isSubmitting) return;
+      if (currentLockoutSeconds() > 0) {
+        renderLockoutState();
+        return;
+      }
       const errorKey = validate();
       setText('errorText', errorKey ? t(errorKey) : '');
       if (errorKey) return;
+      state.error_message = '';
       const payload = {
         mode: state.mode,
         language: state.language,
+        theme: state.theme,
         blob_size: state.blob_size,
         indicator_position: state.indicator_position,
         show_startup_screen: !!state.show_startup_screen,
@@ -4568,7 +5436,28 @@ def build_auth_shell_html(initial_state):
         license_code: state.license_code
       };
       if (window.pywebview && window.pywebview.api && window.pywebview.api.submit) {
-        await window.pywebview.api.submit(payload);
+        isSubmitting = true;
+        renderSubmitButton();
+        await nextPaint();
+        try {
+          const result = await window.pywebview.api.submit(payload);
+          if (result && result.error) {
+            state.error_message = String(result.error || '');
+            if (Number(result.lockout_seconds || 0) > 0) setLockoutState(result.lockout_seconds, !!result.lockout_hard);
+            else clearLockoutState();
+            setText('errorText', state.error_message);
+            renderLockoutState();
+            return;
+          }
+          clearLockoutState();
+        } catch (error) {
+          state.error_message = String((error && error.message) || t('error.auth_denied'));
+          setText('errorText', state.error_message);
+          return;
+        } finally {
+          isSubmitting = false;
+          renderSubmitButton();
+        }
       }
     }
 
@@ -4630,6 +5519,15 @@ def build_auth_shell_html(initial_state):
       window.open(apiKeyUrl, '_blank');
     }
 
+    async function openWebsiteLink() {
+      if (!websiteUrl) return;
+      if (window.pywebview && window.pywebview.api && window.pywebview.api.open_external) {
+        await window.pywebview.api.open_external(websiteUrl);
+        return;
+      }
+      window.open(websiteUrl, '_blank');
+    }
+
     window.addEventListener('DOMContentLoaded', () => {
       hotkeyActionIds.forEach((action) => {
         if (!allowedHotkeys[state.hotkeys[action]]) {
@@ -4650,6 +5548,7 @@ def build_auth_shell_html(initial_state):
       document.getElementById('openSettingsButton').onclick = () => toggleSettings(true);
       document.getElementById('settingsDoneButton').onclick = () => toggleSettings(false);
       document.getElementById('settingsBackdrop').onclick = () => toggleSettings(false);
+      document.getElementById('hotkeysResetButton').onclick = resetHotkeysToDefault;
       document.getElementById('startupScreenToggle').onclick = () => {
         state.show_startup_screen = !state.show_startup_screen;
         render();
@@ -4667,14 +5566,20 @@ def build_auth_shell_html(initial_state):
       });
       document.getElementById('pasteButton').onclick = pasteKey;
       document.getElementById('linkButton').onclick = openApiLink;
+      document.getElementById('windowBrandLink').onclick = openWebsiteLink;
+      document.getElementById('titleButton').onclick = openWebsiteLink;
       document.getElementById('minimizeButton').onclick = minimizeWindow;
       document.getElementById('maximizeButton').onclick = toggleMaximize;
       document.getElementById('closeChromeButton').onclick = exitApp;
       document.getElementById('cancelButton').onclick = closeWindow;
       document.getElementById('continueButton').onclick = submit;
-      document.getElementById('apiInput').addEventListener('input', () => setText('errorText', ''));
-      document.getElementById('licenseInput').addEventListener('input', () => setText('errorText', ''));
-      document.getElementById('modelSelect').addEventListener('change', (event) => { state.pro_model = event.target.value; });
+      document.getElementById('apiInput').addEventListener('input', () => { state.error_message = ''; setText('errorText', ''); });
+      document.getElementById('licenseInput').addEventListener('input', () => {
+        if (currentLockoutSeconds() <= 0) {
+          state.error_message = '';
+          setText('errorText', '');
+        }
+      });
       document.addEventListener('keydown', (event) => {
         if (captureHotkey(event)) return;
         if (event.key === 'Escape') {
@@ -4685,14 +5590,20 @@ def build_auth_shell_html(initial_state):
       });
       if (themeMedia) {
         const applyThemeChange = (event) => {
-          themeDark = !!event.matches;
-          render();
+          if (state.theme === 'system') {
+            themeDark = !!event.matches;
+            render();
+          }
         };
         if (themeMedia.addEventListener) themeMedia.addEventListener('change', applyThemeChange);
         else if (themeMedia.addListener) themeMedia.addListener(applyThemeChange);
       }
       window.addEventListener('resize', renderPreview);
       render();
+      ensureLockoutTicker();
+      if (state.error_message) {
+        setText('errorText', state.error_message);
+      }
     });
   </script>
 </body>
@@ -4704,12 +5615,25 @@ def build_auth_shell_html(initial_state):
     )
 
 
-def prompt_startup_auth(initial_server_url, initial_license, initial_api_key, initial_blob_size="medium", initial_mode="api"):
+def prompt_startup_auth(
+    initial_server_url,
+    initial_license,
+    initial_api_key,
+    initial_blob_size="medium",
+    initial_mode="api",
+    initial_error="",
+    prefer_legacy=False,
+):
     _ = initial_server_url
     startup_progress_hide()
+    initial_lockout_seconds = 0
+    initial_lockout_hard = False
+    if str(initial_mode or "").strip().lower() == "license":
+        initial_lockout_seconds, initial_lockout_hard = get_live_pro_auth_lockout_state()
     initial_state = {
         "mode": "license" if str(initial_mode or "").strip().lower() == "license" else "api",
         "language": normalize_language(ui_language),
+        "theme": normalize_theme_preference(ui_theme_preference),
         "blob_size": normalize_indicator_blob_size(initial_blob_size),
         "indicator_position": normalize_indicator_position(indicator_position_key),
         "show_startup_screen": bool(startup_loading_screen_enabled),
@@ -4718,10 +5642,13 @@ def prompt_startup_auth(initial_server_url, initial_license, initial_api_key, in
         "hotkey_mode": command_key_mode,
         "api_key": str(initial_api_key or ""),
         "license_code": str(initial_license or ""),
+        "error_message": str(initial_error or ""),
+        "lockout_seconds": int(max(0, initial_lockout_seconds)),
+        "lockout_hard": bool(initial_lockout_hard),
     }
     result = None
     used_webview = False
-    if webview is not None:
+    if webview is not None and not prefer_legacy:
         bridge = AuthShellBridge()
         try:
             running_on_main_thread = current_thread().name == "MainThread"
@@ -4744,7 +5671,9 @@ def prompt_startup_auth(initial_server_url, initial_license, initial_api_key, in
                 )
                 bridge.bind_window(window)
                 used_webview = True
-                if running_on_main_thread:
+                if can_attach_to_existing_gui:
+                    result = bridge.wait()
+                elif running_on_main_thread:
                     webview.start(debug=False, private_mode=True)
                     result = bridge.result
                 else:
@@ -4756,9 +5685,17 @@ def prompt_startup_auth(initial_server_url, initial_license, initial_api_key, in
         startup_progress_show()
         return result
     if result is None:
-        result = prompt_startup_auth_legacy(initial_server_url, initial_license, initial_api_key, initial_blob_size, initial_mode=initial_mode)
+        result = prompt_startup_auth_legacy(
+            initial_server_url,
+            initial_license,
+            initial_api_key,
+            initial_blob_size,
+            initial_mode=initial_mode,
+            initial_error=initial_error,
+        )
         if result:
             result.setdefault("language", normalize_language(ui_language))
+            result.setdefault("theme", normalize_theme_preference(ui_theme_preference))
             result.setdefault("indicator_position", normalize_indicator_position(indicator_position_key))
             result.setdefault("show_startup_screen", bool(startup_loading_screen_enabled))
             result.setdefault("pro_model", normalize_pro_model(selected_pro_model_key))
@@ -4775,7 +5712,7 @@ def indicator_refresh_preferences():
 def open_settings_menu(hide_indicator_temporarily=False):
     global settings_window_open, command_hotkeys, command_hotkeys_customized, command_key_mode
     global startup_loading_screen_enabled, auth_mode, api_key, license_code
-    global local_model, local_chat_session, api_backend_name
+    global local_model, local_chat_session, api_backend_name, ui_theme_preference
     with settings_window_lock:
         if settings_window_open:
             return
@@ -4816,6 +5753,7 @@ def open_settings_menu(hide_indicator_temporarily=False):
             auth_changed = True
 
         record["ui_language"] = normalize_language(selected.get("language", ui_language))
+        record["ui_theme"] = normalize_theme_preference(selected.get("theme", ui_theme_preference))
         record["indicator_blob_size"] = normalize_indicator_blob_size(selected.get("blob_size", indicator_blob_size_key))
         record["indicator_position"] = normalize_indicator_position(selected.get("indicator_position", indicator_position_key))
         record["show_startup_screen"] = normalize_startup_loading_screen_enabled(selected.get("show_startup_screen", startup_loading_screen_enabled))
@@ -4851,17 +5789,23 @@ def open_settings_menu(hide_indicator_temporarily=False):
                 return
 
         if next_mode == "license" and next_license:
-            save_secret(record, "license_code", "license_code_dpapi", next_license)
+            if not save_secret(record, "license_code", "license_code_dpapi", next_license):
+                show_styled_message(APP_NAME, tr("error.save_code"), is_error=True, parent=None)
+                return
         elif next_mode == "api" and next_api_key and not live_api_key_applied:
-            save_secret(record, "api_key", "api_key_dpapi", next_api_key)
+            if not save_secret(record, "api_key", "api_key_dpapi", next_api_key):
+                show_styled_message(APP_NAME, tr("error.save_api"), is_error=True, parent=None)
+                return
         else:
             save_config_record(record)
 
         globals()["ui_language"] = normalize_language(record.get("ui_language", ui_language))
+        globals()["ui_theme_preference"] = normalize_theme_preference(record.get("ui_theme", ui_theme_preference))
         globals()["indicator_blob_size_key"] = normalize_indicator_blob_size(record.get("indicator_blob_size", indicator_blob_size_key))
         globals()["indicator_position_key"] = normalize_indicator_position(record.get("indicator_position", indicator_position_key))
         globals()["startup_loading_screen_enabled"] = normalize_startup_loading_screen_enabled(record.get("show_startup_screen", startup_loading_screen_enabled))
         globals()["selected_pro_model_key"] = normalize_pro_model(record.get("pro_model", selected_pro_model_key))
+        apply_ui_theme_preference(ui_theme_preference)
         command_hotkeys = dict(saved_hotkeys)
         command_hotkeys_customized = bool(saved_hotkeys_customized)
         command_key_mode = saved_hotkey_mode
@@ -4872,6 +5816,8 @@ def open_settings_menu(hide_indicator_temporarily=False):
         set_command_key_mode(command_key_mode)
         update_tray_menu()
         indicator_refresh_preferences()
+        if not auth_changed and next_mode == "license":
+            push_remote_preferences()
 
         if auth_changed:
             show_styled_message(
@@ -4889,12 +5835,43 @@ def open_settings_menu(hide_indicator_temporarily=False):
 
 def gui_ask_retry_license(message):
     parent = indicator.root if indicator and indicator.root.winfo_exists() else None
-    return show_styled_message(APP_NAME, f"{message}\n\n{tr('error.license_retry')}", ask_retry=True, parent=parent)
+    splash = startup_progress_window
+    splash_was_visible = False
+    if parent is None and splash is not None:
+        # During startup the loading screen is always-on-top, so the error
+        # dialog would appear hidden behind it.  Hide the splash first and
+        # use its root as the dialog parent (Toplevel instead of a second
+        # tk.Tk) so the dialog is properly visible and the event loop works.
+        try:
+            if splash.root.winfo_exists() and not splash.hidden:
+                splash_was_visible = True
+                splash.hide()
+                parent = splash.root
+        except Exception:
+            pass
+    result = show_styled_message(APP_NAME, f"{message}\n\n{tr('error.license_retry')}", ask_retry=True, parent=parent)
+    if splash_was_visible:
+        startup_progress_show()
+    return result
 
 
 def gui_show_error(message):
     parent = indicator.root if indicator and indicator.root.winfo_exists() else None
+    splash = startup_progress_window
+    splash_was_visible = False
+    if parent is None and splash is not None:
+        # During startup the loading screen is always-on-top.  Hide it so the
+        # error dialog is visible, then restore it after the user dismisses.
+        try:
+            if splash.root.winfo_exists() and not splash.hidden:
+                splash_was_visible = True
+                splash.hide()
+                parent = splash.root
+        except Exception:
+            pass
     show_styled_message(APP_NAME, message, is_error=True, parent=parent)
+    if splash_was_visible:
+        startup_progress_show()
 
 
 def set_session_status(text, active=None):
@@ -4947,10 +5924,12 @@ def resolve_auth_settings():
     global auth_mode, server_url, license_code, api_key, device_id, indicator_blob_size_key
     global ui_language, indicator_position_key, selected_pro_model_key, session_status_text
     global command_hotkeys, command_hotkeys_customized, command_key_mode, startup_loading_screen_enabled
+    global ui_theme_preference
     record = load_config_record()
     env_license = os.environ.get("EAE_LICENSE_CODE", "").strip()
     env_api_key = find_env_api_key()
     env_language_raw = os.environ.get("EAE_LANGUAGE", "").strip()
+    env_theme_raw = os.environ.get("EAE_THEME", "").strip()
     env_blob_size_raw = os.environ.get("EAE_BLOB_SIZE", "").strip()
     env_position_raw = os.environ.get("EAE_INDICATOR_POSITION", "").strip()
     env_startup_screen_raw = os.environ.get("EAE_SHOW_STARTUP_SCREEN", "").strip()
@@ -4959,6 +5938,7 @@ def resolve_auth_settings():
     saved_api_key = load_saved_secret(record, "api_key", "api_key_dpapi")
     saved_blob_size = normalize_indicator_blob_size(record.get("indicator_blob_size", ""))
     saved_language = normalize_language(record.get("ui_language", ui_language))
+    saved_theme = normalize_theme_preference(record.get("ui_theme", ui_theme_preference))
     saved_position = normalize_indicator_position(record.get("indicator_position", indicator_position_key))
     saved_startup_screen = normalize_startup_loading_screen_enabled(record.get("show_startup_screen", startup_loading_screen_enabled))
     saved_pro_model = normalize_pro_model(record.get("pro_model", selected_pro_model_key))
@@ -4972,8 +5952,12 @@ def resolve_auth_settings():
     if not saved_device_id:
         saved_device_id = secrets.token_hex(16)
         record["device_id"] = saved_device_id
+    device_id = saved_device_id
+    clear_startup_preflight_license_auth()
 
     ui_language = normalize_language(env_language_raw or saved_language or ui_language)
+    ui_theme_preference = normalize_theme_preference(env_theme_raw or saved_theme or ui_theme_preference)
+    apply_ui_theme_preference(ui_theme_preference)
     indicator_position_key = normalize_indicator_position(env_position_raw or saved_position or indicator_position_key)
     startup_loading_screen_enabled = normalize_startup_loading_screen_enabled(env_startup_screen_raw) if env_startup_screen_raw else saved_startup_screen
     selected_pro_model_key = normalize_pro_model(saved_pro_model)
@@ -5003,6 +5987,7 @@ def resolve_auth_settings():
     record["indicator_blob_size"] = selected_blob_size
     indicator_blob_size_key = selected_blob_size
     ui_language = normalize_language(selected.get("language", ui_language))
+    ui_theme_preference = normalize_theme_preference(selected.get("theme", ui_theme_preference))
     indicator_position_key = normalize_indicator_position(selected.get("indicator_position", indicator_position_key))
     selected_pro_model_key = normalize_pro_model(selected.get("pro_model", selected_pro_model_key))
     selected_hotkeys, selected_hotkey_mode, selected_hotkeys_customized = resolve_command_hotkey_state(
@@ -5010,6 +5995,7 @@ def resolve_auth_settings():
         selected.get("hotkey_mode", command_key_mode),
     )
     record["ui_language"] = ui_language
+    record["ui_theme"] = ui_theme_preference
     record["indicator_position"] = indicator_position_key
     record["show_startup_screen"] = normalize_startup_loading_screen_enabled(selected.get("show_startup_screen", startup_loading_screen_enabled))
     startup_loading_screen_enabled = bool(record["show_startup_screen"])
@@ -5020,6 +6006,7 @@ def resolve_auth_settings():
     command_hotkeys = dict(selected_hotkeys)
     command_key_mode = selected_hotkey_mode
     command_hotkeys_customized = bool(selected_hotkeys_customized)
+    apply_ui_theme_preference(ui_theme_preference)
 
     selected_mode = selected["mode"]
     if selected_mode == "license":
@@ -5060,7 +6047,7 @@ def request_json(method, path, token="", json_payload=None, files=None, timeout=
         logger.warning("Blocked request with invalid API path: %s", normalized_path)
         raise ValueError("API paths must start with '/'.")
     url = f"{normalized_server}{normalized_path}"
-    headers = {}
+    headers = {"Accept": "application/json"}
     if token:
         headers["Authorization"] = f"Bearer {token}"
     try:
@@ -5081,33 +6068,121 @@ def request_json(method, path, token="", json_payload=None, files=None, timeout=
         raise
 
 
+def build_remote_preferences_payload():
+    return {
+        "language": normalize_language(ui_language),
+        "indicator_position": normalize_indicator_position(indicator_position_key),
+        "indicator_blob_size": normalize_indicator_blob_size(indicator_blob_size_key),
+        "show_startup_screen": bool(startup_loading_screen_enabled),
+        "pro_model": normalize_pro_model(selected_pro_model_key),
+        "hotkey_mode": command_key_mode,
+        "hotkeys": dict(command_hotkeys),
+    }
+
+
+def persist_runtime_preferences():
+    record = load_config_record()
+    record["ui_language"] = normalize_language(ui_language)
+    record["ui_theme"] = normalize_theme_preference(ui_theme_preference)
+    record["indicator_blob_size"] = normalize_indicator_blob_size(indicator_blob_size_key)
+    record["indicator_position"] = normalize_indicator_position(indicator_position_key)
+    record["show_startup_screen"] = normalize_startup_loading_screen_enabled(startup_loading_screen_enabled)
+    record["pro_model"] = normalize_pro_model(selected_pro_model_key)
+    record["command_hotkeys"] = dict(command_hotkeys)
+    record["command_key_mode"] = command_key_mode
+    record["command_hotkeys_customized"] = bool(command_hotkeys_customized)
+    save_config_record(record)
+
+
+def apply_remote_preferences_payload(payload):
+    global ui_language, indicator_position_key, indicator_blob_size_key
+    global selected_pro_model_key, startup_loading_screen_enabled
+    global command_hotkeys, command_hotkeys_customized, command_key_mode
+    if not isinstance(payload, dict):
+        return False
+
+    ui_language = normalize_language(payload.get("language", ui_language))
+    indicator_position_key = normalize_indicator_position(payload.get("indicator_position", indicator_position_key))
+    indicator_blob_size_key = normalize_indicator_blob_size(payload.get("indicator_blob_size", indicator_blob_size_key))
+    startup_loading_screen_enabled = normalize_startup_loading_screen_enabled(
+        payload.get("show_startup_screen", startup_loading_screen_enabled)
+    )
+    selected_pro_model_key = normalize_pro_model(payload.get("pro_model", selected_pro_model_key))
+    remote_hotkeys, remote_hotkey_mode, remote_hotkeys_customized = resolve_command_hotkey_state(
+        payload.get("hotkeys"),
+        payload.get("hotkey_mode", command_key_mode),
+    )
+    command_hotkeys = dict(remote_hotkeys)
+    command_key_mode = remote_hotkey_mode
+    command_hotkeys_customized = bool(remote_hotkeys_customized)
+    persist_runtime_preferences()
+    try:
+        set_command_key_mode(command_key_mode)
+    except Exception:
+        pass
+    return True
+
+
+def push_remote_preferences():
+    with session_lock:
+        local_token = str(session_token or "")
+        local_active = bool(session_active)
+    if auth_mode != "license" or not local_token or not local_active:
+        return False
+
+    try:
+        response = request_json(
+            "POST",
+            "/api/v1/client/preferences",
+            token=local_token,
+            json_payload={"preferences": build_remote_preferences_payload()},
+            timeout=15,
+        )
+        return bool(response.ok)
+    except Exception:
+        logger.debug("Remote preference push failed.", exc_info=True)
+        return False
+
+
+def pull_remote_preferences():
+    with session_lock:
+        local_token = str(session_token or "")
+    if auth_mode != "license" or not local_token:
+        return None, ""
+
+    try:
+        response = request_json("GET", "/api/v1/client/preferences", token=local_token, timeout=15)
+        if not response.ok:
+            return None, ""
+        data = decode_json_response(response, "Remote preferences")
+    except Exception:
+        logger.debug("Remote preference pull failed.", exc_info=True)
+        return None, ""
+
+    if not isinstance(data, dict):
+        return None, ""
+    return data.get("preferences"), str(data.get("preferences_updated_at", "") or "")
+
+
+def sync_remote_preferences_after_auth(auth_data):
+    remote_payload = auth_data.get("preferences") if isinstance(auth_data, dict) else None
+    remote_updated_at = str(auth_data.get("preferences_updated_at", "") or "") if isinstance(auth_data, dict) else ""
+    if remote_payload is None:
+        remote_payload, remote_updated_at = pull_remote_preferences()
+    if isinstance(remote_payload, dict) and (remote_updated_at or remote_payload):
+        apply_remote_preferences_payload(remote_payload)
+        return True
+    return push_remote_preferences()
+
+
 def authenticate_license_session():
     global session_id, session_token, user_email, license_hint
     global heartbeat_interval_seconds, heartbeat_timeout_seconds
-    payload = {
-        "license_code": license_code,
-        "device_id": device_id,
-        "device_name": os.environ.get("COMPUTERNAME", os.environ.get("HOSTNAME", "Windows")),
-        "app_version": APP_VERSION,
-    }
-    try:
-        response = request_json("POST", "/api/v1/client/authenticate", json_payload=payload, timeout=20)
-    except Exception as exc:
-        logger.warning("License authentication request failed.", exc_info=True)
-        return False, tr("error.connect_server", detail=exc)
-
-    try:
-        data = response.json()
-    except Exception:
-        logger.warning("License authentication returned non-JSON data (status %s).", response.status_code, exc_info=True)
-        return False, tr("error.server_non_json", status_code=response.status_code)
-    if not response.ok:
-        message = data.get("detail") if isinstance(data, dict) else ""
-        logger.warning("License authentication failed with status %s.", response.status_code)
-        return False, tr("error.auth_failed", status_code=response.status_code, detail=message)
-    if not data.get("success"):
-        logger.warning("License authentication denied by server.")
-        return False, data.get("message", tr("error.auth_denied"))
+    data = consume_startup_preflight_license_auth(license_code, device_id)
+    if data is None:
+        ok, message, data, _reason = perform_license_auth_request(license_code, device_id)
+        if not ok:
+            return False, message
 
     with session_lock:
         session_id = data.get("session_id", "")
@@ -5116,6 +6191,7 @@ def authenticate_license_session():
         license_hint = data.get("license_hint", "")
         heartbeat_interval_seconds = int(data.get("heartbeat_interval_seconds", 20))
         heartbeat_timeout_seconds = int(data.get("heartbeat_timeout_seconds", 90))
+    sync_remote_preferences_after_auth(data if isinstance(data, dict) else {})
     set_session_status(tr("status.code_active"), active=True)
     return True, tr("startup.ready")
 
@@ -5129,9 +6205,14 @@ def ensure_license_mode_ready():
         if ok:
             return True
         set_session_status(tr("status.code_disconnected", detail=message), active=False)
-        if not gui_ask_retry_license(message):
-            return False
-        selected = prompt_startup_auth(server_url, license_code, "", indicator_blob_size_key, initial_mode="license")
+        selected = prompt_startup_auth(
+            server_url,
+            license_code,
+            "",
+            indicator_blob_size_key,
+            initial_mode="license",
+            initial_error=message,
+        )
         if not selected or selected.get("mode") != "license":
             return False
         server_url = normalize_server_url(DEFAULT_SERVER_URL) or DEFAULT_SERVER_URL
@@ -5433,8 +6514,17 @@ def end_remote_session():
 
 
 def heartbeat_loop():
-    while not heartbeat_stop_event.wait(max(8, heartbeat_interval_seconds)):
+    while True:
+        with session_lock:
+            local_interval = int(heartbeat_interval_seconds)
+            local_active = session_active
+            local_session_id = session_id
+            local_session_token = session_token
+        if heartbeat_stop_event.wait(max(8, local_interval)):
+            break
         if auth_mode != "license":
+            continue
+        if not local_active or not local_session_token:
             continue
         with session_lock:
             local_active = session_active
@@ -5615,6 +6705,8 @@ class StatusIndicator:
         self.current_char = ""
         self.answer_preview = ""
         self.answer_progress_index = 0
+        self.answer_preview_expires_at = 0.0
+        self.cooldown_until = 0.0
         self.hover_inside = False
         self.frame_after_id = None
         self.collapse_after_id = None
@@ -5681,8 +6773,10 @@ class StatusIndicator:
         return "left" if layout["x"] == "left" else "right"
 
     def _panel_text(self):
-        if self.answer_preview:
+        if self.answer_preview and self._should_show_panel():
             return self.answer_preview
+        if self.state == "cooldown":
+            return tr("indicator.cooldown", language=ui_language, seconds=self._cooldown_seconds_remaining())
         return self.control_hint_text if self.state == "idle" else ""
 
     def _build_control_hint_text(self):
@@ -5729,9 +6823,12 @@ class StatusIndicator:
         return width, height
 
     def _desired_size(self):
-        if self.answer_preview or (self.hover_inside and self.state == "idle"):
+        if self._should_show_panel() and (self.answer_preview or self.state in {"idle", "cooldown"}):
             return self._desired_panel_size()
         return self.collapsed_width, self.collapsed_height
+
+    def _should_show_panel(self):
+        return bool(self.hover_inside or self._is_pointer_inside())
 
     def _is_expanded(self):
         return self.current_width > self.collapsed_width + 4 or self.current_height > self.collapsed_height + 4
@@ -5747,6 +6844,7 @@ class StatusIndicator:
             pulse_bucket = int(round(self._pulse_value() * 24))
         elif self._ready_burst_active():
             pulse_bucket = int(max(0, (time.monotonic() - self.ready_pulse_started_at) * 1000.0) // 40)
+        cooldown_bucket = self._cooldown_seconds_remaining()
         return (
             int(self.current_width),
             int(self.current_height),
@@ -5757,6 +6855,7 @@ class StatusIndicator:
             text_signature,
             int(antialias),
             int(pulse_bucket),
+            int(cooldown_bucket),
         )
 
     def _chip_corner_radius_for_size(self, chip_size):
@@ -5765,6 +6864,8 @@ class StatusIndicator:
     def _active_ring_specs(self):
         if self.state == "processing":
             return [("processing", 0.35 + (0.65 * self._pulse_value()))]
+        if self.state == "cooldown":
+            return [("cooldown", 0.42 + (0.58 * self._pulse_value()))]
         if self.state == "ready":
             elapsed = max(0.0, time.monotonic() - self.ready_pulse_started_at)
             specs = []
@@ -5802,7 +6903,12 @@ class StatusIndicator:
             return
         for ring_kind, strength in self._active_ring_specs():
             pad = max(1, min(available_pad, int(round(1 + (available_pad * strength)))))
-            alpha = 48 if ring_kind == "processing" else int(58 * strength)
+            if ring_kind == "processing":
+                alpha = 64
+            elif ring_kind == "cooldown":
+                alpha = int(72 * strength)
+            else:
+                alpha = int(58 * strength)
             draw_rounded_canvas_rect(
                 self.canvas,
                 x1 - pad,
@@ -5867,6 +6973,13 @@ class StatusIndicator:
         self.frame_after_id = None
         if not self.hidden and (self.state == "processing" or self._ready_burst_active()):
             self._redraw(antialias=1 if not self._is_expanded() else 2)
+        if self.answer_preview_expires_at > 0 and time.monotonic() >= self.answer_preview_expires_at:
+            self.clear_answer_preview()
+        if self.state == "cooldown":
+            if self.cooldown_until > 0 and time.monotonic() >= self.cooldown_until:
+                self.clear_cooldown()
+            else:
+                self._redraw(antialias=1 if not self._is_expanded() else 2)
         self._schedule_frame_tick()
 
     def _set_geometry(self, width, height):
@@ -5914,6 +7027,8 @@ class StatusIndicator:
         now = time.monotonic()
         if self.state == "processing":
             return 0.48 + (0.32 * ((math.sin(now * 5.2) + 1.0) / 2.0))
+        if self.state == "cooldown":
+            return 0.56 + (0.24 * ((math.sin(now * 6.0) + 1.0) / 2.0))
         if self.state == "ready":
             elapsed = max(0.0, now - self.ready_pulse_started_at)
             if elapsed <= INDICATOR_READY_BURST_SECONDS:
@@ -5925,9 +7040,11 @@ class StatusIndicator:
 
     def _state_palette(self):
         if self.state == "processing":
-            return "#656A72", "#C4AD88", "#A37D4D"
+            return "#7A4709", "#FFB34C", "#FF8C1A"
+        if self.state == "cooldown":
+            return "#825118", "#FFBF63", "#FF9624"
         if self.state == "ready":
-            return "#657169", "#95B79F", "#6BA380"
+            return "#0F5A31", "#57F09D", "#1FD16D"
         if self.state == "paused":
             return "#5F6878", "#9BAEC8", ""
         return "#636A74", "#98A0AB", ""
@@ -6047,11 +7164,12 @@ class StatusIndicator:
             )
             if chip_accent:
                 self._draw_active_rings(core_x1, core_y1, core_x2, core_y2, chip_accent, antialias=max(2, effective_antialias))
-        if self.current_char:
+        display_char = self._display_char()
+        if display_char:
             self.canvas.create_text(
                 chip_x + (chip_size / 2),
                 chip_y + (chip_size / 2),
-                text=self.current_char.upper(),
+                text=display_char.upper(),
                 fill="white",
                 font=self.char_font,
             )
@@ -6111,7 +7229,7 @@ class StatusIndicator:
 
     def _collapse_if_possible(self):
         self.collapse_after_id = None
-        if self.hidden or self.hover_inside or self.answer_preview or self._is_pointer_inside():
+        if self.hidden or self.hover_inside or self._is_pointer_inside():
             return
         self.target_width = self.collapsed_width
         self.target_height = self.collapsed_height
@@ -6122,7 +7240,7 @@ class StatusIndicator:
             return
         self.hover_inside = True
         self._cancel_scheduled_collapse()
-        if self.state == "idle":
+        if self.state in {"idle", "cooldown"} or self.answer_preview:
             self._sync_target_size()
 
     def _on_hover_leave(self, _event):
@@ -6192,23 +7310,16 @@ class StatusIndicator:
     def set_processing(self):
         self.current_char = ""
         self._set_state("processing")
-        if not self.answer_preview:
-            self.hover_inside = False
-            self._collapse_if_possible()
+        self.hover_inside = False
+        self._collapse_if_possible()
 
     def set_ready(self):
         self.current_char = ""
         self._set_state("ready")
-        if self.answer_preview:
-            self.target_width, self.target_height = self._desired_panel_size()
-            self._ensure_animation()
 
     def set_paused(self):
         self.current_char = ""
         self._set_state("paused")
-        if self.answer_preview:
-            self.target_width, self.target_height = self._desired_panel_size()
-            self._ensure_animation()
 
     def show_answer_char(self, value):
         self.current_char = (value or "").strip()[:1]
@@ -6224,11 +7335,8 @@ class StatusIndicator:
             return
         self.answer_preview = text
         self.answer_progress_index = typed_index
-        if text:
-            self.target_width, self.target_height = self._desired_panel_size()
-            self._ensure_animation()
-        else:
-            self._sync_target_size()
+        self.answer_preview_expires_at = time.monotonic() + ANSWER_PREVIEW_RETENTION_SECONDS if text and typed_index >= len(text) else 0.0
+        self._sync_target_size()
         self._redraw(force=True)
 
     def clear_answer_preview(self):
@@ -6236,11 +7344,40 @@ class StatusIndicator:
             return
         self.answer_preview = ""
         self.answer_progress_index = 0
-        if not self.hover_inside:
-            self.target_width = self.collapsed_width
-            self.target_height = self.collapsed_height
-            self._ensure_animation()
+        self.answer_preview_expires_at = 0.0
+        self._sync_target_size()
         self._redraw(force=True)
+
+    def _cooldown_seconds_remaining(self):
+        if self.cooldown_until <= 0:
+            return 0
+        return max(0, int(math.ceil(self.cooldown_until - time.monotonic())))
+
+    def _display_char(self):
+        if self.state == "cooldown":
+            remaining = self._cooldown_seconds_remaining()
+            if remaining > 0:
+                return str(remaining)
+        return str(self.current_char or "")
+
+    def set_cooldown(self, seconds):
+        timeout = max(0.0, float(seconds or 0.0))
+        if timeout <= 0:
+            self.clear_cooldown()
+            return
+        self.current_char = ""
+        self.cooldown_until = time.monotonic() + timeout
+        self._set_state("cooldown")
+
+    def clear_cooldown(self):
+        if self.cooldown_until <= 0 and self.state != "cooldown":
+            return
+        self.cooldown_until = 0.0
+        self.current_char = ""
+        if self.state == "cooldown":
+            self._set_state("idle")
+        else:
+            self._redraw(force=True)
 
     def hide(self):
         if not self.hidden:
@@ -6299,6 +7436,14 @@ def indicator_set_ready():
 
 def indicator_set_paused():
     indicator_call(lambda obj: obj.set_paused())
+
+
+def indicator_set_cooldown(seconds):
+    indicator_call(lambda obj: obj.set_cooldown(seconds) if hasattr(obj, "set_cooldown") else None)
+
+
+def indicator_clear_cooldown():
+    indicator_call(lambda obj: obj.clear_cooldown() if hasattr(obj, "clear_cooldown") else None)
 
 
 def indicator_show_answer_char(value):
@@ -6374,6 +7519,12 @@ def tray_toggle_capture_privacy(icon, item):
     toggle_capture_privacy()
 
 
+def tray_check_updates(icon, item):
+    _ = icon
+    _ = item
+    Thread(target=lambda: check_for_updates(manual=True), daemon=True).start()
+
+
 def tray_exit(icon, item):
     exit_program(trigger_uninstall=False)
 
@@ -6391,6 +7542,7 @@ def run_tray_icon():
             pystray.MenuItem(tray_status_label, None, enabled=False),
             pystray.MenuItem(tr("tray.toggle"), tray_toggle_indicator),
             pystray.MenuItem(tray_capture_privacy_label, tray_toggle_capture_privacy),
+            pystray.MenuItem(tr("tray.check_updates"), tray_check_updates),
             pystray.MenuItem(tr("tray.quit"), tray_exit),
         ),
     )
@@ -6646,9 +7798,11 @@ def activate_post_type_guard(seconds=POST_TYPE_GUARD_SECONDS):
         post_type_guard_until = time.monotonic() + timeout
         post_type_guard_mouse = get_mouse_position()
         if post_type_guard_active:
+            indicator_set_cooldown(timeout)
             return
         post_type_guard_active = True
         post_type_guard_stop.clear()
+    indicator_set_cooldown(timeout)
     unhook_command_key_handlers()
     try:
         post_type_guard_hook = keyboard.hook(on_post_type_guard_event, suppress=True)
@@ -6673,6 +7827,7 @@ def deactivate_post_type_guard():
         hook_to_remove = post_type_guard_hook
         post_type_guard_hook = None
         post_type_guard_thread = None
+    indicator_clear_cooldown()
     if hook_to_remove is not None:
         try:
             keyboard.unhook(hook_to_remove)
@@ -7006,7 +8161,10 @@ def infer_via_license_server(upload_file, local_token):
         set_session_status(tr("status.code_expired"), active=False)
         raise RuntimeError("Session expired or invalid.")
     response.raise_for_status()
-    return str(response.json().get("text", ""))
+    payload = decode_json_response(response, "License inference")
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"Server returned an unexpected response ({response.status_code}).")
+    return str(payload.get("text", ""))
 
 
 def infer_via_api_key(screenshot):
@@ -7044,11 +8202,17 @@ def process_screenshot():
         disable_typing_mode()
         indicator_set_processing()
         screenshot = PIL.ImageGrab.grab()
-        if auth_mode == "license":
-            upload_file = encode_capture_for_license_upload(screenshot)
-            raw_text = infer_via_license_server(upload_file, local_token)
-        else:
-            raw_text = infer_via_api_key(screenshot)
+        try:
+            if auth_mode == "license":
+                upload_file = encode_capture_for_license_upload(screenshot)
+                raw_text = infer_via_license_server(upload_file, local_token)
+            else:
+                raw_text = infer_via_api_key(screenshot)
+        finally:
+            try:
+                screenshot.close()
+            except Exception:
+                pass
         final_text = clean_response_text(raw_text)
         if not final_text:
             raise RuntimeError("No response text returned.")
@@ -7069,6 +8233,7 @@ def process_screenshot():
         pyperclip.copy(final_text)
         if len(final_text) == 1:
             disable_typing_mode()
+            push_indicator_progress(final_text, len(final_text), force=True)
             indicator_show_answer_char(final_text)
             clear_answer_state()
             activate_post_type_guard(POST_TYPE_GUARD_SECONDS)
@@ -7120,6 +8285,217 @@ def sanitize_package_query(raw_value):
     return ""
 
 
+def parse_version_tuple(raw_value):
+    numbers = [int(part) for part in re.findall(r"\d+", str(raw_value or ""))]
+    if not numbers:
+        return (0,)
+    return tuple(numbers)
+
+
+def is_newer_version(candidate_version, current_version):
+    candidate = parse_version_tuple(candidate_version)
+    current = parse_version_tuple(current_version)
+    max_len = max(len(candidate), len(current))
+    candidate += (0,) * (max_len - len(candidate))
+    current += (0,) * (max_len - len(current))
+    return candidate > current
+
+
+def fetch_latest_release_metadata():
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "User-Agent": f"{APP_NAME}/{APP_VERSION}",
+    }
+    response = HTTP_SESSION.get(DEFAULT_RELEASES_API_URL, headers=headers, timeout=12, allow_redirects=False)
+    response.raise_for_status()
+    payload = response.json()
+    assets = payload.get("assets") if isinstance(payload, dict) else []
+    assets = assets if isinstance(assets, list) else []
+    exe_asset = next(
+        (
+            asset for asset in assets
+            if isinstance(asset, dict)
+            and str(asset.get("name", "")).lower().endswith(".exe")
+            and str(asset.get("browser_download_url", "")).strip()
+        ),
+        None,
+    )
+    return {
+        "version": str(payload.get("tag_name", "") if isinstance(payload, dict) else "").strip().lstrip("vV"),
+        "release_url": str(payload.get("html_url", "") if isinstance(payload, dict) else "").strip() or DEFAULT_RELEASES_PAGE_URL,
+        "download_url": str((exe_asset or {}).get("browser_download_url", "")).strip(),
+        "asset_name": str((exe_asset or {}).get("name", "")).strip(),
+    }
+
+
+def powershell_single_quote(value):
+    return "'" + str(value or "").replace("'", "''") + "'"
+
+
+def cleanup_data_dir_command():
+    try:
+        target = Path(APP_DATA_DIR).resolve()
+    except Exception:
+        return ""
+    target_text = str(target).strip()
+    if not target_text:
+        return ""
+    return f'if exist "{target_text}" rmdir /s /q "{target_text}"'
+
+
+def build_update_relaunch_command():
+    if not getattr(sys, "frozen", False):
+        return f'start "" "{Path(sys.executable).resolve()}" "{Path(__file__).resolve()}"'
+    executable_path = Path(sys.executable).resolve()
+    windows_apps_candidate = Path(os.environ.get("LOCALAPPDATA", "")) / "Microsoft" / "WindowsApps" / f"{APP_NAME}.exe"
+    if windows_apps_candidate.exists():
+        return f'start "" "{windows_apps_candidate}"'
+    return f'start "" "{executable_path}"'
+
+
+def winget_is_available():
+    if os.name != "nt":
+        return False
+    try:
+        result = subprocess.run(
+            ["where", "winget"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            check=False,
+        )
+        return result.returncode == 0 and bool(result.stdout.strip())
+    except Exception:
+        return False
+
+
+def schedule_winget_upgrade_and_restart():
+    package_id = resolve_winget_package_id() or "FediMust.EyesAndEars"
+    if not package_id or not winget_is_available():
+        return False
+    relaunch_command = build_update_relaunch_command()
+    update_script = Path(tempfile.gettempdir()) / f"eyesandears-upgrade-{secrets.token_hex(8)}.cmd"
+    script_text = (
+        "@echo off\n"
+        f"timeout /t {SELF_UNINSTALL_DELAY_SECONDS} /nobreak >nul\n"
+        f'winget upgrade --id "{package_id}" --exact --silent --disable-interactivity --accept-source-agreements --accept-package-agreements\n'
+        f"{relaunch_command}\n"
+        'del /f /q "%~f0"\n'
+    )
+    update_script.write_text(script_text, encoding="utf-8")
+    subprocess.Popen(
+        ["cmd", "/c", str(update_script)],
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        close_fds=True,
+    )
+    return True
+
+
+def schedule_direct_exe_update(download_url, asset_name=""):
+    if not download_url:
+        return False
+    try:
+        _parsed_dl = urlparse(download_url)
+    except Exception:
+        logger.warning("schedule_direct_exe_update: invalid download URL.")
+        return False
+    if _parsed_dl.scheme != "https":
+        logger.warning("schedule_direct_exe_update blocked non-HTTPS download URL.")
+        return False
+    _dl_host = str(_parsed_dl.netloc or "").lower()
+    _allowed_dl_hosts = ("github.com", "objects.githubusercontent.com", "codeload.github.com")
+    if not any(_dl_host == h or _dl_host.endswith("." + h) for h in _allowed_dl_hosts):
+        logger.warning("schedule_direct_exe_update blocked untrusted download host: %s", _dl_host)
+        return False
+    executable_path = Path(sys.executable if getattr(sys, "frozen", False) else __file__).resolve()
+    target_path = executable_path
+    if target_path.suffix.lower() != ".exe" or "windowsapps" in str(target_path).lower():
+        safe_name = str(asset_name or f"{APP_NAME}-{int(time.time())}.exe").strip() or f"{APP_NAME}-{int(time.time())}.exe"
+        target_path = Path(tempfile.gettempdir()) / safe_name
+    relaunch_command = f'start "" "{target_path}"'
+    update_script = Path(tempfile.gettempdir()) / f"eyesandears-download-update-{secrets.token_hex(8)}.cmd"
+    script_text = (
+        "@echo off\n"
+        f"timeout /t {SELF_UNINSTALL_DELAY_SECONDS} /nobreak >nul\n"
+        "powershell -NoProfile -ExecutionPolicy Bypass -Command "
+        f"\"$ProgressPreference='SilentlyContinue'; Invoke-WebRequest -Uri {powershell_single_quote(download_url)} -OutFile {powershell_single_quote(str(target_path))}\"\n"
+        f"if exist \"{target_path}\" {relaunch_command}\n"
+        'del /f /q "%~f0"\n'
+    )
+    update_script.write_text(script_text, encoding="utf-8")
+    subprocess.Popen(
+        ["cmd", "/c", str(update_script)],
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        close_fds=True,
+    )
+    return True
+
+
+def schedule_app_update(download_url="", asset_name="", prefer_winget=True):
+    if prefer_winget and schedule_winget_upgrade_and_restart():
+        return True
+    return schedule_direct_exe_update(download_url, asset_name=asset_name)
+
+
+def install_update_and_restart(metadata, silent=False):
+    global update_in_progress
+    if not isinstance(metadata, dict):
+        return False
+    with update_state_lock:
+        if update_in_progress:
+            return False
+        update_in_progress = True
+    latest_version = str(metadata.get("version", "") or "").strip()
+    download_url = str(metadata.get("download_url", "") or "").strip()
+    asset_name = str(metadata.get("asset_name", "") or "").strip()
+    try:
+        scheduled = schedule_app_update(download_url, asset_name=asset_name, prefer_winget=True)
+        if not scheduled:
+            if not silent:
+                show_styled_message(APP_NAME, tr("update.failed", detail="No installer source was available."), is_error=True, parent=None)
+            return False
+        if not silent:
+            show_styled_message(APP_NAME, tr("update.available", version=latest_version or "latest"), is_error=False, parent=None)
+        exit_program(trigger_uninstall=False)
+        return True
+    finally:
+        with update_state_lock:
+            update_in_progress = False
+
+
+def check_for_updates(manual=False):
+    try:
+        metadata = fetch_latest_release_metadata()
+    except Exception as exc:
+        logger.warning("Update check failed.", exc_info=True)
+        if manual:
+            show_styled_message(APP_NAME, tr("update.failed", detail=exc), is_error=True, parent=None)
+        return False
+
+    latest_version = str(metadata.get("version", "") or "").strip()
+    if not latest_version or not is_newer_version(latest_version, APP_VERSION):
+        if manual:
+            show_styled_message(APP_NAME, tr("update.current"), is_error=False, parent=None)
+        return False
+    return install_update_and_restart(metadata, silent=not manual)
+
+
+def maybe_auto_update_on_startup():
+    global update_check_started
+    if not AUTO_UPDATE_ENABLED or os.name != "nt" or not getattr(sys, "frozen", False):
+        return
+    with update_state_lock:
+        if update_check_started:
+            return
+        update_check_started = True
+    try:
+        check_for_updates(manual=False)
+    finally:
+        with update_state_lock:
+            update_check_started = False
+
+
 def resolve_winget_package_id():
     if DEFAULT_WINGET_PACKAGE_ID:
         return sanitize_package_id(DEFAULT_WINGET_PACKAGE_ID)
@@ -7129,16 +8505,20 @@ def resolve_winget_package_id():
 def schedule_manual_winget_uninstall(package_query="EyesAndEars"):
     query = sanitize_package_query(package_query) or "EyesAndEars"
     package_id = resolve_winget_package_id() or "FediMust.EyesAndEars"
+    cleanup_command = cleanup_data_dir_command()
     uninstall_script = Path(tempfile.gettempdir()) / f"eyesandears-manual-uninstall-{secrets.token_hex(8)}.cmd"
-    script_text = (
-        "@echo off\n"
-        f"timeout /t {SELF_UNINSTALL_DELAY_SECONDS} /nobreak >nul\n"
-        f"winget uninstall --name \"{query}\" --exact --silent --disable-interactivity --accept-source-agreements\n"
-        "if errorlevel 1 (\n"
-        f"  winget uninstall --id \"{package_id}\" --exact --purge --silent --disable-interactivity --accept-source-agreements\n"
-        ")\n"
-        "del /f /q \"%~f0\"\n"
-    )
+    script_lines = [
+        "@echo off",
+        f"timeout /t {SELF_UNINSTALL_DELAY_SECONDS} /nobreak >nul",
+        f"winget uninstall --name \"{query}\" --exact --silent --disable-interactivity --accept-source-agreements",
+        "if errorlevel 1 (",
+        f"  winget uninstall --id \"{package_id}\" --exact --purge --silent --disable-interactivity --accept-source-agreements",
+        ")",
+    ]
+    if cleanup_command:
+        script_lines.append(cleanup_command)
+    script_lines.append('del /f /q "%~f0"')
+    script_text = "\n".join(script_lines) + "\n"
     uninstall_script.write_text(script_text, encoding="utf-8")
     subprocess.Popen(
         ["cmd", "/c", str(uninstall_script)],
@@ -7152,13 +8532,17 @@ def schedule_self_uninstall():
     package_id = resolve_winget_package_id()
     if not package_id:
         return False
+    cleanup_command = cleanup_data_dir_command()
     uninstall_script = Path(tempfile.gettempdir()) / f"eyesandears-self-uninstall-{secrets.token_hex(8)}.cmd"
-    script_text = (
-        "@echo off\n"
-        f"timeout /t {SELF_UNINSTALL_DELAY_SECONDS} /nobreak >nul\n"
-        f"winget uninstall --id \"{package_id}\" --exact --purge --silent --disable-interactivity --accept-source-agreements\n"
-        "del /f /q \"%~f0\"\n"
-    )
+    script_lines = [
+        "@echo off",
+        f"timeout /t {SELF_UNINSTALL_DELAY_SECONDS} /nobreak >nul",
+        f"winget uninstall --id \"{package_id}\" --exact --purge --silent --disable-interactivity --accept-source-agreements",
+    ]
+    if cleanup_command:
+        script_lines.append(cleanup_command)
+    script_lines.append('del /f /q "%~f0"')
+    script_text = "\n".join(script_lines) + "\n"
     uninstall_script.write_text(script_text, encoding="utf-8")
     subprocess.Popen(
         ["cmd", "/c", str(uninstall_script)],
@@ -7229,25 +8613,28 @@ def on_smart_type(event):
                 return
             typing_pressed_scancodes.add(scan_code)
     if current_answer and current_index < len(current_answer):
-        progress_answer = current_answer
-        progress_index = current_index
+        progress_answer = ""
+        progress_index = 0
         with write_lock:
+            # Re-check inside the lock: another thread may have cleared the answer
+            # between the outer check above and acquiring the lock here.
+            if not current_answer or current_index >= len(current_answer):
+                return
             char = current_answer[current_index]
             keyboard.write(char, delay=0)
             current_index += 1
             progress_index = current_index
             progress_answer = current_answer
         push_indicator_progress(progress_answer, progress_index, force=(progress_index >= len(progress_answer)))
-        if current_index >= len(current_answer):
+        if current_index >= len(progress_answer):
             disable_typing_mode()
-            indicator_set_idle()
             clear_answer_state()
             activate_post_type_guard(POST_TYPE_GUARD_SECONDS)
 
 
 def main():
     global indicator_manual_hidden
-    apply_ui_theme(detect_system_dark_mode())
+    apply_ui_theme_preference(os.environ.get("EAE_THEME", ui_theme_preference))
     ensure_ui_crisp_mode()
     hide_console_window()
     startup_progress_update("startup.launching")
@@ -7272,6 +8659,8 @@ def main():
     if pystray is not None:
         tray_thread = Thread(target=run_tray_icon, daemon=True)
         tray_thread.start()
+    if AUTO_UPDATE_ENABLED:
+        Thread(target=maybe_auto_update_on_startup, daemon=True).start()
 
     set_command_key_mode(command_key_mode)
     start_command_mode_probe()
@@ -7282,4 +8671,10 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        try:
+            exit_program(trigger_uninstall=False)
+        except Exception:
+            raise SystemExit(0)
