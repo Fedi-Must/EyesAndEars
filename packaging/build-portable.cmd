@@ -4,6 +4,7 @@ setlocal
 set VERSION=%~1
 if "%VERSION%"=="" set VERSION=1.0.0
 set SCRIPT_DIR=%~dp0
+set ICON_PATH=%SCRIPT_DIR%assets\eyesandears.ico
 set PYTHON_CMD=
 
 pushd "%SCRIPT_DIR%.."
@@ -16,8 +17,8 @@ echo [1/4] Installing build dependencies...
 %PYTHON_CMD% -m pip install -r requirements.txt pyinstaller
 if errorlevel 1 goto :fail
 
-echo [2/4] Building single-file EXE...
-%PYTHON_CMD% -m PyInstaller --noconfirm --clean --onefile --name EyesAndEars "eyesandears.py"
+echo [2/4] Building single-file GUI EXE...
+%PYTHON_CMD% -m PyInstaller --noconfirm --clean --onefile --windowed --icon "%ICON_PATH%" --name EyesAndEars "eyesandears.py"
 if errorlevel 1 goto :fail
 
 echo [3/4] Creating versioned release artifact...
