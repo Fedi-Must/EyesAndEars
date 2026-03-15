@@ -2,6 +2,7 @@ import base64
 import csv
 import ctypes
 import hashlib
+import html
 import ipaddress
 import io
 import json
@@ -1195,6 +1196,27 @@ def normalize_server_url(value):
     return normalized
 
 
+def describe_unexpected_json_response(response):
+    content_type = str(getattr(response, "headers", {}).get("content-type", "") or "").strip().lower()
+    try:
+        snippet = str(getattr(response, "text", "") or "").strip()
+    except Exception:
+        snippet = ""
+    snippet = " ".join(snippet.split())[:320]
+    plain_text = " ".join(re.sub(r"<[^>]+>", " ", html.unescape(snippet)).split())
+    if not plain_text:
+        return f"content-type={content_type or 'unknown'}"
+    missing_relation_match = re.search(r'relation\s+"([^"]+)"\s+does not exist', plain_text, flags=re.IGNORECASE)
+    if missing_relation_match:
+        return f"Server database is missing table '{missing_relation_match.group(1)}'."
+    fatal_match = re.search(r"Fatal error:\s*(.+)", plain_text, flags=re.IGNORECASE)
+    if fatal_match:
+        return f"Server PHP fatal error: {fatal_match.group(1).strip()[:220]}"
+    if "html" in content_type:
+        return f"Server returned HTML: {plain_text[:220]}"
+    return plain_text[:220]
+
+
 def decode_json_response(response, context_label):
     try:
         return response.json()
@@ -1279,7 +1301,11 @@ def perform_license_auth_request(license_value, device_value):
 
     data = decode_json_response(response, "License authentication")
     if data is None:
-        return False, tr("error.server_non_json", status_code=response.status_code), None, "server_non_json"
+        detail = describe_unexpected_json_response(response)
+        message = tr("error.server_non_json", status_code=response.status_code)
+        if detail:
+            message = f"{message} {detail}"
+        return False, message, None, "server_non_json"
     if not response.ok:
         message = data.get("detail") if isinstance(data, dict) else ""
         logger.warning("License authentication failed with status %s.", response.status_code)
@@ -6168,7 +6194,7 @@ def sync_remote_preferences_after_auth(auth_data):
     remote_updated_at = str(auth_data.get("preferences_updated_at", "") or "") if isinstance(auth_data, dict) else ""
     if remote_payload is None:
         remote_payload, remote_updated_at = pull_remote_preferences()
-    if isinstance(remote_payload, dict) and (remote_updated_at or remote_payload):
+    if isinstance(remote_payload, dict) and remote_updated_at:
         apply_remote_preferences_payload(remote_payload)
         return True
     return push_remote_preferences()
