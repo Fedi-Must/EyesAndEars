@@ -31,6 +31,9 @@ import PIL.ImageGrab
 import PIL.ImageTk
 import pyperclip
 import requests
+from cryptography.hazmat.primitives.hashes import SHA256
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 try:
     import pystray
@@ -54,6 +57,7 @@ except Exception:
 
 APP_NAME = "EyesAndEars"
 APP_VERSION = "2.2.0"
+AUTH_SHELL_SUBPROCESS_FLAG = "--auth-shell-dialog"
 if not logging.getLogger().handlers:
     logging.basicConfig(level=logging.WARNING, format="%(levelname)s [%(name)s] %(message)s")
 logger = logging.getLogger(APP_NAME)
@@ -274,7 +278,7 @@ PROGRESS_UI_MIN_INTERVAL = 0.035
 PROGRESS_UI_MIN_STEP = 2
 PROCESS_SNAPSHOT_CACHE_SECONDS = 4.0
 
-auth_mode = "license"
+auth_mode = "account"
 server_url = DEFAULT_SERVER_URL
 license_code = ""
 api_key = ""
@@ -482,7 +486,7 @@ TRANSLATIONS = {
         "startup.restoring": "Restoring your preferences",
         "startup.opening_setup": "Opening setup",
         "startup.checking_auth": "Checking your sign-in mode",
-        "startup.connecting_pro": "Connecting to Pro mode",
+        "startup.connecting_pro": "Signing in",
         "startup.initializing_model": "Initializing AI backend",
         "startup.starting_indicator": "Starting indicator",
         "startup.ready": "Ready",
@@ -490,7 +494,7 @@ TRANSLATIONS = {
         "startup.detail.restoring": "Restoring saved settings and secure secrets",
         "startup.detail.opening_setup": "Waiting for your setup choices",
         "startup.detail.checking_auth": "Validating the selected access mode",
-        "startup.detail.connecting_pro": "Connecting your subscription session",
+        "startup.detail.connecting_pro": "Signing in to your account",
         "startup.detail.initializing_model": "Checking your API key and model runtime",
         "startup.detail.starting_indicator": "Starting the floating capture indicator",
         "startup.detail.ready": "EyesAndEars is ready",
@@ -509,8 +513,8 @@ TRANSLATIONS = {
         "auth.language": "Language",
         "auth.mode.free": "Free mode",
         "auth.mode.free.help": "Use your own Gemini API key",
-        "auth.mode.pro": "Pro mode",
-        "auth.mode.pro.help": "Use your secret key",
+        "auth.mode.pro": "Account mode",
+        "auth.mode.pro.help": "Use your website account",
         "auth.section.startup": "Startup",
         "auth.startup_screen.label": "Loading screen",
         "auth.startup_screen.copy": "Disable this to launch directly without the animated splash screen.",
@@ -525,7 +529,7 @@ TRANSLATIONS = {
         "auth.section.indicator_size": "Indicator size",
         "auth.section.indicator_position": "Indicator placement",
         "auth.section.free": "Use your own Gemini API key",
-        "auth.section.pro": "Connect with your secret key",
+        "auth.section.pro": "Sign in with your account",
         "auth.section.hotkeys": "Hotkeys",
         "auth.hotkeys.copy": "Click an action, then press the replacement key. Letters are not allowed.",
         "auth.hotkeys.waiting": "Press a new key...",
@@ -548,10 +552,19 @@ TRANSLATIONS = {
         "auth.api.link": "Don't have a key ? Get one here",
         "auth.api.note": "Stored locally with Windows data protection (DPAPI).",
         "auth.api.helper": "We verify your key by initializing Gemini. A local format check only blocks obvious garbage.",
-        "auth.pro.label": "Secret key",
-        "auth.pro.placeholder": "Enter your secret key",
-        "auth.pro.note": "The server endpoint stays managed inside the app.",
-        "auth.pro.model": "Preferred Pro model",
+        "auth.pro.label": "Account access",
+        "auth.pro.placeholder": "Use the account sign-in window",
+        "auth.pro.note": "Desktop access now uses your website email and password.",
+        "auth.account.title": "Website account",
+        "auth.account.copy": "Sign in with your website email and password. Your Gemini API key stays encrypted in the dashboard and is decrypted locally on this device.",
+        "auth.account.email": "Email",
+        "auth.account.email.placeholder": "name@example.com",
+        "auth.account.password": "Password",
+        "auth.account.password.placeholder": "Enter your website password",
+        "auth.account.dashboard": "Open dashboard",
+        "auth.account.reset": "Reset password",
+        "auth.account.helper": "Add or replace your Gemini API key from the dashboard whenever needed. You can leave the password blank when only changing local settings.",
+        "auth.pro.model": "Preferred model",
         "auth.pro.model.note": "Current Gemini screenshot models that support direct text answers.",
         "auth.preview.title": "Indicator location",
         "auth.preview.copy": "The floating indicator stays native, smooth, and capture-protected.",
@@ -563,9 +576,12 @@ TRANSLATIONS = {
         "auth.validation.api.short": "This key looks too short. Remove accidental truncation and try again.",
         "auth.validation.api.whitespace": "Remove spaces or line breaks from the API key and try again.",
         "auth.validation.api.shape": "This key still looks malformed. Check for extra characters and try again.",
-        "auth.validation.pro.empty": "Enter your secret key.",
+        "auth.validation.pro.empty": "Complete sign-in in the account window.",
+        "auth.validation.account.email.empty": "Enter your account email.",
+        "auth.validation.account.email.invalid": "Enter a valid email address.",
         "auth.status.free": "Free mode checks your API key locally on this device.",
-        "auth.status.pro": "Pro mode signs you in with your subscription session.",
+        "auth.status.pro": "Account mode signs you in through the website.",
+        "auth.status.account": "Desktop access uses your website account and local Gemini decryption.",
         "position.top_left": "Top left",
         "position.top_center": "Top center",
         "position.top_right": "Top right",
@@ -581,7 +597,7 @@ TRANSLATIONS = {
         "status.window_title": "EyesAndEars Status",
         "status.mode": "Mode",
         "status.mode.free": "Free mode",
-        "status.mode.pro": "Pro mode",
+        "status.mode.pro": "Account mode",
         "status.status": "Status",
         "status.server": "Server",
         "status.user": "User",
@@ -589,7 +605,7 @@ TRANSLATIONS = {
         "status.backend": "Backend",
         "status.model": "Model",
         "status.api_key": "API key",
-        "status.pro_model": "Preferred Pro model",
+        "status.pro_model": "Preferred model",
         "status.not_set": "-",
         "tray.open": "Open status",
         "tray.toggle": "Toggle indicator",
@@ -607,8 +623,8 @@ TRANSLATIONS = {
         "error.server_non_json": "The server returned an unexpected response ({status_code}).",
         "error.auth_failed": "Authentication request failed ({status_code}). {detail}",
         "error.auth_denied": "Authentication denied.",
-        "error.pro_lockout_wait": "Too many incorrect secret key attempts. Try again in {seconds} seconds.",
-        "error.pro_lockout_locked": "Too many incorrect secret key attempts. This device is locked for {seconds} seconds.",
+        "error.pro_lockout_wait": "Too many incorrect sign-in attempts. Try again in {seconds} seconds.",
+        "error.pro_lockout_locked": "Too many incorrect sign-in attempts. This device is locked for {seconds} seconds.",
         "error.pro_time_unavailable": "Couldn't verify trusted online time. Check your connection and try again.",
         "error.api_empty": "API key is empty.",
         "error.no_sdk": "Could not initialize API mode.\n{detail}",
@@ -618,17 +634,17 @@ TRANSLATIONS = {
         "error.api_required": "API mode needs a valid Gemini API key.",
         "error.api_select_mode": "Select Free mode and enter a valid Gemini API key.",
         "error.session_inactive": "Session inactive. Restart the app and sign in again.",
-        "error.license_retry": "Retry Pro mode sign-in?",
-        "status.code_active": "Pro mode active",
-        "status.code_disconnected": "Pro mode disconnected: {detail}",
-        "status.code_session_lost": "Pro mode session lost",
-        "status.code_network_error": "Pro mode disconnected",
-        "status.code_expired": "Pro mode session expired. Restart the app.",
-        "status.code_inactive": "Pro mode inactive - sign-in required",
-        "status.api_active": "Free mode active ({backend})",
-        "status.api_invalid": "Free mode inactive - invalid API key",
-        "status.api_credits": "Free mode inactive - credits exhausted",
-        "status.api_required": "Free mode inactive - API key required",
+        "error.license_retry": "Retry sign-in?",
+        "status.code_active": "Account session active",
+        "status.code_disconnected": "Account sign-in failed: {detail}",
+        "status.code_session_lost": "Account session lost",
+        "status.code_network_error": "Account connection lost",
+        "status.code_expired": "Account session expired. Sign in again.",
+        "status.code_inactive": "Account sign-in required",
+        "status.api_active": "Local Gemini ready ({backend})",
+        "status.api_invalid": "Gemini API key invalid - update it in the dashboard",
+        "status.api_credits": "Gemini API key needs credits - update it in the dashboard",
+        "status.api_required": "Gemini API key missing - add it in the dashboard",
         "status.stopped": "Stopped",
         "status.not_authenticated": "Not authenticated",
         "indicator.cooldown": "Typing finished. Controls unlock in {seconds}s.",
@@ -650,7 +666,7 @@ TRANSLATIONS = {
         "startup.restoring": "Restauration de vos preferences",
         "startup.opening_setup": "Ouverture de la configuration",
         "startup.checking_auth": "Verification du mode de connexion",
-        "startup.connecting_pro": "Connexion au mode Pro",
+        "startup.connecting_pro": "Connexion au compte",
         "startup.initializing_model": "Initialisation du moteur IA",
         "startup.starting_indicator": "Demarrage de l'indicateur",
         "startup.ready": "Pret",
@@ -658,7 +674,7 @@ TRANSLATIONS = {
         "startup.detail.restoring": "Restauration des reglages et secrets securises",
         "startup.detail.opening_setup": "En attente de vos choix de configuration",
         "startup.detail.checking_auth": "Validation du mode d'acces selectionne",
-        "startup.detail.connecting_pro": "Connexion de votre session d'abonnement",
+        "startup.detail.connecting_pro": "Connexion a votre compte",
         "startup.detail.initializing_model": "Verification de votre cle API et du moteur",
         "startup.detail.starting_indicator": "Demarrage de l'indicateur flottant",
         "startup.detail.ready": "EyesAndEars est pret",
@@ -677,8 +693,8 @@ TRANSLATIONS = {
         "auth.language": "Langue",
         "auth.mode.free": "Mode gratuit",
         "auth.mode.free.help": "Utiliser votre propre cle Gemini",
-        "auth.mode.pro": "Mode Pro",
-        "auth.mode.pro.help": "Utiliser votre cle secrete",
+        "auth.mode.pro": "Mode compte",
+        "auth.mode.pro.help": "Utiliser votre compte du site",
         "auth.section.startup": "Demarrage",
         "auth.startup_screen.label": "Ecran de chargement",
         "auth.startup_screen.copy": "Desactivez ceci pour lancer directement l'application sans l'ecran anime.",
@@ -693,7 +709,7 @@ TRANSLATIONS = {
         "auth.section.indicator_size": "Taille de l'indicateur",
         "auth.section.indicator_position": "Position de l'indicateur",
         "auth.section.free": "Utiliser votre propre cle Gemini",
-        "auth.section.pro": "Connexion avec votre cle secrete",
+        "auth.section.pro": "Connexion avec votre compte",
         "auth.section.hotkeys": "Raccourcis",
         "auth.hotkeys.copy": "Cliquez sur une action puis appuyez sur la nouvelle touche. Les lettres sont interdites.",
         "auth.hotkeys.waiting": "Appuyez sur une nouvelle touche...",
@@ -716,10 +732,19 @@ TRANSLATIONS = {
         "auth.api.link": "Pas de cle ? Obtenez-en une ici",
         "auth.api.note": "Stockee localement avec la protection Windows (DPAPI).",
         "auth.api.helper": "Nous verifions votre cle en initialisant Gemini. Le controle local ne bloque que les erreurs evidentes.",
-        "auth.pro.label": "Cle secrete",
-        "auth.pro.placeholder": "Entrez votre cle secrete",
-        "auth.pro.note": "Le point d'acces serveur reste gere dans l'application.",
-        "auth.pro.model": "Modele Pro prefere",
+        "auth.pro.label": "Acces au compte",
+        "auth.pro.placeholder": "Utilisez la fenetre de connexion au compte",
+        "auth.pro.note": "L'acces desktop utilise maintenant l'email et le mot de passe du site.",
+        "auth.account.title": "Compte du site",
+        "auth.account.copy": "Connectez-vous avec l'email et le mot de passe du site. Votre cle Gemini reste chiffree dans le tableau de bord et n'est dechiffree que localement sur cet appareil.",
+        "auth.account.email": "Email",
+        "auth.account.email.placeholder": "nom@exemple.com",
+        "auth.account.password": "Mot de passe",
+        "auth.account.password.placeholder": "Entrez le mot de passe du site",
+        "auth.account.dashboard": "Ouvrir le tableau de bord",
+        "auth.account.reset": "Reinitialiser le mot de passe",
+        "auth.account.helper": "Ajoutez ou remplacez votre cle Gemini depuis le tableau de bord si besoin. Vous pouvez laisser le mot de passe vide si vous modifiez seulement les reglages locaux.",
+        "auth.pro.model": "Modele prefere",
         "auth.pro.model.note": "Modeles Gemini actuels pour les captures avec reponse texte directe.",
         "auth.preview.title": "Emplacement de l'indicateur",
         "auth.preview.copy": "L'indicateur flottant reste natif, fluide et protege des captures.",
@@ -731,9 +756,12 @@ TRANSLATIONS = {
         "auth.validation.api.short": "Cette cle semble trop courte. Verifiez si elle a ete tronquee.",
         "auth.validation.api.whitespace": "Supprimez les espaces ou retours a la ligne de la cle API.",
         "auth.validation.api.shape": "Cette cle semble mal formee. Verifiez les caracteres supplementaires.",
-        "auth.validation.pro.empty": "Entrez votre cle secrete.",
+        "auth.validation.pro.empty": "Terminez la connexion dans la fenetre du compte.",
+        "auth.validation.account.email.empty": "Entrez l'email du compte.",
+        "auth.validation.account.email.invalid": "Entrez une adresse email valide.",
         "auth.status.free": "Le mode gratuit verifie votre cle API localement sur cet appareil.",
-        "auth.status.pro": "Le mode Pro ouvre votre session d'abonnement.",
+        "auth.status.pro": "Le mode compte ouvre votre session via le site.",
+        "auth.status.account": "L'acces desktop utilise votre compte du site et le dechiffrement Gemini en local.",
         "position.top_left": "Haut gauche",
         "position.top_center": "Haut centre",
         "position.top_right": "Haut droite",
@@ -749,7 +777,7 @@ TRANSLATIONS = {
         "status.window_title": "Statut EyesAndEars",
         "status.mode": "Mode",
         "status.mode.free": "Mode gratuit",
-        "status.mode.pro": "Mode Pro",
+        "status.mode.pro": "Mode compte",
         "status.status": "Statut",
         "status.server": "Serveur",
         "status.user": "Utilisateur",
@@ -757,7 +785,7 @@ TRANSLATIONS = {
         "status.backend": "Moteur",
         "status.model": "Modele",
         "status.api_key": "Cle API",
-        "status.pro_model": "Modele Pro prefere",
+        "status.pro_model": "Modele prefere",
         "status.not_set": "-",
         "tray.open": "Ouvrir le statut",
         "tray.toggle": "Afficher ou masquer l'indicateur",
@@ -775,8 +803,8 @@ TRANSLATIONS = {
         "error.server_non_json": "Le serveur a renvoye une reponse inattendue ({status_code}).",
         "error.auth_failed": "La demande d'authentification a echoue ({status_code}). {detail}",
         "error.auth_denied": "Authentification refusee.",
-        "error.pro_lockout_wait": "Trop de tentatives incorrectes pour la cle secrete. Reessayez dans {seconds} secondes.",
-        "error.pro_lockout_locked": "Trop de tentatives incorrectes pour la cle secrete. Cet appareil est bloque pour {seconds} secondes.",
+        "error.pro_lockout_wait": "Trop de tentatives de connexion incorrectes. Reessayez dans {seconds} secondes.",
+        "error.pro_lockout_locked": "Trop de tentatives de connexion incorrectes. Cet appareil est bloque pour {seconds} secondes.",
         "error.pro_time_unavailable": "Impossible de verifier l'heure en ligne. Verifiez votre connexion puis reessayez.",
         "error.api_empty": "La cle API est vide.",
         "error.no_sdk": "Impossible d'initialiser le mode API.\n{detail}",
@@ -786,17 +814,17 @@ TRANSLATIONS = {
         "error.api_required": "Le mode gratuit a besoin d'une cle API Gemini valide.",
         "error.api_select_mode": "Selectionnez le mode gratuit et entrez une cle API Gemini valide.",
         "error.session_inactive": "Session inactive. Redemarrez l'application et reconnectez-vous.",
-        "error.license_retry": "Reessayer la connexion au mode Pro ?",
-        "status.code_active": "Mode Pro actif",
-        "status.code_disconnected": "Mode Pro deconnecte : {detail}",
-        "status.code_session_lost": "Session Pro perdue",
-        "status.code_network_error": "Mode Pro deconnecte",
-        "status.code_expired": "La session Pro a expire. Redemarrez l'application.",
-        "status.code_inactive": "Mode Pro inactif - connexion requise",
-        "status.api_active": "Mode gratuit actif ({backend})",
-        "status.api_invalid": "Mode gratuit inactif - cle API invalide",
-        "status.api_credits": "Mode gratuit inactif - credits epuises",
-        "status.api_required": "Mode gratuit inactif - cle API requise",
+        "error.license_retry": "Reessayer la connexion ?",
+        "status.code_active": "Session du compte active",
+        "status.code_disconnected": "Echec de connexion au compte : {detail}",
+        "status.code_session_lost": "Session du compte perdue",
+        "status.code_network_error": "Connexion au compte perdue",
+        "status.code_expired": "La session du compte a expire. Reconnectez-vous.",
+        "status.code_inactive": "Connexion au compte requise",
+        "status.api_active": "Gemini local pret ({backend})",
+        "status.api_invalid": "Cle Gemini invalide - mettez-la a jour depuis le tableau de bord",
+        "status.api_credits": "La cle Gemini n'a plus de credits - mettez-la a jour depuis le tableau de bord",
+        "status.api_required": "Cle Gemini manquante - ajoutez-la depuis le tableau de bord",
         "status.stopped": "Arrete",
         "status.not_authenticated": "Non authentifie",
         "indicator.cooldown": "Saisie terminee. Les commandes reviennent dans {seconds}s.",
@@ -805,23 +833,18 @@ TRANSLATIONS = {
 
 DEFAULT_PRO_MODEL_OPTIONS = [
     {
-        "id": "pro-auto",
-        "label": "Auto",
-        "description": "Use the server default Pro model.",
-    },
-    {
         "id": "gemini-3-flash-preview",
         "label": "Gemini 3 Flash Preview",
-        "description": "Current fastest Gemini 3 preview for Pro users.",
+        "description": "Current fastest Gemini 3 preview for lightweight local work.",
     },
     {
         "id": "gemini-3.1-flash-lite-preview",
         "label": "Gemini 3.1 Flash-Lite Preview",
-        "description": "Lowest-latency Gemini 3.1 option for lightweight Pro work.",
+        "description": "Lowest-latency Gemini 3.1 option for lightweight local work.",
     },
     {
         "id": "gemini-3.1-pro-preview",
-        "label": "Gemini 3.1 Pro Preview",
+        "label": "Gemini 3.1 Preview",
         "description": "Highest-quality Gemini 3.1 reasoning preview.",
     },
     {
@@ -846,7 +869,7 @@ DEFAULT_PRO_MODEL_OPTIONS = [
     },
     {
         "id": "gemini-2.5-pro",
-        "label": "Gemini 2.5 Pro",
+        "label": "Gemini 2.5 Advanced",
         "description": "Highest reasoning quality when available.",
     },
 ]
@@ -996,6 +1019,9 @@ def normalize_pro_model(value):
     for item in PRO_MODEL_OPTIONS:
         if candidate == item["id"]:
             return candidate
+    for item in PRO_MODEL_OPTIONS:
+        if item["id"] == DEFAULT_MODEL_NAME:
+            return item["id"]
     return str(PRO_MODEL_OPTIONS[0]["id"])
 
 
@@ -1254,6 +1280,26 @@ def open_default_website():
         return False
 
 
+def open_dashboard_page(anchor="dashboard-app-access"):
+    target = str(DEFAULT_WEBSITE_URL or DEFAULT_SERVER_URL).strip().rstrip("/")
+    if not target:
+        return False
+    if not target.lower().endswith(".php") and not target.endswith("/dashboard.php"):
+        target = f"{target}/dashboard.php"
+    if anchor:
+        target = f"{target}#{str(anchor).strip().lstrip('#')}"
+    try:
+        parsed = urlparse(target)
+    except Exception:
+        return False
+    if parsed.scheme not in {"http", "https"}:
+        return False
+    try:
+        return bool(webbrowser.open(target, new=2))
+    except Exception:
+        return False
+
+
 def clear_startup_preflight_license_auth():
     global startup_preflight_license_auth
     startup_preflight_license_auth = None
@@ -1287,38 +1333,10 @@ def consume_startup_preflight_license_auth(license_value, device_value):
 
 
 def perform_license_auth_request(license_value, device_value):
-    payload = {
-        "license_code": str(license_value or "").strip(),
-        "device_id": str(device_value or "").strip(),
-        "device_name": os.environ.get("COMPUTERNAME", os.environ.get("HOSTNAME", "Windows")),
-        "app_version": APP_VERSION,
-    }
-    try:
-        response = request_json("POST", "/api/v1/client/authenticate", json_payload=payload, timeout=20)
-    except Exception as exc:
-        logger.warning("License authentication request failed.", exc_info=True)
-        return False, tr("error.connect_server", detail=exc), None, "network_error"
-
-    data = decode_json_response(response, "License authentication")
-    if data is None:
-        detail = describe_unexpected_json_response(response)
-        message = tr("error.server_non_json", status_code=response.status_code)
-        if detail:
-            message = f"{message} {detail}"
-        return False, message, None, "server_non_json"
-    if not response.ok:
-        message = data.get("detail") if isinstance(data, dict) else ""
-        logger.warning("License authentication failed with status %s.", response.status_code)
-        return False, tr("error.auth_failed", status_code=response.status_code, detail=message), None, "http_error"
-    if not data.get("success"):
-        denial_message = str(data.get("message", tr("error.auth_denied")) or "").strip()
-        logger.info("License authentication denied by server.")
-        if license_message_is_lockout(denial_message):
-            return False, denial_message, None, "lockout"
-        if license_message_is_invalid_secret(denial_message):
-            return False, denial_message, None, "invalid_secret"
-        return False, denial_message or tr("error.auth_denied"), None, "denied"
-    return True, tr("startup.ready"), data, "ok"
+    _ = license_value
+    _ = device_value
+    message = "Legacy access-code sign-in is no longer supported. Use your website email and password."
+    return False, message, None, "unsupported"
 
 
 def resolve_install_root():
@@ -1950,6 +1968,54 @@ def save_secret(record, plain_key, encrypted_key, value):
     return True
 
 
+def clear_saved_secret(record, plain_key, encrypted_key):
+    record.pop(plain_key, None)
+    record.pop(encrypted_key, None)
+    save_config_record(record)
+
+
+def normalize_account_email(value):
+    candidate = str(value or "").strip().lower()
+    if not candidate:
+        return ""
+    return candidate
+
+
+def decode_account_api_key_bundle(bundle, password):
+    if not isinstance(bundle, dict):
+        raise RuntimeError("No encrypted API key was returned by the website.")
+    if str(bundle.get("kdf_name", "")).strip().lower() not in {"", "pbkdf2-sha256"}:
+        raise RuntimeError("The website returned an unsupported API-key format.")
+    try:
+        salt = base64.b64decode(str(bundle.get("salt", "") or ""))
+        nonce = base64.b64decode(str(bundle.get("nonce", "") or ""))
+        ciphertext = base64.b64decode(str(bundle.get("ciphertext", "") or ""))
+    except Exception as exc:
+        raise RuntimeError("The website returned a malformed encrypted API key.") from exc
+
+    iterations = int(bundle.get("opslimit", 600000) or 600000)
+    if iterations < 100000:
+        iterations = 100000
+    if len(salt) < 8 or len(nonce) < 12 or not ciphertext:
+        raise RuntimeError("The website returned an incomplete encrypted API key.")
+
+    password_bytes = str(password or "").encode("utf-8")
+    if not password_bytes:
+        raise RuntimeError("Password is required to unlock the encrypted API key.")
+
+    try:
+        kdf = PBKDF2HMAC(algorithm=SHA256(), length=32, salt=salt, iterations=iterations)
+        aes_key = kdf.derive(password_bytes)
+        plaintext = AESGCM(aes_key).decrypt(nonce, ciphertext, None)
+    except Exception as exc:
+        raise RuntimeError("Could not unlock the encrypted API key with that password.") from exc
+
+    resolved = str(plaintext.decode("utf-8", errors="strict") or "").strip()
+    if not resolved:
+        raise RuntimeError("The decrypted API key was empty.")
+    return resolved
+
+
 def set_hidden_path_flag(path):
     if os.name != "nt":
         return False
@@ -2046,7 +2112,7 @@ def save_pro_auth_guard_state(payload):
         if os.name == "nt":
             stored_payload = encrypt_with_dpapi(serialized)
             if not stored_payload:
-                raise RuntimeError("Could not protect Pro auth guard state with DPAPI.")
+                raise RuntimeError("Could not protect the legacy auth guard state with DPAPI.")
         else:
             stored_payload = base64.b64encode(serialized.encode("utf-8")).decode("ascii")
         temp_path = PRO_AUTH_RUNTIME_DIR / f"{PRO_AUTH_HIDDEN_FILE_NAME}.{secrets.token_hex(6)}.tmp"
@@ -3835,6 +3901,14 @@ class AuthShellBridge:
         logger.warning("Could not resolve auth window handle for resize operations.")
         return 0
 
+    def ensure_capture_privacy(self):
+        if not is_capture_privacy_active():
+            return True
+        hwnd = self._get_hwnd()
+        if not hwnd:
+            return False
+        return bool(set_window_capture_excluded(hwnd, enabled=True))
+
     def submit(self, payload):
         if not isinstance(payload, dict):
             return {"ok": False, "error": "Invalid setup payload."}
@@ -3843,66 +3917,20 @@ class AuthShellBridge:
             payload.get("hotkey_mode", command_key_mode),
         )
         normalized = {
-            "mode": "license" if str(payload.get("mode", "")).strip().lower() == "license" else "api",
+            "mode": "account",
             "language": normalize_language(payload.get("language", ui_language)),
             "theme": normalize_theme_preference(payload.get("theme", ui_theme_preference)),
             "blob_size": normalize_indicator_blob_size(payload.get("blob_size", indicator_blob_size_key)),
             "indicator_position": normalize_indicator_position(payload.get("indicator_position", indicator_position_key)),
             "show_startup_screen": normalize_startup_loading_screen_enabled(payload.get("show_startup_screen", startup_loading_screen_enabled)),
-            "pro_model": normalize_pro_model(payload.get("pro_model", selected_pro_model_key)),
+            "preferred_model": normalize_pro_model(payload.get("preferred_model", payload.get("pro_model", selected_pro_model_key))),
             "hotkeys": hotkeys,
             "hotkey_mode": hotkey_mode,
             "hotkeys_customized": bool(hotkeys_customized),
+            "email": normalize_account_email(payload.get("email", "")),
+            "password": str(payload.get("password", "") or ""),
         }
-        if normalized["mode"] == "license":
-            normalized["license_code"] = str(payload.get("license_code", "") or "").strip()
-            try:
-                trusted_now, trusted_time_source = fetch_trusted_utc_epoch()
-            except Exception as exc:
-                clear_startup_preflight_license_auth()
-                return {"ok": False, "error": str(exc or tr("error.pro_time_unavailable"))}
-            is_locked, remaining_seconds, hard_locked, _guard_state = inspect_pro_auth_guard(trusted_now)
-            if is_locked:
-                clear_startup_preflight_license_auth()
-                return {
-                    "ok": False,
-                    "error": build_pro_auth_lockout_message(remaining_seconds, hard_locked=hard_locked),
-                    "lockout_seconds": int(max(1, remaining_seconds)),
-                    "lockout_hard": bool(hard_locked),
-                }
-            ok, message, auth_data, reason = perform_license_auth_request(normalized["license_code"], device_id)
-            if not ok:
-                clear_startup_preflight_license_auth()
-                lockout_seconds = 0
-                lockout_hard = False
-                if reason == "lockout":
-                    try:
-                        message = sync_local_pro_auth_lockout(trusted_now, message, time_source=trusted_time_source)
-                    except Exception:
-                        logger.warning("Could not persist server-side Pro auth lockout state.", exc_info=True)
-                    lockout_seconds, lockout_hard = extract_lockout_seconds_from_message(message)
-                elif reason == "invalid_secret":
-                    try:
-                        local_lockout_message = record_local_pro_auth_failure(trusted_now, time_source=trusted_time_source)
-                    except Exception:
-                        logger.warning("Could not persist local Pro auth failure state.", exc_info=True)
-                        local_lockout_message = ""
-                    if local_lockout_message:
-                        message = local_lockout_message
-                        lockout_seconds, lockout_hard = extract_lockout_seconds_from_message(local_lockout_message)
-                result = {"ok": False, "error": str(message or tr("error.auth_denied"))}
-                if lockout_seconds > 0:
-                    result["lockout_seconds"] = int(max(1, lockout_seconds))
-                    result["lockout_hard"] = bool(lockout_hard)
-                return result
-            try:
-                clear_pro_auth_guard_state()
-            except Exception:
-                logger.warning("Could not clear local Pro auth failure state after successful sign-in.", exc_info=True)
-            cache_startup_preflight_license_auth(normalized["license_code"], device_id, auth_data)
-        else:
-            normalized["api_key"] = str(payload.get("api_key", "") or "").strip()
-            clear_startup_preflight_license_auth()
+        normalized["pro_model"] = normalized["preferred_model"]
         self._result = normalized
         self.close()
         return {"ok": True}
@@ -3917,6 +3945,9 @@ class AuthShellBridge:
         return True
 
     def exit_app(self):
+        if AUTH_SHELL_SUBPROCESS_FLAG in sys.argv:
+            self.close()
+            return True
         self.close()
         exit_program(trigger_uninstall=False)
         return True
@@ -4031,8 +4062,9 @@ def build_auth_shell_html(initial_state):
         "positionIds": list(INDICATOR_POSITIONS.keys()),
         "positionPoints": dict(INDICATOR_PREVIEW_POINTS),
         "proModels": list(PRO_MODEL_OPTIONS),
-        "apiKeyUrl": "https://aistudio.google.com/api-keys",
         "websiteUrl": DEFAULT_WEBSITE_URL,
+        "dashboardUrl": f"{str(DEFAULT_WEBSITE_URL).rstrip('/')}/dashboard.php#dashboard-app-access",
+        "forgotPasswordUrl": f"{str(DEFAULT_WEBSITE_URL).rstrip('/')}/forgot-password.php",
         "themeDark": bool(system_dark_theme_enabled),
     }
     template = r"""
@@ -4084,7 +4116,8 @@ def build_auth_shell_html(initial_state):
       overflow: auto;
     }
     .window-shell {
-      height: calc(100vh - 32px);
+      height: min(920px, calc(100vh - 32px));
+      min-height: 0;
       background: linear-gradient(180deg, rgba(255,255,255,0.08), rgba(255,255,255,0.03));
       border: 1px solid var(--border);
       box-shadow: 0 30px 90px rgba(0,0,0,0.35);
@@ -4098,6 +4131,8 @@ def build_auth_shell_html(initial_state):
     .window-bar {
       display: flex;
       align-items: center;
+      flex-wrap: wrap;
+      justify-content: space-between;
       gap: 16px;
       min-height: 72px;
       padding: 14px 18px;
@@ -4109,6 +4144,7 @@ def build_auth_shell_html(initial_state):
       flex: 1 1 auto;
       display: flex;
       align-items: center;
+      flex-wrap: wrap;
       gap: 16px;
     }
     .window-brand {
@@ -4161,12 +4197,15 @@ def build_auth_shell_html(initial_state):
     .window-caption {
       font-size: 15px;
       font-weight: 700;
+      overflow-wrap: anywhere;
     }
     .window-status {
       display: inline-flex;
       align-items: center;
       justify-content: center;
-      min-width: 220px;
+      min-width: 0;
+      flex: 1 1 220px;
+      max-width: 100%;
       padding: 10px 16px;
       border-radius: 999px;
       background: rgba(255,255,255,0.08);
@@ -4174,10 +4213,13 @@ def build_auth_shell_html(initial_state):
       color: var(--muted);
       font-size: 12px;
       text-align: center;
+      overflow-wrap: anywhere;
     }
     .window-controls {
       display: flex;
       align-items: center;
+      justify-content: flex-end;
+      flex-wrap: wrap;
       gap: 10px;
       flex: 0 0 auto;
     }
@@ -4210,7 +4252,7 @@ def build_auth_shell_html(initial_state):
       display: grid;
       grid-template-columns: minmax(340px, 1.03fr) minmax(320px, 0.97fr);
       overflow: hidden;
-      align-items: center;
+      align-items: stretch;
     }
     .hero, .panel { min-height: 0; padding: 26px 30px; }
     .hero {
@@ -4244,6 +4286,12 @@ def build_auth_shell_html(initial_state):
       display: block;
     }
     .subtitle { color: var(--muted); max-width: 540px; line-height: 1.55; }
+    .subtitle,
+    .hero-copy,
+    .settings-summary,
+    .main-card {
+      min-width: 0;
+    }
     .card {
       background: var(--glass);
       border: 1px solid var(--border);
@@ -4496,6 +4544,9 @@ def build_auth_shell_html(initial_state):
       z-index: 2;
     }
     .input-link-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px 14px;
       margin-top: 10px;
     }
     .text-link {
@@ -4593,6 +4644,7 @@ def build_auth_shell_html(initial_state):
       flex-wrap: wrap;
       gap: 10px;
       margin-left: auto;
+      width: 100%;
       padding-top: 4px;
     }
     .actions .ghost,
@@ -4721,7 +4773,7 @@ def build_auth_shell_html(initial_state):
       cursor: nesw-resize;
     }
     .hidden { display: none !important; }
-    @media (max-width: 980px) {
+    @media (max-width: 1180px), (max-height: 780px) {
       body { padding: 14px; }
       .window-shell { height: calc(100vh - 28px); }
       .window-bar {
@@ -4758,6 +4810,63 @@ def build_auth_shell_html(initial_state):
         width: auto;
       }
     }
+    @media (max-width: 760px), (max-height: 640px) {
+      body { padding: 10px; }
+      .window-shell {
+        height: calc(100vh - 20px);
+        border-radius: 24px;
+      }
+      .window-bar {
+        gap: 12px;
+        min-height: 0;
+        padding: 12px 14px;
+      }
+      .window-controls {
+        width: 100%;
+      }
+      .chrome-control {
+        width: 36px;
+        height: 36px;
+        border-radius: 12px;
+      }
+      .hero,
+      .panel {
+        padding: 18px 18px 16px;
+      }
+      .window-status {
+        padding: 8px 12px;
+        font-size: 11px;
+      }
+      .preview {
+        min-height: 190px;
+      }
+      .hotkey-row {
+        grid-template-columns: 1fr;
+      }
+      .hotkey-button {
+        width: 100%;
+      }
+      .actions {
+        margin-left: 0;
+      }
+      .actions .ghost,
+      .actions .primary {
+        flex: 1 1 100%;
+        min-width: 0;
+      }
+      .text-link {
+        max-width: 100%;
+        text-align: left;
+      }
+      .settings-drawer {
+        top: 112px;
+        left: 10px;
+        right: 10px;
+        bottom: 10px;
+        padding: 14px;
+        border-radius: 24px;
+      }
+    }
   </style>
 </head>
 <body class="theme-dark">
@@ -4785,8 +4894,8 @@ def build_auth_shell_html(initial_state):
           <p class="subtitle" id="subtitle"></p>
         </div>
         <div class="modes">
-          <article class="card mode" id="modeApiCard"><h3 id="modeApiTitle"></h3><p id="modeApiHelp"></p></article>
-          <article class="card mode" id="modeLicenseCard"><h3 id="modeLicenseTitle"></h3><p id="modeLicenseHelp"></p></article>
+          <article class="card mode active"><h3 id="modeAccountTitle"></h3><p id="modeAccountHelp"></p></article>
+          <article class="card mode"><h3 id="modeDashboardTitle"></h3><p id="modeDashboardHelp"></p></article>
         </div>
         <div class="card settings-summary">
           <div>
@@ -4800,22 +4909,23 @@ def build_auth_shell_html(initial_state):
         <div class="card main-card">
           <div class="section" id="accountTitle"></div>
           <p class="helper" id="accountCopy"></p>
-          <div class="auth-panel" id="apiPanel">
-          <label class="label" id="apiLabel"></label>
+          <div class="auth-panel" id="accountPanel">
+          <label class="label" id="emailLabel"></label>
+          <div class="field">
+            <input id="emailInput" type="email" autocomplete="username email" spellcheck="false">
+          </div>
+          <label class="label" id="passwordLabel" style="margin-top: 14px;"></label>
           <div class="field icon-field">
-            <input id="apiInput" type="password" autocomplete="off" spellcheck="false">
+            <input id="passwordInput" type="password" autocomplete="current-password" spellcheck="false">
             <div class="field-actions">
-              <button class="icon-button" id="pasteButton" type="button"></button>
               <button class="icon-button" id="showButton" type="button"></button>
             </div>
           </div>
-          <div class="input-link-row"><button class="text-link" id="linkButton" type="button"></button></div>
-          <p class="helper" id="apiHelper" style="margin-top: 12px;"></p>
+          <div class="input-link-row">
+            <button class="text-link" id="dashboardButton" type="button"></button>
+            <button class="text-link" id="resetPasswordButton" type="button"></button>
           </div>
-          <div class="auth-panel" id="licensePanel">
-          <label class="label" id="licenseLabel"></label>
-          <div class="field"><input id="licenseInput" type="text" autocomplete="off" spellcheck="false"></div>
-          <p class="helper" id="licenseNote" style="margin-top: 12px;"></p>
+          <p class="helper" id="accountHelper" style="margin-top: 12px;"></p>
           </div>
         </div>
         <div class="error" id="errorText"></div>
@@ -4899,7 +5009,6 @@ def build_auth_shell_html(initial_state):
     const bootstrap = window.AUTH_BOOTSTRAP || {};
     const copy = bootstrap.translations || {};
     const state = Object.assign({
-      mode: 'api',
       language: 'en',
       theme: 'system',
       blob_size: 'medium',
@@ -4907,12 +5016,11 @@ def build_auth_shell_html(initial_state):
       show_startup_screen: true,
       hotkeys: {},
       hotkey_mode: 'numpad',
+      preferred_model: '',
       pro_model: '',
-      api_key: '',
-      license_code: '',
-      error_message: '',
-      lockout_until_ms: 0,
-      lockout_hard: false
+      email: '',
+      password: '',
+      error_message: ''
     }, bootstrap.initialState || {});
     const hotkeyActionIds = bootstrap.hotkeyActionIds || [];
     const allowedHotkeys = bootstrap.allowedHotkeys || {};
@@ -4921,8 +5029,9 @@ def build_auth_shell_html(initial_state):
     const positionIds = bootstrap.positionIds || [];
     const positionPoints = bootstrap.positionPoints || {};
     const proModels = bootstrap.proModels || [];
-    const apiKeyUrl = bootstrap.apiKeyUrl || '';
     const websiteUrl = bootstrap.websiteUrl || '';
+    const dashboardUrl = bootstrap.dashboardUrl || websiteUrl;
+    const forgotPasswordUrl = bootstrap.forgotPasswordUrl || websiteUrl;
     let themeDark = !!bootstrap.themeDark;
     let closePending = false;
     let settingsOpen = false;
@@ -4930,7 +5039,6 @@ def build_auth_shell_html(initial_state):
     let hotkeyFeedbackKey = 'auth.hotkeys.copy';
     let windowMaximized = false;
     let isSubmitting = false;
-    let lockoutTickHandle = null;
     const themeMedia = window.matchMedia ? window.matchMedia('(prefers-color-scheme: dark)') : null;
 
     function t(key, vars) {
@@ -4958,60 +5066,9 @@ def build_auth_shell_html(initial_state):
       const button = document.getElementById('continueButton');
       if (!button) return;
       button.classList.toggle('loading', isSubmitting);
-      button.disabled = !!isSubmitting || currentLockoutSeconds() > 0;
+      button.disabled = !!isSubmitting;
       button.setAttribute('aria-busy', isSubmitting ? 'true' : 'false');
       setText('continueButtonLabel', isSubmitting ? t('auth.continue.loading') : t('auth.continue'));
-    }
-
-    function currentLockoutSeconds() {
-      const remainingMs = Math.max(0, Number(state.lockout_until_ms || 0) - Date.now());
-      if (remainingMs <= 0) return 0;
-      return Math.max(1, Math.ceil(remainingMs / 1000));
-    }
-
-    function clearLockoutState() {
-      state.lockout_until_ms = 0;
-      state.lockout_hard = false;
-    }
-
-    function setLockoutState(seconds, hardLocked) {
-      const normalizedSeconds = Math.max(0, Number(seconds || 0));
-      if (normalizedSeconds <= 0) {
-        clearLockoutState();
-        return;
-      }
-      state.lockout_until_ms = Date.now() + (normalizedSeconds * 1000);
-      state.lockout_hard = !!hardLocked;
-    }
-
-    function lockoutMessage() {
-      const remaining = currentLockoutSeconds();
-      if (remaining <= 0) return '';
-      return t(state.lockout_hard ? 'error.pro_lockout_locked' : 'error.pro_lockout_wait', { seconds: remaining });
-    }
-
-    function renderLockoutState() {
-      const remaining = currentLockoutSeconds();
-      if (remaining > 0) {
-        state.error_message = lockoutMessage();
-        setText('errorText', state.error_message);
-      } else if (state.lockout_until_ms) {
-        clearLockoutState();
-        state.error_message = '';
-        setText('errorText', '');
-      }
-      renderSubmitButton();
-    }
-
-    function ensureLockoutTicker() {
-      if (lockoutTickHandle !== null) return;
-      lockoutTickHandle = window.setInterval(() => {
-        renderLockoutState();
-      }, 250);
-    }
-
-    if (Number(state.lockout_seconds || 0) > 0) {
-      setLockoutState(state.lockout_seconds, !!state.lockout_hard);
     }
 
     function iconSvg(name) {
@@ -5048,7 +5105,7 @@ def build_auth_shell_html(initial_state):
     }
 
     function currentStatus() {
-      return state.mode === 'license' ? t('auth.status.pro') : t('auth.status.free');
+      return t('auth.status.account');
     }
 
     function resolveThemeDarkJs() {
@@ -5277,16 +5334,18 @@ def build_auth_shell_html(initial_state):
       const mount = document.getElementById('modelOptions');
       if (!hiddenInput || !mount) return;
       mount.innerHTML = '';
-      const nextValue = state.pro_model || (proModels[0] ? proModels[0].id : '');
+      const nextValue = state.preferred_model || state.pro_model || (proModels[0] ? proModels[0].id : '');
+      state.preferred_model = nextValue;
       state.pro_model = nextValue;
       hiddenInput.value = nextValue;
       proModels.forEach((item) => {
         const button = document.createElement('button');
         button.type = 'button';
-        button.className = 'model-option' + (item.id === state.pro_model ? ' active' : '');
+        button.className = 'model-option' + (item.id === state.preferred_model ? ' active' : '');
         button.title = item.description || item.label || item.id;
-        button.setAttribute('aria-pressed', item.id === state.pro_model ? 'true' : 'false');
+        button.setAttribute('aria-pressed', item.id === state.preferred_model ? 'true' : 'false');
         button.onclick = () => {
+          state.preferred_model = item.id;
           state.pro_model = item.id;
           hiddenInput.value = item.id;
           renderModels();
@@ -5362,10 +5421,10 @@ def build_auth_shell_html(initial_state):
       setText('startupSectionTitle', t('auth.section.startup'));
       setText('startupScreenLabel', t('auth.startup_screen.label'));
       setText('startupScreenCopy', t('auth.startup_screen.copy'));
-      setText('modeApiTitle', t('auth.mode.free'));
-      setText('modeApiHelp', t('auth.mode.free.help'));
-      setText('modeLicenseTitle', t('auth.mode.pro'));
-      setText('modeLicenseHelp', t('auth.mode.pro.help'));
+      setText('modeAccountTitle', t('auth.account.title'));
+      setText('modeAccountHelp', t('auth.account.copy'));
+      setText('modeDashboardTitle', t('auth.account.dashboard'));
+      setText('modeDashboardHelp', t('auth.account.helper'));
       setText('previewTitle', t('auth.preview.title'));
       setText('previewCopy', t('auth.preview.copy'));
       setText('languageTitle', t('auth.language'));
@@ -5374,13 +5433,13 @@ def build_auth_shell_html(initial_state):
       setText('themeCopy', t('auth.theme.copy'));
       setText('sizeTitle', t('auth.section.indicator_size'));
       setText('proSectionTitle', t('auth.section.pro'));
-      setText('accountTitle', state.mode === 'license' ? t('auth.mode.pro') : t('auth.mode.free'));
-      setText('accountCopy', state.mode === 'license' ? t('auth.mode.pro.help') : t('auth.mode.free.help'));
-      setText('apiLabel', t('auth.api.label'));
-      setText('linkButton', t('auth.api.link'));
-      setText('apiHelper', t('auth.api.helper'));
-      setText('licenseLabel', t('auth.pro.label'));
-      setText('licenseNote', t('auth.pro.note'));
+      setText('accountTitle', t('auth.account.title'));
+      setText('accountCopy', t('auth.account.copy'));
+      setText('emailLabel', t('auth.account.email'));
+      setText('passwordLabel', t('auth.account.password'));
+      setText('dashboardButton', t('auth.account.dashboard'));
+      setText('resetPasswordButton', t('auth.account.reset'));
+      setText('accountHelper', t('auth.account.helper'));
       setText('modelLabel', t('auth.pro.model'));
       setText('modelNote', t('auth.pro.model.note'));
       setText('hotkeysTitle', t('auth.section.hotkeys'));
@@ -5389,19 +5448,13 @@ def build_auth_shell_html(initial_state):
       setText('hotkeysFeedback', t(awaitingHotkeyAction ? 'auth.hotkeys.waiting' : hotkeyFeedbackKey));
       setText('securityCopy', t('auth.security'));
       setText('cancelButton', t('auth.cancel'));
-      document.getElementById('apiInput').placeholder = t('auth.api.placeholder');
-      document.getElementById('licenseInput').placeholder = t('auth.pro.placeholder');
-      document.getElementById('modeApiCard').classList.toggle('active', state.mode === 'api');
-      document.getElementById('modeLicenseCard').classList.toggle('active', state.mode === 'license');
-      document.getElementById('apiPanel').classList.toggle('hidden', state.mode !== 'api');
-      document.getElementById('licensePanel').classList.toggle('hidden', state.mode !== 'license');
-      document.getElementById('modelSettingsCard').classList.toggle('hidden', state.mode !== 'license');
+      document.getElementById('emailInput').placeholder = t('auth.account.email.placeholder');
+      document.getElementById('passwordInput').placeholder = t('auth.account.password.placeholder');
       setIconButton('settingsToggleButton', 'settings', t('auth.settings'));
       setIconButton('minimizeButton', 'remove', t('auth.window.minimize'));
       setIconButton('maximizeButton', windowMaximized ? 'contract' : 'square', windowMaximized ? t('auth.window.restore') : t('auth.window.maximize'));
       setIconButton('closeChromeButton', 'close', t('auth.window.close'));
-      setIconButton('pasteButton', 'paste', t('auth.api.paste'));
-      setIconButton('showButton', document.getElementById('apiInput').type === 'password' ? 'eye' : 'eye-off', document.getElementById('apiInput').type === 'password' ? t('auth.api.show') : t('auth.api.hide'));
+      setIconButton('showButton', document.getElementById('passwordInput').type === 'password' ? 'eye' : 'eye-off', document.getElementById('passwordInput').type === 'password' ? t('auth.api.show') : t('auth.api.hide'));
       const startupToggle = document.getElementById('startupScreenToggle');
       if (startupToggle) {
         startupToggle.textContent = state.show_startup_screen ? t('auth.startup_screen.enabled') : t('auth.startup_screen.disabled');
@@ -5415,40 +5468,27 @@ def build_auth_shell_html(initial_state):
       renderHotkeys();
       renderModels();
       renderPreview();
-      renderLockoutState();
       renderSubmitButton();
       syncSettingsState();
     }
 
     function validate() {
-      const apiValue = String(document.getElementById('apiInput').value || '').trim();
-      const licenseValue = String(document.getElementById('licenseInput').value || '').trim();
-      state.api_key = apiValue;
-      state.license_code = licenseValue;
-      if (state.mode === 'license') {
-        return licenseValue ? '' : 'auth.validation.pro.empty';
-      }
-      if (!apiValue) return 'auth.validation.api.empty';
-      if (/\s/.test(apiValue)) return 'auth.validation.api.whitespace';
-      if (apiValue.length < 12) return 'auth.validation.api.short';
-      if ((new Set(apiValue.split(''))).size < 4 || !/[A-Za-z]/.test(apiValue) || !/[A-Za-z0-9]/.test(apiValue)) {
-        return 'auth.validation.api.shape';
-      }
+      const emailValue = String(document.getElementById('emailInput').value || '').trim().toLowerCase();
+      const passwordValue = String(document.getElementById('passwordInput').value || '');
+      state.email = emailValue;
+      state.password = passwordValue;
+      if (!emailValue) return 'auth.validation.account.email.empty';
+      if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(emailValue)) return 'auth.validation.account.email.invalid';
       return '';
     }
 
     async function submit() {
       if (isSubmitting) return;
-      if (currentLockoutSeconds() > 0) {
-        renderLockoutState();
-        return;
-      }
       const errorKey = validate();
       setText('errorText', errorKey ? t(errorKey) : '');
       if (errorKey) return;
       state.error_message = '';
       const payload = {
-        mode: state.mode,
         language: state.language,
         theme: state.theme,
         blob_size: state.blob_size,
@@ -5456,9 +5496,10 @@ def build_auth_shell_html(initial_state):
         show_startup_screen: !!state.show_startup_screen,
         hotkeys: state.hotkeys,
         hotkey_mode: state.hotkey_mode,
-        pro_model: state.pro_model,
-        api_key: state.api_key,
-        license_code: state.license_code
+        preferred_model: state.preferred_model || state.pro_model,
+        pro_model: state.preferred_model || state.pro_model,
+        email: state.email,
+        password: state.password
       };
       if (window.pywebview && window.pywebview.api && window.pywebview.api.submit) {
         isSubmitting = true;
@@ -5468,13 +5509,9 @@ def build_auth_shell_html(initial_state):
           const result = await window.pywebview.api.submit(payload);
           if (result && result.error) {
             state.error_message = String(result.error || '');
-            if (Number(result.lockout_seconds || 0) > 0) setLockoutState(result.lockout_seconds, !!result.lockout_hard);
-            else clearLockoutState();
             setText('errorText', state.error_message);
-            renderLockoutState();
             return;
           }
-          clearLockoutState();
         } catch (error) {
           state.error_message = String((error && error.message) || t('error.auth_denied'));
           setText('errorText', state.error_message);
@@ -5483,18 +5520,6 @@ def build_auth_shell_html(initial_state):
           isSubmitting = false;
           renderSubmitButton();
         }
-      }
-    }
-
-    async function pasteKey() {
-      let value = '';
-      try {
-        if (window.pywebview && window.pywebview.api && window.pywebview.api.read_clipboard) value = await window.pywebview.api.read_clipboard();
-        else if (navigator.clipboard && navigator.clipboard.readText) value = await navigator.clipboard.readText();
-      } catch (error) {}
-      if (value) {
-        document.getElementById('apiInput').value = String(value).trim();
-        setText('errorText', '');
       }
     }
 
@@ -5536,12 +5561,22 @@ def build_auth_shell_html(initial_state):
       }
     }
 
-    async function openApiLink() {
+    async function openDashboardLink() {
+      if (!dashboardUrl) return;
       if (window.pywebview && window.pywebview.api && window.pywebview.api.open_external) {
-        await window.pywebview.api.open_external(apiKeyUrl);
+        await window.pywebview.api.open_external(dashboardUrl);
         return;
       }
-      window.open(apiKeyUrl, '_blank');
+      window.open(dashboardUrl, '_blank');
+    }
+
+    async function openResetPasswordLink() {
+      if (!forgotPasswordUrl) return;
+      if (window.pywebview && window.pywebview.api && window.pywebview.api.open_external) {
+        await window.pywebview.api.open_external(forgotPasswordUrl);
+        return;
+      }
+      window.open(forgotPasswordUrl, '_blank');
     }
 
     async function openWebsiteLink() {
@@ -5560,12 +5595,10 @@ def build_auth_shell_html(initial_state):
         }
       });
       state.hotkey_mode = inferHotkeyModeJs();
-      document.getElementById('apiInput').value = state.api_key || '';
-      document.getElementById('licenseInput').value = state.license_code || '';
-      document.getElementById('modeApiCard').onclick = () => { state.mode = 'api'; render(); };
-      document.getElementById('modeLicenseCard').onclick = () => { state.mode = 'license'; render(); };
+      document.getElementById('emailInput').value = state.email || '';
+      document.getElementById('passwordInput').value = state.password || '';
       document.getElementById('showButton').onclick = () => {
-        const input = document.getElementById('apiInput');
+        const input = document.getElementById('passwordInput');
         input.type = input.type === 'password' ? 'text' : 'password';
         render();
       };
@@ -5589,8 +5622,8 @@ def build_auth_shell_html(initial_state):
           }
         });
       });
-      document.getElementById('pasteButton').onclick = pasteKey;
-      document.getElementById('linkButton').onclick = openApiLink;
+      document.getElementById('dashboardButton').onclick = openDashboardLink;
+      document.getElementById('resetPasswordButton').onclick = openResetPasswordLink;
       document.getElementById('windowBrandLink').onclick = openWebsiteLink;
       document.getElementById('titleButton').onclick = openWebsiteLink;
       document.getElementById('minimizeButton').onclick = minimizeWindow;
@@ -5598,13 +5631,8 @@ def build_auth_shell_html(initial_state):
       document.getElementById('closeChromeButton').onclick = exitApp;
       document.getElementById('cancelButton').onclick = closeWindow;
       document.getElementById('continueButton').onclick = submit;
-      document.getElementById('apiInput').addEventListener('input', () => { state.error_message = ''; setText('errorText', ''); });
-      document.getElementById('licenseInput').addEventListener('input', () => {
-        if (currentLockoutSeconds() <= 0) {
-          state.error_message = '';
-          setText('errorText', '');
-        }
-      });
+      document.getElementById('emailInput').addEventListener('input', () => { state.error_message = ''; setText('errorText', ''); });
+      document.getElementById('passwordInput').addEventListener('input', () => { state.error_message = ''; setText('errorText', ''); });
       document.addEventListener('keydown', (event) => {
         if (captureHotkey(event)) return;
         if (event.key === 'Escape') {
@@ -5625,7 +5653,6 @@ def build_auth_shell_html(initial_state):
       }
       window.addEventListener('resize', renderPreview);
       render();
-      ensureLockoutTicker();
       if (state.error_message) {
         setText('errorText', state.error_message);
       }
@@ -5640,92 +5667,623 @@ def build_auth_shell_html(initial_state):
     )
 
 
+def prompt_account_auth_dialog_tk(initial_email="", initial_password="", initial_blob_size="medium", initial_error=""):
+    result = {"value": None}
+    root, card = make_dialog_shell(tr("auth.window_title"), 860, 760)
+    root.minsize(720, 620)
+    center_window(root, 860, 760)
+
+    language_var = tk.StringVar(value=normalize_language(ui_language))
+    theme_var = tk.StringVar(value=normalize_theme_preference(ui_theme_preference))
+    blob_size_var = tk.StringVar(value=normalize_indicator_blob_size(initial_blob_size))
+    position_var = tk.StringVar(value=normalize_indicator_position(indicator_position_key))
+    startup_screen_var = tk.BooleanVar(value=bool(startup_loading_screen_enabled))
+    email_var = tk.StringVar(value=normalize_account_email(initial_email))
+    password_var = tk.StringVar(value=str(initial_password or ""))
+    show_password_var = tk.BooleanVar(value=False)
+    model_var = tk.StringVar(value=normalize_pro_model(selected_pro_model_key))
+    error_var = tk.StringVar(value=str(initial_error or ""))
+
+    wrap_labels = []
+
+    header = tk.Frame(card, bg=UI_CARD_BG, bd=0)
+    header.pack(fill="x", padx=28, pady=(24, 10))
+    title_label = tk.Label(header, text=APP_NAME, bg=UI_CARD_BG, fg=UI_TEXT, font=(UI_FONT, 30, "bold"))
+    title_label.pack(anchor="w")
+    subtitle_label = tk.Label(
+        header,
+        text="",
+        bg=UI_CARD_BG,
+        fg=UI_MUTED,
+        font=(UI_FONT, 11),
+        justify="left",
+    )
+    subtitle_label.pack(anchor="w", pady=(4, 0))
+    wrap_labels.append(subtitle_label)
+
+    lang_theme_row = tk.Frame(card, bg=UI_CARD_BG, bd=0)
+    lang_theme_row.pack(fill="x", padx=28, pady=(0, 12))
+
+    language_shell = tk.Frame(lang_theme_row, bg=UI_CARD_BG, bd=0)
+    language_shell.pack(side="left")
+    language_title = tk.Label(language_shell, text="", bg=UI_CARD_BG, fg=UI_MUTED, font=(UI_FONT, 9, "bold"))
+    language_title.pack(anchor="w", pady=(0, 6))
+    language_buttons = {}
+    for lang_key in ("en", "fr"):
+        btn = tk.Button(
+            language_shell,
+            text=lang_key.upper(),
+            relief="flat",
+            bd=0,
+            padx=10,
+            pady=6,
+            font=(UI_FONT, 9, "bold"),
+            cursor="hand2",
+            command=lambda value=lang_key: (language_var.set(value), refresh_copy()),
+        )
+        btn.pack(side="left", padx=(0, 6))
+        language_buttons[lang_key] = btn
+
+    theme_shell = tk.Frame(lang_theme_row, bg=UI_CARD_BG, bd=0)
+    theme_shell.pack(side="right")
+    theme_title = tk.Label(theme_shell, text="", bg=UI_CARD_BG, fg=UI_MUTED, font=(UI_FONT, 9, "bold"))
+    theme_title.pack(anchor="e", pady=(0, 6))
+    theme_buttons = {}
+    theme_labels = {"light": "Light", "dark": "Dark", "system": "Auto"}
+    for theme_key in ("light", "dark", "system"):
+        btn = tk.Button(
+            theme_shell,
+            text=theme_labels[theme_key],
+            relief="flat",
+            bd=0,
+            padx=12,
+            pady=6,
+            font=(UI_FONT, 9, "bold"),
+            cursor="hand2",
+            command=lambda value=theme_key: (theme_var.set(value), refresh_copy()),
+        )
+        btn.pack(side="left", padx=(6 if theme_key != "light" else 0, 0))
+        theme_buttons[theme_key] = btn
+
+    body = tk.Frame(card, bg=UI_CARD_BG, bd=0)
+    body.pack(fill="both", expand=True, padx=28, pady=(0, 10))
+
+    account_card = tk.Frame(body, bg=UI_PANEL_BG, highlightbackground=UI_BORDER, highlightthickness=1, bd=0)
+    account_card.pack(fill="x", pady=(0, 12))
+    account_inner = tk.Frame(account_card, bg=UI_PANEL_BG, bd=0)
+    account_inner.pack(fill="both", expand=True, padx=18, pady=16)
+
+    account_title = tk.Label(account_inner, text="", bg=UI_PANEL_BG, fg=UI_TEXT, font=(UI_FONT, 12, "bold"))
+    account_title.pack(anchor="w")
+    account_copy = tk.Label(account_inner, text="", bg=UI_PANEL_BG, fg=UI_MUTED, font=(UI_FONT, 9), justify="left")
+    account_copy.pack(anchor="w", pady=(4, 10))
+    wrap_labels.append(account_copy)
+
+    email_label = tk.Label(account_inner, text="", bg=UI_PANEL_BG, fg=UI_TEXT, font=(UI_FONT, 10, "bold"))
+    email_label.pack(anchor="w", pady=(0, 6))
+    email_field = tk.Frame(account_inner, bg=UI_FIELD_BG, highlightbackground=UI_BORDER, highlightthickness=1, bd=0)
+    email_field.pack(fill="x")
+    email_entry = tk.Entry(
+        email_field,
+        textvariable=email_var,
+        bg=UI_FIELD_BG,
+        fg=UI_TEXT,
+        relief="flat",
+        bd=0,
+        insertbackground=UI_TEXT,
+        font=(UI_FONT, 11),
+    )
+    email_entry.pack(fill="x", padx=12, pady=10)
+
+    password_row = tk.Frame(account_inner, bg=UI_PANEL_BG, bd=0)
+    password_row.pack(fill="x", pady=(12, 0))
+    password_label = tk.Label(password_row, text="", bg=UI_PANEL_BG, fg=UI_TEXT, font=(UI_FONT, 10, "bold"))
+    password_label.pack(anchor="w", pady=(0, 6))
+    password_field = tk.Frame(account_inner, bg=UI_FIELD_BG, highlightbackground=UI_BORDER, highlightthickness=1, bd=0)
+    password_field.pack(fill="x")
+    password_entry = tk.Entry(
+        password_field,
+        textvariable=password_var,
+        show="*",
+        bg=UI_FIELD_BG,
+        fg=UI_TEXT,
+        relief="flat",
+        bd=0,
+        insertbackground=UI_TEXT,
+        font=(UI_FONT, 11),
+    )
+    password_entry.pack(side="left", fill="x", expand=True, padx=(12, 0), pady=10)
+    password_toggle = tk.Button(
+        password_field,
+        text="",
+        relief="flat",
+        bd=0,
+        padx=12,
+        pady=6,
+        font=(UI_FONT, 9, "bold"),
+        cursor="hand2",
+    )
+    password_toggle.pack(side="right", padx=8)
+
+    account_actions = tk.Frame(account_inner, bg=UI_PANEL_BG, bd=0)
+    account_actions.pack(fill="x", pady=(10, 0))
+    dashboard_btn = tk.Button(
+        account_actions,
+        text="Dashboard",
+        command=lambda: open_dashboard_page("dashboard-app-access"),
+        relief="flat",
+        bd=0,
+        padx=12,
+        pady=7,
+        font=(UI_FONT, 9, "bold"),
+        cursor="hand2",
+    )
+    style_button(dashboard_btn, primary=False)
+    dashboard_btn.pack(side="left")
+    reset_btn = tk.Button(
+        account_actions,
+        text="Reset password",
+        command=lambda: webbrowser.open(f"{str(DEFAULT_WEBSITE_URL).rstrip('/')}/forgot-password.php", new=2),
+        relief="flat",
+        bd=0,
+        padx=12,
+        pady=7,
+        font=(UI_FONT, 9, "bold"),
+        cursor="hand2",
+    )
+    style_button(reset_btn, primary=False)
+    reset_btn.pack(side="left", padx=(8, 0))
+
+    settings_card = tk.Frame(body, bg=UI_PANEL_BG, highlightbackground=UI_BORDER, highlightthickness=1, bd=0)
+    settings_card.pack(fill="both", expand=True)
+    settings_inner = tk.Frame(settings_card, bg=UI_PANEL_BG, bd=0)
+    settings_inner.pack(fill="both", expand=True, padx=18, pady=16)
+
+    model_label = tk.Label(settings_inner, text="", bg=UI_PANEL_BG, fg=UI_TEXT, font=(UI_FONT, 10, "bold"))
+    model_label.pack(anchor="w")
+    model_menu = tk.OptionMenu(settings_inner, model_var, *(item["id"] for item in PRO_MODEL_OPTIONS))
+    model_menu.configure(
+        relief="flat",
+        bd=0,
+        bg=UI_GHOST_BG,
+        fg=UI_TEXT,
+        activebackground=UI_GHOST_ACTIVE,
+        activeforeground=UI_TEXT,
+        highlightthickness=0,
+        font=(UI_FONT, 10),
+    )
+    model_menu.pack(fill="x", pady=(6, 0))
+    model_menu["menu"].delete(0, "end")
+    model_labels = {item["id"]: item["label"] for item in PRO_MODEL_OPTIONS}
+    for model_option in PRO_MODEL_OPTIONS:
+        model_menu["menu"].add_command(
+            label=model_option["label"],
+            command=lambda value=model_option["id"]: model_var.set(value),
+        )
+    model_note = tk.Label(settings_inner, text="", bg=UI_PANEL_BG, fg=UI_MUTED, font=(UI_FONT, 9), justify="left")
+    model_note.pack(anchor="w", pady=(6, 12))
+    wrap_labels.append(model_note)
+
+    blob_title = tk.Label(settings_inner, text="", bg=UI_PANEL_BG, fg=UI_TEXT, font=(UI_FONT, 10, "bold"))
+    blob_title.pack(anchor="w")
+    blob_button_row = tk.Frame(settings_inner, bg=UI_PANEL_BG, bd=0)
+    blob_button_row.pack(fill="x", pady=(6, 12))
+    blob_buttons = {}
+    for size_key in ("very_small", "small", "medium", "large"):
+        btn = tk.Button(
+            blob_button_row,
+            text=INDICATOR_BLOB_SIZE_LABELS[size_key],
+            relief="flat",
+            bd=0,
+            padx=12,
+            pady=8,
+            font=(UI_FONT, 9, "bold"),
+            cursor="hand2",
+            command=lambda value=size_key: (blob_size_var.set(value), refresh_copy()),
+        )
+        btn.pack(side="left", padx=(0, 8))
+        blob_buttons[size_key] = btn
+
+    position_label = tk.Label(settings_inner, text="", bg=UI_PANEL_BG, fg=UI_TEXT, font=(UI_FONT, 10, "bold"))
+    position_label.pack(anchor="w")
+    position_labels = {key: key for key in INDICATOR_POSITIONS}
+    position_menu = tk.OptionMenu(settings_inner, position_var, *INDICATOR_POSITIONS)
+    position_menu.configure(
+        relief="flat",
+        bd=0,
+        bg=UI_GHOST_BG,
+        fg=UI_TEXT,
+        activebackground=UI_GHOST_ACTIVE,
+        activeforeground=UI_TEXT,
+        highlightthickness=0,
+        font=(UI_FONT, 10),
+    )
+    position_menu.pack(fill="x", pady=(6, 12))
+
+    startup_label = tk.Label(settings_inner, text="", bg=UI_PANEL_BG, fg=UI_TEXT, font=(UI_FONT, 10, "bold"))
+    startup_label.pack(anchor="w")
+    startup_toggle_btn = tk.Button(
+        settings_inner,
+        text="",
+        command=lambda: (startup_screen_var.set(not startup_screen_var.get()), refresh_copy()),
+        relief="flat",
+        bd=0,
+        padx=12,
+        pady=8,
+        font=(UI_FONT, 9, "bold"),
+        cursor="hand2",
+    )
+    startup_toggle_btn.pack(anchor="w", pady=(6, 0))
+    startup_copy = tk.Label(settings_inner, text="", bg=UI_PANEL_BG, fg=UI_MUTED, font=(UI_FONT, 9), justify="left")
+    startup_copy.pack(anchor="w", pady=(8, 0))
+    wrap_labels.append(startup_copy)
+
+    security_copy = tk.Label(card, text="", bg=UI_CARD_BG, fg=UI_MUTED, font=(UI_FONT, 9), justify="left")
+    security_copy.pack(fill="x", padx=28, pady=(10, 4))
+    wrap_labels.append(security_copy)
+
+    error_label = tk.Label(card, textvariable=error_var, bg=UI_CARD_BG, fg=UI_DANGER, font=(UI_FONT, 10, "bold"))
+    error_label.pack(fill="x", padx=28, pady=(0, 6))
+
+    button_bar = tk.Frame(card, bg=UI_CARD_BG, bd=0)
+    button_bar.pack(fill="x", padx=28, pady=(0, 22))
+
+    def sync_wraps():
+        wrap = max(280, int(root.winfo_width()) - 110)
+        for label in wrap_labels:
+            try:
+                label.configure(wraplength=wrap)
+            except Exception:
+                pass
+
+    def toggle_password():
+        visible = not show_password_var.get()
+        show_password_var.set(visible)
+        password_entry.configure(show="" if visible else "*")
+        refresh_copy()
+
+    def close_with(value):
+        result["value"] = value
+        root.destroy()
+
+    def on_continue():
+        error_var.set("")
+        email_value = normalize_account_email(email_var.get())
+        password_value = str(password_var.get() or "")
+        if email_value and not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email_value):
+            error_var.set("Enter a valid email address.")
+            email_entry.focus_set()
+            return
+        if not email_value:
+            error_var.set("Enter your account email.")
+            email_entry.focus_set()
+            return
+        close_with({
+            "mode": "account",
+            "email": email_value,
+            "password": password_value,
+            "blob_size": normalize_indicator_blob_size(blob_size_var.get()),
+            "language": normalize_language(language_var.get()),
+            "theme": normalize_theme_preference(theme_var.get()),
+            "indicator_position": normalize_indicator_position(position_var.get()),
+            "show_startup_screen": bool(startup_screen_var.get()),
+            "preferred_model": normalize_pro_model(model_var.get()),
+            "pro_model": normalize_pro_model(model_var.get()),
+            "hotkeys": dict(command_hotkeys),
+            "hotkey_mode": command_key_mode,
+        })
+
+    def refresh_copy():
+        lang = normalize_language(language_var.get())
+        subtitle_label.configure(
+            text=(
+                "Sign in with your website email and password. Your Gemini API key stays encrypted on the website "
+                "and is only decrypted locally on this device."
+                if lang != "fr" else
+                "Connectez-vous avec l'email et le mot de passe du site. Votre cle Gemini reste chiffree sur le site "
+                "et n'est dechiffree que localement sur cet appareil."
+            )
+        )
+        language_title.configure(text=tr("auth.language", language=lang))
+        for key, button in language_buttons.items():
+            button.configure(text=tr(f"lang.{key}", language=lang))
+            style_button(button, primary=(language_var.get() == key))
+        theme_title.configure(text="Theme" if lang != "fr" else "Theme")
+        for key, button in theme_buttons.items():
+            button.configure(text=theme_labels[key])
+            style_button(button, primary=(theme_var.get() == key))
+        account_title.configure(text="Account sign-in" if lang != "fr" else "Connexion du compte")
+        account_copy.configure(
+            text=(
+                "Use the same account as the dashboard. Add or replace your Gemini API key from the dashboard whenever needed."
+                if lang != "fr" else
+                "Utilisez le meme compte que le tableau de bord. Ajoutez ou remplacez votre cle Gemini depuis le tableau de bord si besoin."
+            )
+        )
+        email_label.configure(text="Email" if lang != "fr" else "Email")
+        password_label.configure(text="Password" if lang != "fr" else "Mot de passe")
+        password_toggle.configure(
+            text=("Hide" if show_password_var.get() else "Show") if lang != "fr" else ("Masquer" if show_password_var.get() else "Afficher"),
+            command=toggle_password,
+        )
+        dashboard_btn.configure(text="Open dashboard" if lang != "fr" else "Ouvrir le tableau de bord")
+        reset_btn.configure(text="Reset password" if lang != "fr" else "Reinitialiser le mot de passe")
+        model_label.configure(text="Preferred model" if lang != "fr" else "Modele prefere")
+        model_note.configure(
+            text=(
+                "The selected Gemini model is used for local screenshot analysis after sign-in."
+                if lang != "fr" else
+                "Le modele Gemini choisi est utilise localement pour l'analyse des captures apres connexion."
+            )
+        )
+        position_label.configure(text=tr("auth.section.indicator_position", language=lang))
+        position_menu["menu"].delete(0, "end")
+        for position_key in INDICATOR_POSITIONS:
+            position_labels[position_key] = tr(f"position.{position_key}", language=lang)
+            position_menu["menu"].add_command(
+                label=position_labels[position_key],
+                command=lambda value=position_key: position_var.set(value),
+            )
+        blob_title.configure(text=tr("auth.section.indicator_size", language=lang))
+        for size_key, button in blob_buttons.items():
+            button.configure(text=tr(f"size.{size_key}", language=lang))
+            style_button(button, primary=(blob_size_var.get() == size_key))
+        startup_label.configure(text=tr("auth.startup_screen.label", language=lang))
+        startup_copy.configure(text=tr("auth.startup_screen.copy", language=lang))
+        startup_toggle_btn.configure(
+            text=tr("auth.startup_screen.enabled", language=lang)
+            if startup_screen_var.get() else tr("auth.startup_screen.disabled", language=lang)
+        )
+        style_button(startup_toggle_btn, primary=bool(startup_screen_var.get()), active=not bool(startup_screen_var.get()))
+        security_copy.configure(text=tr("auth.security", language=lang))
+        cancel_btn.configure(text=tr("auth.cancel", language=lang))
+        continue_btn.configure(text=("Sign in" if lang != "fr" else "Se connecter"))
+        sync_wraps()
+
+    cancel_btn = tk.Button(
+        button_bar,
+        text="Cancel",
+        command=lambda: close_with(None),
+        relief="flat",
+        bd=0,
+        padx=20,
+        pady=10,
+        font=(UI_FONT, 10, "bold"),
+        cursor="hand2",
+    )
+    style_button(cancel_btn, primary=False)
+    cancel_btn.pack(side="right")
+
+    continue_btn = tk.Button(
+        button_bar,
+        text="Sign in",
+        command=on_continue,
+        relief="flat",
+        bd=0,
+        padx=22,
+        pady=10,
+        font=(UI_FONT, 10, "bold"),
+        cursor="hand2",
+    )
+    style_button(continue_btn, primary=True)
+    continue_btn.pack(side="right", padx=(0, 10))
+
+    root.bind("<Escape>", lambda _event: close_with(None))
+    root.bind("<Return>", lambda _event: (on_continue(), "break")[1])
+    root.bind("<Configure>", lambda _event: sync_wraps(), add="+")
+    refresh_copy()
+    email_entry.focus_set()
+    root.mainloop()
+    return result["value"]
+
+
+def build_account_auth_shell_state(initial_email="", initial_password="", initial_blob_size="medium", initial_error=""):
+    preferred_model = normalize_pro_model(selected_pro_model_key)
+    return {
+        "language": normalize_language(ui_language),
+        "theme": normalize_theme_preference(ui_theme_preference),
+        "blob_size": normalize_indicator_blob_size(initial_blob_size),
+        "indicator_position": normalize_indicator_position(indicator_position_key),
+        "show_startup_screen": normalize_startup_loading_screen_enabled(startup_loading_screen_enabled),
+        "preferred_model": preferred_model,
+        "pro_model": preferred_model,
+        "hotkeys": dict(command_hotkeys),
+        "hotkey_mode": command_key_mode,
+        "email": normalize_account_email(initial_email),
+        "password": str(initial_password or ""),
+        "error_message": str(initial_error or ""),
+    }
+
+
+def auth_shell_window_geometry():
+    screen_width = 1920
+    screen_height = 1080
+    if os.name == "nt":
+        try:
+            screen_width = int(ctypes.windll.user32.GetSystemMetrics(0))
+            screen_height = int(ctypes.windll.user32.GetSystemMetrics(1))
+        except Exception:
+            logger.debug("Could not read work-area metrics for auth shell sizing.", exc_info=True)
+    left, top, right, bottom = get_work_area_bounds(screen_width, screen_height)
+    available_width = max(720, int(right - left))
+    available_height = max(560, int(bottom - top))
+    width = max(680, min(980, available_width - 72))
+    height = max(560, min(820, available_height - 72))
+    min_width = 640 if available_width < 980 else 700
+    min_height = 520 if available_height < 760 else 560
+    return {
+        "width": int(width),
+        "height": int(height),
+        "min_size": (int(min_width), int(min_height)),
+    }
+
+
+def run_auth_shell_webview(initial_state):
+    if webview is None:
+        return {"__fallback__": "tk", "__reason__": "missing_webview"}
+
+    bridge = AuthShellBridge()
+    title = tr("auth.window_title", language=normalize_language(initial_state.get("language", ui_language)))
+    geometry = auth_shell_window_geometry()
+    try:
+        window = webview.create_window(
+            title,
+            html=build_auth_shell_html(initial_state),
+            js_api=bridge,
+            width=geometry["width"],
+            height=geometry["height"],
+            min_size=geometry["min_size"],
+            hidden=True,
+            frameless=True,
+            easy_drag=False,
+            shadow=True,
+            focus=True,
+            background_color="#081321",
+            text_select=False,
+        )
+        if window is None:
+            return {"__fallback__": "tk", "__reason__": "window_init"}
+        bridge.bind_window(window)
+
+        def _prepare(window_obj, bridge_obj):
+            deadline = time.time() + 6.0
+            while time.time() < deadline:
+                if bridge_obj._get_hwnd():
+                    break
+                time.sleep(0.05)
+            if is_capture_privacy_active() and not bridge_obj.ensure_capture_privacy():
+                bridge_obj._result = {"__fallback__": "tk", "__reason__": "capture_privacy"}
+                bridge_obj.close()
+                return
+            try:
+                window_obj.show()
+            except Exception:
+                logger.warning("Could not show auth webview window.", exc_info=True)
+                bridge_obj._result = {"__fallback__": "tk", "__reason__": "show_failed"}
+                bridge_obj.close()
+
+        webview.start(
+            _prepare,
+            args=(window, bridge),
+            gui="edgechromium",
+            private_mode=True,
+        )
+    except Exception:
+        logger.warning("Webview auth shell failed.", exc_info=True)
+        return {"__fallback__": "tk", "__reason__": "webview_error"}
+
+    return bridge.result
+
+
+def run_auth_shell_subprocess(request_path, response_path):
+    payload = {}
+    try:
+        payload = json.loads(Path(request_path).read_text(encoding="utf-8"))
+    except Exception:
+        payload = {}
+
+    result = run_auth_shell_webview(payload if isinstance(payload, dict) else {})
+    try:
+        Path(response_path).write_text(
+            json.dumps({"result": result}, ensure_ascii=True),
+            encoding="utf-8",
+        )
+    except Exception:
+        logger.warning("Could not write auth shell response payload.", exc_info=True)
+        return 1
+    return 0
+
+
+def prompt_account_auth_dialog(initial_email="", initial_password="", initial_blob_size="medium", initial_error=""):
+    initial_state = build_account_auth_shell_state(
+        initial_email=initial_email,
+        initial_password=initial_password,
+        initial_blob_size=initial_blob_size,
+        initial_error=initial_error,
+    )
+    if webview is None:
+        return prompt_account_auth_dialog_tk(
+            initial_email=initial_email,
+            initial_password=initial_password,
+            initial_blob_size=initial_blob_size,
+            initial_error=initial_error,
+        )
+
+    with tempfile.TemporaryDirectory(prefix="eae-auth-") as temp_dir:
+        request_path = Path(temp_dir) / "request.json"
+        response_path = Path(temp_dir) / "response.json"
+        request_path.write_text(json.dumps(initial_state, ensure_ascii=True), encoding="utf-8")
+
+        command = [sys.executable]
+        if not getattr(sys, "frozen", False):
+            command.append(os.path.abspath(__file__))
+        command.extend([AUTH_SHELL_SUBPROCESS_FLAG, str(request_path), str(response_path)])
+
+        creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        try:
+            completed = subprocess.run(
+                command,
+                check=False,
+                timeout=None,
+                creationflags=creation_flags,
+            )
+        except Exception:
+            logger.warning("Auth shell subprocess failed to start.", exc_info=True)
+            completed = None
+
+        if completed is None or completed.returncode != 0 or not response_path.exists():
+            return prompt_account_auth_dialog_tk(
+                initial_email=initial_email,
+                initial_password=initial_password,
+                initial_blob_size=initial_blob_size,
+                initial_error=initial_error,
+            )
+
+        try:
+            payload = json.loads(response_path.read_text(encoding="utf-8"))
+        except Exception:
+            logger.warning("Auth shell subprocess returned invalid JSON.", exc_info=True)
+            payload = {}
+
+    result = payload.get("result") if isinstance(payload, dict) else None
+    if isinstance(result, dict) and result.get("__fallback__") == "tk":
+        return prompt_account_auth_dialog_tk(
+            initial_email=initial_email,
+            initial_password=initial_password,
+            initial_blob_size=initial_blob_size,
+            initial_error=initial_error,
+        )
+    return result
+
+
 def prompt_startup_auth(
     initial_server_url,
     initial_license,
     initial_api_key,
     initial_blob_size="medium",
-    initial_mode="api",
+    initial_mode="account",
     initial_error="",
     prefer_legacy=False,
 ):
     _ = initial_server_url
+    _ = initial_mode
+    _ = prefer_legacy
     startup_progress_hide()
-    initial_lockout_seconds = 0
-    initial_lockout_hard = False
-    if str(initial_mode or "").strip().lower() == "license":
-        initial_lockout_seconds, initial_lockout_hard = get_live_pro_auth_lockout_state()
-    initial_state = {
-        "mode": "license" if str(initial_mode or "").strip().lower() == "license" else "api",
-        "language": normalize_language(ui_language),
-        "theme": normalize_theme_preference(ui_theme_preference),
-        "blob_size": normalize_indicator_blob_size(initial_blob_size),
-        "indicator_position": normalize_indicator_position(indicator_position_key),
-        "show_startup_screen": bool(startup_loading_screen_enabled),
-        "pro_model": normalize_pro_model(selected_pro_model_key),
-        "hotkeys": dict(command_hotkeys),
-        "hotkey_mode": command_key_mode,
-        "api_key": str(initial_api_key or ""),
-        "license_code": str(initial_license or ""),
-        "error_message": str(initial_error or ""),
-        "lockout_seconds": int(max(0, initial_lockout_seconds)),
-        "lockout_hard": bool(initial_lockout_hard),
-    }
-    result = None
-    used_webview = False
-    if webview is not None and not prefer_legacy:
-        bridge = AuthShellBridge()
-        try:
-            running_on_main_thread = current_thread().name == "MainThread"
-            can_attach_to_existing_gui = bool(getattr(webview, "guilib", None))
-            if running_on_main_thread or can_attach_to_existing_gui:
-                window = webview.create_window(
-                    tr("auth.window_title", language=initial_state["language"]),
-                    html=build_auth_shell_html(initial_state),
-                    js_api=bridge,
-                    width=1260,
-                    height=760,
-                    min_size=(920, 640),
-                    resizable=True,
-                    background_color="#081321",
-                    frameless=True,
-                    easy_drag=False,
-                    shadow=True,
-                    vibrancy=bool(os.name == "nt"),
-                    text_select=False,
-                )
-                bridge.bind_window(window)
-                used_webview = True
-                if can_attach_to_existing_gui:
-                    result = bridge.wait()
-                elif running_on_main_thread:
-                    webview.start(debug=False, private_mode=True)
-                    result = bridge.result
-                else:
-                    result = bridge.wait()
-        except Exception:
-            logger.exception("Auth webview flow failed; falling back to Tk setup window.")
-            result = None
-    if used_webview:
-        startup_progress_show()
-        return result
-    if result is None:
-        result = prompt_startup_auth_legacy(
-            initial_server_url,
-            initial_license,
-            initial_api_key,
-            initial_blob_size,
-            initial_mode=initial_mode,
-            initial_error=initial_error,
-        )
-        if result:
-            result.setdefault("language", normalize_language(ui_language))
-            result.setdefault("theme", normalize_theme_preference(ui_theme_preference))
-            result.setdefault("indicator_position", normalize_indicator_position(indicator_position_key))
-            result.setdefault("show_startup_screen", bool(startup_loading_screen_enabled))
-            result.setdefault("pro_model", normalize_pro_model(selected_pro_model_key))
-            result.setdefault("hotkeys", dict(command_hotkeys))
-            result.setdefault("hotkey_mode", command_key_mode)
+    result = prompt_account_auth_dialog(
+        initial_email=initial_license,
+        initial_password=initial_api_key,
+        initial_blob_size=initial_blob_size,
+        initial_error=initial_error,
+    )
+    if result:
+        result.setdefault("language", normalize_language(ui_language))
+        result.setdefault("theme", normalize_theme_preference(ui_theme_preference))
+        result.setdefault("indicator_position", normalize_indicator_position(indicator_position_key))
+        result.setdefault("show_startup_screen", bool(startup_loading_screen_enabled))
+        result.setdefault("preferred_model", normalize_pro_model(selected_pro_model_key))
+        result.setdefault("pro_model", normalize_pro_model(selected_pro_model_key))
+        result.setdefault("hotkeys", dict(command_hotkeys))
+        result.setdefault("hotkey_mode", command_key_mode)
     startup_progress_show()
     return result
 
@@ -5736,7 +6294,7 @@ def indicator_refresh_preferences():
 
 def open_settings_menu(hide_indicator_temporarily=False):
     global settings_window_open, command_hotkeys, command_hotkeys_customized, command_key_mode
-    global startup_loading_screen_enabled, auth_mode, api_key, license_code
+    global startup_loading_screen_enabled, auth_mode, api_key, license_code, user_email
     global local_model, local_chat_session, api_backend_name, ui_theme_preference
     with settings_window_lock:
         if settings_window_open:
@@ -5747,110 +6305,45 @@ def open_settings_menu(hide_indicator_temporarily=False):
         if hide_indicator_temporarily and indicator and not indicator.hidden:
             restore_indicator_after_close = True
             indicator_hide()
-        record = load_config_record()
-        saved_license = load_saved_secret(record, "license_code", "license_code_dpapi")
-        saved_api_key = load_saved_secret(record, "api_key", "api_key_dpapi")
         selected = prompt_startup_auth(
             initial_server_url=DEFAULT_SERVER_URL,
-            initial_license=license_code or saved_license,
-            initial_api_key=api_key or saved_api_key,
+            initial_license=user_email,
+            initial_api_key="",
             initial_blob_size=indicator_blob_size_key,
             initial_mode=auth_mode,
         )
         if not selected:
             return
 
-        auth_changed = False
-        next_mode = "license" if str(selected.get("mode", "")).strip().lower() == "license" else "api"
-        next_license = str(selected.get("license_code", "") or "").strip()
-        next_api_key = str(selected.get("api_key", "") or "").strip()
-        live_api_key_change = (
-            auth_mode == "api"
-            and next_mode == "api"
-            and bool(next_api_key)
-            and next_api_key != api_key
-        )
-        if next_mode != auth_mode:
-            auth_changed = True
-        elif next_mode == "license" and next_license and next_license != license_code:
-            auth_changed = True
-        elif next_mode == "api" and next_api_key and next_api_key != api_key and not live_api_key_change:
-            auth_changed = True
+        selected_email = normalize_account_email(selected.get("email", user_email))
+        selected_password = str(selected.get("password", "") or "")
+        current_email = normalize_account_email(user_email)
+        auth_changed = bool(selected_password) or (selected_email != "" and selected_email != current_email)
+        if selected_email != current_email and not selected_password:
+            show_styled_message(APP_NAME, "Enter the password for the new account email.", is_error=True, parent=None)
+            return
 
-        record["ui_language"] = normalize_language(selected.get("language", ui_language))
-        record["ui_theme"] = normalize_theme_preference(selected.get("theme", ui_theme_preference))
-        record["indicator_blob_size"] = normalize_indicator_blob_size(selected.get("blob_size", indicator_blob_size_key))
-        record["indicator_position"] = normalize_indicator_position(selected.get("indicator_position", indicator_position_key))
-        record["show_startup_screen"] = normalize_startup_loading_screen_enabled(selected.get("show_startup_screen", startup_loading_screen_enabled))
-        record["pro_model"] = normalize_pro_model(selected.get("pro_model", selected_pro_model_key))
-        saved_hotkeys, saved_hotkey_mode, saved_hotkeys_customized = resolve_command_hotkey_state(
-            selected.get("hotkeys"),
-            selected.get("hotkey_mode", command_key_mode),
-        )
-        record["command_hotkeys"] = dict(saved_hotkeys)
-        record["command_key_mode"] = saved_hotkey_mode
-        record["command_hotkeys_customized"] = bool(saved_hotkeys_customized)
-        record["auth_mode"] = next_mode
-        live_api_key_applied = False
-        if live_api_key_change:
-            previous_api_key = str(api_key or "")
-            previous_runtime = (local_model, local_chat_session, api_backend_name)
-            api_key = next_api_key
-            license_code = ""
-            if ensure_api_mode_ready():
-                if not save_secret(record, "api_key", "api_key_dpapi", next_api_key):
-                    show_styled_message(APP_NAME, tr("error.save_api"), is_error=True, parent=None)
-                    api_key = previous_api_key
-                    local_model, local_chat_session, api_backend_name = previous_runtime
-                    ensure_api_mode_ready()
-                    return
-                live_api_key_applied = True
-            else:
-                api_key = previous_api_key
-                license_code = ""
-                local_model, local_chat_session, api_backend_name = previous_runtime
-                if previous_api_key:
-                    ensure_api_mode_ready()
+        previous_model = normalize_pro_model(selected_pro_model_key)
+        if auth_changed:
+            try:
+                ok, message = authenticate_account_session(selected_email or current_email, selected_password)
+            except Exception as exc:
+                ok, message = False, str(exc)
+            if not ok:
+                show_styled_message(APP_NAME, message, is_error=True, parent=None)
                 return
-
-        if next_mode == "license" and next_license:
-            if not save_secret(record, "license_code", "license_code_dpapi", next_license):
-                show_styled_message(APP_NAME, tr("error.save_code"), is_error=True, parent=None)
-                return
-        elif next_mode == "api" and next_api_key and not live_api_key_applied:
-            if not save_secret(record, "api_key", "api_key_dpapi", next_api_key):
-                show_styled_message(APP_NAME, tr("error.save_api"), is_error=True, parent=None)
+            apply_auth_dialog_selection(selected, persist=True)
+            if not ensure_api_mode_ready():
                 return
         else:
-            save_config_record(record)
-
-        globals()["ui_language"] = normalize_language(record.get("ui_language", ui_language))
-        globals()["ui_theme_preference"] = normalize_theme_preference(record.get("ui_theme", ui_theme_preference))
-        globals()["indicator_blob_size_key"] = normalize_indicator_blob_size(record.get("indicator_blob_size", indicator_blob_size_key))
-        globals()["indicator_position_key"] = normalize_indicator_position(record.get("indicator_position", indicator_position_key))
-        globals()["startup_loading_screen_enabled"] = normalize_startup_loading_screen_enabled(record.get("show_startup_screen", startup_loading_screen_enabled))
-        globals()["selected_pro_model_key"] = normalize_pro_model(record.get("pro_model", selected_pro_model_key))
-        apply_ui_theme_preference(ui_theme_preference)
-        command_hotkeys = dict(saved_hotkeys)
-        command_hotkeys_customized = bool(saved_hotkeys_customized)
-        command_key_mode = saved_hotkey_mode
-        if live_api_key_applied:
-            auth_mode = "api"
-            api_key = next_api_key
-            license_code = ""
-        set_command_key_mode(command_key_mode)
-        update_tray_menu()
-        indicator_refresh_preferences()
-        if not auth_changed and next_mode == "license":
+            apply_auth_dialog_selection(selected, persist=True)
+            if normalize_pro_model(selected_pro_model_key) != previous_model and api_key:
+                if not ensure_api_mode_ready():
+                    return
             push_remote_preferences()
 
-        if auth_changed:
-            show_styled_message(
-                APP_NAME,
-                "Settings saved. Restart EyesAndEars to apply sign-in changes.",
-                is_error=False,
-                parent=indicator.root if indicator and indicator.root.winfo_exists() else None,
-            )
+        update_tray_menu()
+        indicator_refresh_preferences()
     finally:
         if restore_indicator_after_close and not indicator_manual_hidden and not privacy_forced_hidden:
             indicator_show()
@@ -5949,25 +6442,22 @@ def resolve_auth_settings():
     global auth_mode, server_url, license_code, api_key, device_id, indicator_blob_size_key
     global ui_language, indicator_position_key, selected_pro_model_key, session_status_text
     global command_hotkeys, command_hotkeys_customized, command_key_mode, startup_loading_screen_enabled
-    global ui_theme_preference
+    global ui_theme_preference, user_email, session_id, session_token, session_active, model_name
     record = load_config_record()
-    env_license = os.environ.get("EAE_LICENSE_CODE", "").strip()
-    env_api_key = find_env_api_key()
     env_language_raw = os.environ.get("EAE_LANGUAGE", "").strip()
     env_theme_raw = os.environ.get("EAE_THEME", "").strip()
     env_blob_size_raw = os.environ.get("EAE_BLOB_SIZE", "").strip()
     env_position_raw = os.environ.get("EAE_INDICATOR_POSITION", "").strip()
     env_startup_screen_raw = os.environ.get("EAE_SHOW_STARTUP_SCREEN", "").strip()
     env_blob_size = normalize_indicator_blob_size(env_blob_size_raw) if env_blob_size_raw else ""
-    saved_license = load_saved_secret(record, "license_code", "license_code_dpapi")
     saved_api_key = load_saved_secret(record, "api_key", "api_key_dpapi")
+    saved_session_token = load_saved_secret(record, "session_token", "session_token_dpapi")
     saved_blob_size = normalize_indicator_blob_size(record.get("indicator_blob_size", ""))
     saved_language = normalize_language(record.get("ui_language", ui_language))
     saved_theme = normalize_theme_preference(record.get("ui_theme", ui_theme_preference))
     saved_position = normalize_indicator_position(record.get("indicator_position", indicator_position_key))
     saved_startup_screen = normalize_startup_loading_screen_enabled(record.get("show_startup_screen", startup_loading_screen_enabled))
-    saved_pro_model = normalize_pro_model(record.get("pro_model", selected_pro_model_key))
-    saved_auth_mode = "license" if str(record.get("auth_mode", "")).strip().lower() == "license" else "api"
+    saved_pro_model = normalize_pro_model(record.get("preferred_model", record.get("pro_model", selected_pro_model_key)))
     saved_hotkey_mode = "toprow" if str(record.get("command_key_mode", "")).strip().lower() == "toprow" else detect_initial_command_key_mode()
     saved_hotkeys, saved_hotkey_mode, saved_hotkeys_customized = resolve_command_hotkey_state(
         record.get("command_hotkeys"),
@@ -5979,6 +6469,13 @@ def resolve_auth_settings():
         record["device_id"] = saved_device_id
     device_id = saved_device_id
     clear_startup_preflight_license_auth()
+    record["auth_mode"] = "account"
+    record["server_url"] = DEFAULT_SERVER_URL
+    record["preferred_model"] = saved_pro_model
+    record["pro_model"] = saved_pro_model
+    record.pop("license_code", None)
+    record.pop("license_code_dpapi", None)
+    save_config_record(record)
 
     ui_language = normalize_language(env_language_raw or saved_language or ui_language)
     ui_theme_preference = normalize_theme_preference(env_theme_raw or saved_theme or ui_theme_preference)
@@ -5986,79 +6483,22 @@ def resolve_auth_settings():
     indicator_position_key = normalize_indicator_position(env_position_raw or saved_position or indicator_position_key)
     startup_loading_screen_enabled = normalize_startup_loading_screen_enabled(env_startup_screen_raw) if env_startup_screen_raw else saved_startup_screen
     selected_pro_model_key = normalize_pro_model(saved_pro_model)
+    model_name = normalize_pro_model(selected_pro_model_key) or DEFAULT_MODEL_NAME
     command_hotkeys = dict(saved_hotkeys)
     command_hotkeys_customized = bool(saved_hotkeys_customized)
     command_key_mode = saved_hotkey_mode
     session_status_text = tr("status.not_authenticated")
+    auth_mode = "account"
+    server_url = DEFAULT_SERVER_URL
+    license_code = ""
+    api_key = saved_api_key
+    user_email = normalize_account_email(record.get("user_email", ""))
+    with session_lock:
+        session_id = str(record.get("session_id", "") or "").strip()
+        session_token = str(saved_session_token or "").strip()
+        session_active = False
 
-    initial_blob_size = env_blob_size or saved_blob_size or indicator_blob_size_key
-    initial_mode = saved_auth_mode
-    if env_license and not env_api_key:
-        initial_mode = "license"
-    elif env_api_key and not env_license:
-        initial_mode = "api"
-    startup_progress_update("startup.opening_setup")
-    selected = prompt_startup_auth(
-        initial_server_url=DEFAULT_SERVER_URL,
-        initial_license=env_license or saved_license,
-        initial_api_key=env_api_key or saved_api_key,
-        initial_blob_size=initial_blob_size,
-        initial_mode=initial_mode,
-    )
-    if not selected:
-        return False
-
-    selected_blob_size = normalize_indicator_blob_size(selected.get("blob_size", initial_blob_size))
-    record["indicator_blob_size"] = selected_blob_size
-    indicator_blob_size_key = selected_blob_size
-    ui_language = normalize_language(selected.get("language", ui_language))
-    ui_theme_preference = normalize_theme_preference(selected.get("theme", ui_theme_preference))
-    indicator_position_key = normalize_indicator_position(selected.get("indicator_position", indicator_position_key))
-    selected_pro_model_key = normalize_pro_model(selected.get("pro_model", selected_pro_model_key))
-    selected_hotkeys, selected_hotkey_mode, selected_hotkeys_customized = resolve_command_hotkey_state(
-        selected.get("hotkeys"),
-        selected.get("hotkey_mode", command_key_mode),
-    )
-    record["ui_language"] = ui_language
-    record["ui_theme"] = ui_theme_preference
-    record["indicator_position"] = indicator_position_key
-    record["show_startup_screen"] = normalize_startup_loading_screen_enabled(selected.get("show_startup_screen", startup_loading_screen_enabled))
-    startup_loading_screen_enabled = bool(record["show_startup_screen"])
-    record["pro_model"] = selected_pro_model_key
-    record["command_hotkeys"] = dict(selected_hotkeys)
-    record["command_key_mode"] = selected_hotkey_mode
-    record["command_hotkeys_customized"] = bool(selected_hotkeys_customized)
-    command_hotkeys = dict(selected_hotkeys)
-    command_key_mode = selected_hotkey_mode
-    command_hotkeys_customized = bool(selected_hotkeys_customized)
-    apply_ui_theme_preference(ui_theme_preference)
-
-    selected_mode = selected["mode"]
-    if selected_mode == "license":
-        selected_server = normalize_server_url(DEFAULT_SERVER_URL) or DEFAULT_SERVER_URL
-        selected_license = selected["license_code"]
-        record["auth_mode"] = "license"
-        record["server_url"] = selected_server
-        if not save_secret(record, "license_code", "license_code_dpapi", selected_license):
-            gui_show_error(tr("error.save_code"))
-            return False
-        auth_mode = "license"
-        server_url = selected_server
-        license_code = selected_license
-        api_key = ""
-    else:
-        selected_api_key = selected["api_key"]
-        record["auth_mode"] = "api"
-        if not save_secret(record, "api_key", "api_key_dpapi", selected_api_key):
-            gui_show_error(tr("error.save_api"))
-            return False
-        auth_mode = "api"
-        api_key = selected_api_key
-        license_code = ""
-
-    record["device_id"] = saved_device_id
-    save_config_record(record)
-    device_id = saved_device_id
+    indicator_blob_size_key = env_blob_size or saved_blob_size or indicator_blob_size_key
     return True
 
 
@@ -6099,7 +6539,7 @@ def build_remote_preferences_payload():
         "indicator_position": normalize_indicator_position(indicator_position_key),
         "indicator_blob_size": normalize_indicator_blob_size(indicator_blob_size_key),
         "show_startup_screen": bool(startup_loading_screen_enabled),
-        "pro_model": normalize_pro_model(selected_pro_model_key),
+        "preferred_model": normalize_pro_model(selected_pro_model_key),
         "hotkey_mode": command_key_mode,
         "hotkeys": dict(command_hotkeys),
     }
@@ -6107,20 +6547,26 @@ def build_remote_preferences_payload():
 
 def persist_runtime_preferences():
     record = load_config_record()
+    record["auth_mode"] = "account"
+    record["server_url"] = DEFAULT_SERVER_URL
     record["ui_language"] = normalize_language(ui_language)
     record["ui_theme"] = normalize_theme_preference(ui_theme_preference)
     record["indicator_blob_size"] = normalize_indicator_blob_size(indicator_blob_size_key)
     record["indicator_position"] = normalize_indicator_position(indicator_position_key)
     record["show_startup_screen"] = normalize_startup_loading_screen_enabled(startup_loading_screen_enabled)
+    record["preferred_model"] = normalize_pro_model(selected_pro_model_key)
     record["pro_model"] = normalize_pro_model(selected_pro_model_key)
     record["command_hotkeys"] = dict(command_hotkeys)
     record["command_key_mode"] = command_key_mode
     record["command_hotkeys_customized"] = bool(command_hotkeys_customized)
+    record["user_email"] = normalize_account_email(user_email)
+    if device_id:
+        record["device_id"] = device_id
     save_config_record(record)
 
 
 def apply_remote_preferences_payload(payload):
-    global ui_language, indicator_position_key, indicator_blob_size_key
+    global ui_language, indicator_position_key, indicator_blob_size_key, model_name
     global selected_pro_model_key, startup_loading_screen_enabled
     global command_hotkeys, command_hotkeys_customized, command_key_mode
     if not isinstance(payload, dict):
@@ -6132,7 +6578,10 @@ def apply_remote_preferences_payload(payload):
     startup_loading_screen_enabled = normalize_startup_loading_screen_enabled(
         payload.get("show_startup_screen", startup_loading_screen_enabled)
     )
-    selected_pro_model_key = normalize_pro_model(payload.get("pro_model", selected_pro_model_key))
+    selected_pro_model_key = normalize_pro_model(
+        payload.get("preferred_model", payload.get("pro_model", selected_pro_model_key))
+    )
+    model_name = normalize_pro_model(selected_pro_model_key) or DEFAULT_MODEL_NAME
     remote_hotkeys, remote_hotkey_mode, remote_hotkeys_customized = resolve_command_hotkey_state(
         payload.get("hotkeys"),
         payload.get("hotkey_mode", command_key_mode),
@@ -6148,11 +6597,92 @@ def apply_remote_preferences_payload(payload):
     return True
 
 
+def apply_auth_dialog_selection(selected, persist=True):
+    global ui_language, ui_theme_preference, indicator_blob_size_key, indicator_position_key
+    global selected_pro_model_key, startup_loading_screen_enabled, command_hotkeys
+    global command_key_mode, command_hotkeys_customized, model_name
+    if not isinstance(selected, dict):
+        return
+
+    ui_language = normalize_language(selected.get("language", ui_language))
+    ui_theme_preference = normalize_theme_preference(selected.get("theme", ui_theme_preference))
+    indicator_blob_size_key = normalize_indicator_blob_size(selected.get("blob_size", indicator_blob_size_key))
+    indicator_position_key = normalize_indicator_position(selected.get("indicator_position", indicator_position_key))
+    startup_loading_screen_enabled = normalize_startup_loading_screen_enabled(
+        selected.get("show_startup_screen", startup_loading_screen_enabled)
+    )
+    selected_pro_model_key = normalize_pro_model(
+        selected.get("preferred_model", selected.get("pro_model", selected_pro_model_key))
+    )
+    model_name = normalize_pro_model(selected_pro_model_key) or DEFAULT_MODEL_NAME
+    selected_hotkeys, selected_hotkey_mode, selected_hotkeys_customized = resolve_command_hotkey_state(
+        selected.get("hotkeys"),
+        selected.get("hotkey_mode", command_key_mode),
+    )
+    command_hotkeys = dict(selected_hotkeys)
+    command_key_mode = selected_hotkey_mode
+    command_hotkeys_customized = bool(selected_hotkeys_customized)
+    apply_ui_theme_preference(ui_theme_preference)
+    try:
+        set_command_key_mode(command_key_mode)
+    except Exception:
+        pass
+    if persist:
+        persist_runtime_preferences()
+
+
+def clear_account_session_state(clear_cached_api_key=False):
+    global session_id, session_token, session_active, api_key, auth_mode, license_code
+    with session_lock:
+        session_id = ""
+        session_token = ""
+        session_active = False
+    auth_mode = "account"
+    license_code = ""
+    if clear_cached_api_key:
+        api_key = ""
+    record = load_config_record()
+    record["auth_mode"] = "account"
+    record["server_url"] = DEFAULT_SERVER_URL
+    record["session_id"] = ""
+    clear_saved_secret(record, "session_token", "session_token_dpapi")
+    if clear_cached_api_key:
+        record = load_config_record()
+        clear_saved_secret(record, "api_key", "api_key_dpapi")
+
+
+def persist_account_session_state(email_value, session_id_value, session_token_value, api_key_value):
+    record = load_config_record()
+    record["auth_mode"] = "account"
+    record["server_url"] = DEFAULT_SERVER_URL
+    record["user_email"] = normalize_account_email(email_value)
+    record["session_id"] = str(session_id_value or "").strip()
+    record["preferred_model"] = normalize_pro_model(selected_pro_model_key)
+    record["pro_model"] = normalize_pro_model(selected_pro_model_key)
+    if device_id:
+        record["device_id"] = device_id
+    record.pop("license_code", None)
+    record.pop("license_code_dpapi", None)
+    if not save_secret(record, "session_token", "session_token_dpapi", str(session_token_value or "").strip()):
+        return False
+    if not save_secret(record, "api_key", "api_key_dpapi", str(api_key_value or "").strip()):
+        return False
+    return True
+
+
+def app_device_name():
+    value = str(os.environ.get("COMPUTERNAME", "") or "").strip()
+    if value:
+        return value
+    value = str(os.environ.get("HOSTNAME", "") or "").strip()
+    return value or "Windows PC"
+
+
 def push_remote_preferences():
     with session_lock:
         local_token = str(session_token or "")
         local_active = bool(session_active)
-    if auth_mode != "license" or not local_token or not local_active:
+    if not local_token or not local_active:
         return False
 
     try:
@@ -6172,7 +6702,7 @@ def push_remote_preferences():
 def pull_remote_preferences():
     with session_lock:
         local_token = str(session_token or "")
-    if auth_mode != "license" or not local_token:
+    if not local_token:
         return None, ""
 
     try:
@@ -6200,74 +6730,108 @@ def sync_remote_preferences_after_auth(auth_data):
     return push_remote_preferences()
 
 
-def authenticate_license_session():
-    global session_id, session_token, user_email, license_hint
-    global heartbeat_interval_seconds, heartbeat_timeout_seconds
-    data = consume_startup_preflight_license_auth(license_code, device_id)
-    if data is None:
-        ok, message, data, _reason = perform_license_auth_request(license_code, device_id)
-        if not ok:
-            return False, message
+def restore_cached_account_session():
+    global auth_mode, api_key, license_code, user_email, server_url
+    global session_id, session_token, session_active
+    record = load_config_record()
+    cached_email = normalize_account_email(record.get("user_email", ""))
+    cached_api_key = load_saved_secret(record, "api_key", "api_key_dpapi")
+    cached_session_token = load_saved_secret(record, "session_token", "session_token_dpapi")
+    cached_session_id = str(record.get("session_id", "") or "").strip()
 
+    if not cached_email or not cached_api_key or not cached_session_token:
+        return False
+
+    auth_mode = "account"
+    server_url = DEFAULT_SERVER_URL
+    license_code = ""
+    user_email = cached_email
+    api_key = cached_api_key
     with session_lock:
-        session_id = data.get("session_id", "")
-        session_token = data.get("session_token", "")
-        user_email = data.get("user_email", "")
-        license_hint = data.get("license_hint", "")
-        heartbeat_interval_seconds = int(data.get("heartbeat_interval_seconds", 20))
-        heartbeat_timeout_seconds = int(data.get("heartbeat_timeout_seconds", 90))
-    sync_remote_preferences_after_auth(data if isinstance(data, dict) else {})
+        session_id = cached_session_id
+        session_token = cached_session_token
+        session_active = True
+
+    try:
+        response = request_json("GET", "/api/v1/client/preferences", token=cached_session_token, timeout=12)
+        if int(getattr(response, "status_code", 0) or 0) == 401:
+            clear_account_session_state(clear_cached_api_key=False)
+            return False
+        if response.ok:
+            payload = decode_json_response(response, "Remote preferences")
+            if isinstance(payload, dict):
+                apply_remote_preferences_payload(payload.get("preferences"))
+    except Exception:
+        logger.debug("Using cached local API key because preference sync could not be refreshed.", exc_info=True)
+
     set_session_status(tr("status.code_active"), active=True)
-    return True, tr("startup.ready")
+    return True
 
 
-def ensure_license_mode_ready():
-    global server_url, license_code, indicator_blob_size_key
-    global ui_language, indicator_position_key, selected_pro_model_key, startup_loading_screen_enabled
-    global command_hotkeys, command_key_mode, command_hotkeys_customized
-    while True:
-        ok, message = run_startup_background_task(authenticate_license_session, stage_key="startup.connecting_pro")
-        if ok:
-            return True
-        set_session_status(tr("status.code_disconnected", detail=message), active=False)
-        selected = prompt_startup_auth(
-            server_url,
-            license_code,
-            "",
-            indicator_blob_size_key,
-            initial_mode="license",
-            initial_error=message,
-        )
-        if not selected or selected.get("mode") != "license":
-            return False
-        server_url = normalize_server_url(DEFAULT_SERVER_URL) or DEFAULT_SERVER_URL
-        license_code = selected["license_code"]
-        indicator_blob_size_key = normalize_indicator_blob_size(selected.get("blob_size", indicator_blob_size_key))
-        ui_language = normalize_language(selected.get("language", ui_language))
-        indicator_position_key = normalize_indicator_position(selected.get("indicator_position", indicator_position_key))
-        selected_pro_model_key = normalize_pro_model(selected.get("pro_model", selected_pro_model_key))
-        selected_hotkeys, selected_hotkey_mode, selected_hotkeys_customized = resolve_command_hotkey_state(
-            selected.get("hotkeys"),
-            selected.get("hotkey_mode", command_key_mode),
-        )
-        record = load_config_record()
-        record["auth_mode"] = "license"
-        record["server_url"] = server_url
-        record["indicator_blob_size"] = indicator_blob_size_key
-        record["ui_language"] = ui_language
-        record["indicator_position"] = indicator_position_key
-        record["show_startup_screen"] = normalize_startup_loading_screen_enabled(selected.get("show_startup_screen", startup_loading_screen_enabled))
-        record["pro_model"] = selected_pro_model_key
-        record["command_hotkeys"] = dict(selected_hotkeys)
-        record["command_key_mode"] = selected_hotkey_mode
-        record["command_hotkeys_customized"] = bool(selected_hotkeys_customized)
-        command_hotkeys = dict(selected_hotkeys)
-        command_key_mode = selected_hotkey_mode
-        command_hotkeys_customized = bool(selected_hotkeys_customized)
-        startup_loading_screen_enabled = bool(record["show_startup_screen"])
-        if not save_secret(record, "license_code", "license_code_dpapi", license_code):
-            gui_show_error(tr("error.save_code"))
-            return False
+def authenticate_account_session(email_value, password_value):
+    global auth_mode, server_url, license_code, api_key, user_email
+    global session_id, session_token, session_active
+    normalized_email = normalize_account_email(email_value)
+    if not normalized_email:
+        return False, "Enter your account email."
+    if not str(password_value or ""):
+        return False, "Enter your password."
+
+    response = request_json(
+        "POST",
+        "/api/v1/client/login",
+        json_payload={
+            "email": normalized_email,
+            "password": str(password_value or ""),
+            "device_id": device_id,
+            "device_name": app_device_name(),
+            "app_version": APP_VERSION,
+        },
+        timeout=20,
+    )
+    payload = decode_json_response(response, "App login")
+    if not isinstance(payload, dict):
+        return False, tr("error.server_non_json", status_code=getattr(response, "status_code", "?"))
+    if not response.ok or not bool(payload.get("success")):
+        message = str(payload.get("message", "") or f"Sign-in failed ({getattr(response, 'status_code', '?')}).").strip()
+        if payload.get("password_setup_required"):
+            open_dashboard_page("dashboard-security")
+        return False, message
+    if payload.get("password_setup_required"):
+        open_dashboard_page("dashboard-security")
+        return False, "Finish creating a password on the website before using the desktop app."
+    if payload.get("api_key_required") or not isinstance(payload.get("api_key_bundle"), dict):
+        open_dashboard_page("dashboard-app-access")
+        return False, "Add your Gemini API key in the dashboard before using the desktop app."
+
+    try:
+        decrypted_api_key = decode_account_api_key_bundle(payload.get("api_key_bundle"), password_value)
+    except Exception as exc:
+        open_dashboard_page("dashboard-app-access")
+        return False, str(exc)
+
+    next_session_id = str(payload.get("session_id", "") or "").strip()
+    next_session_token = str(payload.get("session_token", "") or "").strip()
+    if not next_session_token:
+        return False, "The website did not return a valid desktop session."
+
+    auth_mode = "account"
+    server_url = DEFAULT_SERVER_URL
+    license_code = ""
+    user_email = normalized_email
+    api_key = decrypted_api_key
+    with session_lock:
+        session_id = next_session_id
+        session_token = next_session_token
+        session_active = True
+
+    if not persist_account_session_state(normalized_email, next_session_id, next_session_token, decrypted_api_key):
+        clear_account_session_state(clear_cached_api_key=True)
+        return False, "Could not securely store the account session on this machine."
+
+    sync_remote_preferences_after_auth(payload)
+    set_session_status(tr("status.code_active"), active=True)
+    return True, str(payload.get("message", "") or "Signed in.")
 
 
 class _SimpleApiResponse:
@@ -6353,10 +6917,11 @@ def initialize_api_runtime():
 
 
 def ensure_api_mode_ready():
-    global local_model, local_chat_session, api_backend_name
+    global local_model, local_chat_session, api_backend_name, model_name
     if not api_key:
         gui_show_error(tr("error.api_empty"))
         return False
+    model_name = normalize_pro_model(selected_pro_model_key) or DEFAULT_MODEL_NAME
     try:
         runtime = run_startup_background_task(initialize_api_runtime, stage_key="startup.initializing_model")
         local_model = runtime["model"]
@@ -6411,11 +6976,6 @@ def classify_api_runtime_issue(error_text):
 
 
 def refresh_api_key_via_startup_ui(issue_kind):
-    global auth_mode, api_key, license_code, indicator_blob_size_key
-    global ui_language, indicator_position_key, selected_pro_model_key, startup_loading_screen_enabled
-    global local_model, local_chat_session, api_backend_name
-    global command_hotkeys, command_key_mode, command_hotkeys_customized
-
     if str(issue_kind) == "credits":
         message = tr("error.api_credits")
         status_text = tr("status.api_credits")
@@ -6428,79 +6988,58 @@ def refresh_api_key_via_startup_ui(issue_kind):
     disable_typing_mode()
     clear_answer_state()
     indicator_set_idle()
-    show_styled_message(APP_NAME, message, is_error=True, parent=None)
+    clear_account_session_state(clear_cached_api_key=True)
+    open_dashboard_page("dashboard-app-access")
+    show_styled_message(
+        APP_NAME,
+        f"{message}\n\nUpdate or replace the Gemini API key from the dashboard, then sign in again.",
+        is_error=True,
+        parent=None,
+    )
+    return False
 
-    initial_api_key = str(api_key or "")
+
+def ensure_account_mode_ready():
+    initial_email = normalize_account_email(user_email)
+    error_message = ""
+
+    if restore_cached_account_session():
+        return ensure_api_mode_ready()
+
     while True:
         selected = prompt_startup_auth(
             initial_server_url=DEFAULT_SERVER_URL,
-            initial_license="",
-            initial_api_key=initial_api_key,
+            initial_license=initial_email,
+            initial_api_key="",
             initial_blob_size=indicator_blob_size_key,
+            initial_mode="account",
+            initial_error=error_message,
+            prefer_legacy=True,
         )
         if not selected:
-            local_model = None
-            local_chat_session = None
-            api_backend_name = "none"
-            api_key = ""
-            set_session_status(tr("status.api_required"), active=False)
-            exit_program(trigger_uninstall=False)
             return False
-        if selected.get("mode") != "api":
-            show_styled_message(
-                APP_NAME,
-                tr("error.api_select_mode"),
-                is_error=True,
-                parent=None,
+
+        apply_auth_dialog_selection(selected, persist=True)
+        initial_email = normalize_account_email(selected.get("email", initial_email))
+        password_value = str(selected.get("password", "") or "")
+        if not password_value:
+            error_message = "Enter your password."
+            continue
+
+        try:
+            ok, message = run_startup_background_task(
+                lambda: authenticate_account_session(initial_email, password_value),
+                stage_key="startup.connecting_pro",
             )
-            initial_api_key = str(selected.get("api_key", "") or initial_api_key)
-            continue
-
-        selected_api_key = str(selected.get("api_key", "")).strip()
-        if not selected_api_key:
-            show_styled_message(APP_NAME, tr("auth.validation.api.empty"), is_error=True, parent=None)
-            continue
-
-        selected_blob_size = normalize_indicator_blob_size(selected.get("blob_size", indicator_blob_size_key))
-        ui_language = normalize_language(selected.get("language", ui_language))
-        indicator_position_key = normalize_indicator_position(selected.get("indicator_position", indicator_position_key))
-        selected_pro_model_key = normalize_pro_model(selected.get("pro_model", selected_pro_model_key))
-        selected_hotkeys, selected_hotkey_mode, selected_hotkeys_customized = resolve_command_hotkey_state(
-            selected.get("hotkeys"),
-            selected.get("hotkey_mode", command_key_mode),
-        )
-        record = load_config_record()
-        record["auth_mode"] = "api"
-        record["indicator_blob_size"] = selected_blob_size
-        record["ui_language"] = ui_language
-        record["indicator_position"] = indicator_position_key
-        record["show_startup_screen"] = normalize_startup_loading_screen_enabled(selected.get("show_startup_screen", startup_loading_screen_enabled))
-        record["pro_model"] = selected_pro_model_key
-        record["command_hotkeys"] = dict(selected_hotkeys)
-        record["command_key_mode"] = selected_hotkey_mode
-        record["command_hotkeys_customized"] = bool(selected_hotkeys_customized)
-        if not save_secret(record, "api_key", "api_key_dpapi", selected_api_key):
-            show_styled_message(APP_NAME, tr("error.save_api"), is_error=True, parent=None)
-            return False
-
-        auth_mode = "api"
-        api_key = selected_api_key
-        license_code = ""
-        indicator_blob_size_key = selected_blob_size
-        command_hotkeys = dict(selected_hotkeys)
-        command_key_mode = selected_hotkey_mode
-        command_hotkeys_customized = bool(selected_hotkeys_customized)
-        startup_loading_screen_enabled = bool(record["show_startup_screen"])
-        initial_api_key = selected_api_key
-
-        if ensure_api_mode_ready():
-            return True
+        except Exception as exc:
+            ok, message = False, str(exc)
+        if ok:
+            return ensure_api_mode_ready()
+        error_message = str(message or "Could not sign in.").strip()
 
 
 def initialize_auth_mode():
-    if auth_mode == "license":
-        return ensure_license_mode_ready()
-    return ensure_api_mode_ready()
+    return ensure_account_mode_ready()
 
 
 def end_remote_session():
@@ -6514,59 +7053,23 @@ def end_remote_session():
     try:
         request_json(
             "POST",
-            "/api/v1/client/end-session",
+            "/api/v1/client/logout",
             token=local_session_token,
             json_payload={"session_id": local_session_id},
             timeout=12,
         )
     except Exception:
         logger.debug("Remote session shutdown request failed.", exc_info=True)
+    finally:
+        clear_account_session_state(clear_cached_api_key=False)
 
 
 def heartbeat_loop():
-    while True:
-        with session_lock:
-            local_interval = int(heartbeat_interval_seconds)
-            local_active = session_active
-            local_session_id = session_id
-            local_session_token = session_token
-        if heartbeat_stop_event.wait(max(8, local_interval)):
-            break
-        if auth_mode != "license":
-            continue
-        if not local_active or not local_session_token:
-            continue
-        with session_lock:
-            local_active = session_active
-            local_session_id = session_id
-            local_session_token = session_token
-        if not local_active or not local_session_token:
-            continue
-        try:
-            response = request_json(
-                "POST",
-                "/api/v1/client/heartbeat",
-                token=local_session_token,
-                json_payload={"session_id": local_session_id},
-                timeout=15,
-            )
-            if not response.ok:
-                set_session_status(tr("status.code_session_lost"), active=False)
-                disable_typing_mode()
-                indicator_set_idle()
-        except Exception:
-            set_session_status(tr("status.code_network_error"), active=False)
-            disable_typing_mode()
-            indicator_set_idle()
+    return
 
 
 def start_heartbeat():
-    global heartbeat_thread
-    if heartbeat_thread is not None and heartbeat_thread.is_alive():
-        return
-    heartbeat_stop_event.clear()
-    heartbeat_thread = Thread(target=heartbeat_loop, daemon=True)
-    heartbeat_thread.start()
+    return
 
 
 def list_running_process_snapshot():
@@ -8019,8 +8522,7 @@ def handle_clear_ctx_hotkey():
 def run_clear_ctx_action():
     deactivate_post_type_guard()
     clear_answer_state()
-    if auth_mode == "api":
-        reset_api_context()
+    reset_api_context()
     disable_typing_mode()
     indicator_set_idle()
 
@@ -8164,17 +8666,9 @@ def encode_capture_for_license_upload(screenshot):
 
 
 def infer_via_license_server(upload_file, local_token):
-    file_name, file_bytes, mime_type = upload_file
-    files = {"file": (file_name, file_bytes, mime_type)}
-    response = request_json("POST", "/api/v1/client/infer", token=local_token, files=files, timeout=80)
-    if response.status_code == 401:
-        set_session_status(tr("status.code_expired"), active=False)
-        raise RuntimeError("Session expired or invalid.")
-    response.raise_for_status()
-    payload = decode_json_response(response, "License inference")
-    if not isinstance(payload, dict):
-        raise RuntimeError(f"Server returned an unexpected response ({response.status_code}).")
-    return str(payload.get("text", ""))
+    _ = upload_file
+    _ = local_token
+    raise RuntimeError("Remote inference is no longer supported in the desktop app.")
 
 
 def infer_via_api_key(screenshot):
@@ -8195,29 +8689,13 @@ def process_screenshot():
         is_processing = True
     request_epoch = get_answer_epoch()
     deactivate_post_type_guard()
-    local_token = ""
     try:
-        if auth_mode == "license":
-            with session_lock:
-                local_active = session_active
-                local_token = session_token
-            if not local_active or not local_token:
-                set_session_status(tr("status.code_inactive"), active=False)
-                disable_typing_mode()
-                indicator_set_idle()
-                gui_show_error(tr("error.session_inactive"))
-                return
-
         is_paused = False
         disable_typing_mode()
         indicator_set_processing()
         screenshot = PIL.ImageGrab.grab()
         try:
-            if auth_mode == "license":
-                upload_file = encode_capture_for_license_upload(screenshot)
-                raw_text = infer_via_license_server(upload_file, local_token)
-            else:
-                raw_text = infer_via_api_key(screenshot)
+            raw_text = infer_via_api_key(screenshot)
         finally:
             try:
                 screenshot.close()
@@ -8257,13 +8735,12 @@ def process_screenshot():
             enable_typing_mode()
     except Exception as exc:
         logger.exception("Screenshot processing failed.")
-        if auth_mode == "api":
-            issue_kind = classify_api_runtime_issue(exc)
-            if issue_kind:
-                try:
-                    refresh_api_key_via_startup_ui(issue_kind)
-                except Exception:
-                    logger.exception("API key recovery flow failed.")
+        issue_kind = classify_api_runtime_issue(exc)
+        if issue_kind:
+            try:
+                refresh_api_key_via_startup_ui(issue_kind)
+            except Exception:
+                logger.exception("API key recovery flow failed.")
         indicator_set_idle()
         clear_answer_state()
     finally:
@@ -8567,8 +9044,7 @@ def exit_program(trigger_uninstall=False):
     heartbeat_stop_event.set()
     privacy_guard_stop_event.set()
     stop_command_mode_probe()
-    if auth_mode == "license":
-        end_remote_session()
+    end_remote_session()
     set_session_status(tr("status.stopped"), active=False)
     deactivate_post_type_guard()
     disable_typing_mode()
@@ -8656,8 +9132,6 @@ def main():
     if not initialize_auth_mode():
         startup_progress_close()
         return
-    if auth_mode == "license":
-        start_heartbeat()
 
     startup_progress_update("startup.starting_indicator")
     indicator_thread = Thread(target=init_indicator, daemon=True)
@@ -8681,6 +9155,8 @@ def main():
 
 
 if __name__ == "__main__":
+    if len(sys.argv) >= 4 and sys.argv[1] == AUTH_SHELL_SUBPROCESS_FLAG:
+        raise SystemExit(run_auth_shell_subprocess(sys.argv[2], sys.argv[3]))
     try:
         main()
     except KeyboardInterrupt:
