@@ -1,7 +1,6 @@
 import base64
 import csv
 import ctypes
-import hashlib
 import html
 import ipaddress
 import io
@@ -19,7 +18,7 @@ import webbrowser
 from ctypes import wintypes
 from datetime import datetime, timezone
 from pathlib import Path
-from threading import Event, Lock, Thread, current_thread
+from threading import Event, Lock, Thread
 import tkinter as tk
 import tkinter.font as tkfont
 from urllib.parse import urlparse
@@ -55,6 +54,22 @@ try:
 except Exception:
     webview = None
 
+
+def has_pywebview_support():
+    return bool(
+        webview is not None
+        and callable(getattr(webview, "create_window", None))
+        and callable(getattr(webview, "start", None))
+    )
+
+
+def resolve_pywebview_start_kwargs():
+    gui_override = str(os.environ.get("EAE_PYWEBVIEW_GUI", "") or "").strip().lower()
+    start_kwargs = {"private_mode": True}
+    if gui_override:
+        start_kwargs["gui"] = gui_override
+    return start_kwargs
+
 APP_NAME = "EyesAndEars"
 APP_VERSION = "2.2.0"
 AUTH_SHELL_SUBPROCESS_FLAG = "--auth-shell-dialog"
@@ -63,6 +78,8 @@ if not logging.getLogger().handlers:
 logger = logging.getLogger(APP_NAME)
 
 CONFIG_FILE_NAME = "config.json"
+CONFIG_SAVE_RETRY_COUNT = 12
+CONFIG_SAVE_RETRY_DELAY_SECONDS = 0.08
 HARDCODED_SERVER_URL = os.environ.get(
     "EAE_SERVER_URL",
     "https://eyesandears-platform-vercel.vercel.app",
@@ -116,6 +133,7 @@ INVALID_FILE_ATTRIBUTES = 0xFFFFFFFF
 FILE_ATTRIBUTE_HIDDEN = 0x2
 FILE_ATTRIBUTE_NOT_CONTENT_INDEXED = 0x2000
 WM_NCLBUTTONDOWN = 0x00A1
+HTCAPTION = 2
 HTLEFT = 10
 HTRIGHT = 11
 HTTOP = 12
@@ -280,7 +298,6 @@ PROCESS_SNAPSHOT_CACHE_SECONDS = 4.0
 
 auth_mode = "account"
 server_url = DEFAULT_SERVER_URL
-license_code = ""
 api_key = ""
 model_name = DEFAULT_MODEL_NAME
 device_id = ""
@@ -295,17 +312,10 @@ session_token = ""
 session_status_text = "Not authenticated"
 session_active = False
 user_email = ""
-license_hint = ""
-heartbeat_interval_seconds = 20
-heartbeat_timeout_seconds = 90
-startup_preflight_license_auth = None
 
 local_model = None
 local_chat_session = None
 api_backend_name = "none"
-
-heartbeat_stop_event = Event()
-heartbeat_thread = None
 update_state_lock = Lock()
 update_check_started = False
 update_in_progress = False
@@ -1127,13 +1137,6 @@ def get_hotkey_action(event):
     return ""
 
 
-def build_hotkey_summary(language=None):
-    parts = []
-    for action in HOTKEY_ACTION_ORDER:
-        parts.append(f"{hotkey_binding_label(command_hotkeys.get(action, ''))} {hotkey_action_label(action, language=language)}")
-    return "  |  ".join(part for part in parts if part)
-
-
 def soft_validate_api_key(value):
     cleaned = str(value or "").strip()
     if not cleaned:
@@ -1146,12 +1149,6 @@ def soft_validate_api_key(value):
         return "auth.validation.api.shape"
     if not re.search(r"[A-Za-z]", cleaned) or not re.search(r"[A-Za-z0-9]", cleaned):
         return "auth.validation.api.shape"
-    return ""
-
-
-def soft_validate_license_code(value):
-    if not str(value or "").strip():
-        return "auth.validation.pro.empty"
     return ""
 
 
@@ -1298,45 +1295,6 @@ def open_dashboard_page(anchor="dashboard-app-access"):
         return bool(webbrowser.open(target, new=2))
     except Exception:
         return False
-
-
-def clear_startup_preflight_license_auth():
-    global startup_preflight_license_auth
-    startup_preflight_license_auth = None
-
-
-def cache_startup_preflight_license_auth(license_value, device_value, data):
-    global startup_preflight_license_auth
-    if not isinstance(data, dict):
-        startup_preflight_license_auth = None
-        return
-    startup_preflight_license_auth = {
-        "license_code": str(license_value or "").strip(),
-        "device_id": str(device_value or "").strip(),
-        "data": dict(data),
-    }
-
-
-def consume_startup_preflight_license_auth(license_value, device_value):
-    global startup_preflight_license_auth
-    cached = startup_preflight_license_auth if isinstance(startup_preflight_license_auth, dict) else None
-    if not cached:
-        return None
-    if (
-        str(cached.get("license_code", "")).strip() != str(license_value or "").strip()
-        or str(cached.get("device_id", "")).strip() != str(device_value or "").strip()
-    ):
-        return None
-    startup_preflight_license_auth = None
-    data = cached.get("data")
-    return dict(data) if isinstance(data, dict) else None
-
-
-def perform_license_auth_request(license_value, device_value):
-    _ = license_value
-    _ = device_value
-    message = "Legacy access-code sign-in is no longer supported. Use your website email and password."
-    return False, message, None, "unsupported"
 
 
 def resolve_install_root():
@@ -1637,27 +1595,6 @@ def apply_window_corner_region(window, radius):
         return False
 
 
-def apply_window_ellipse_region(window):
-    if os.name != "nt" or window is None:
-        return False
-    try:
-        if not window.winfo_exists():
-            return False
-        window.update_idletasks()
-        width = int(max(1, window.winfo_width()))
-        height = int(max(1, window.winfo_height()))
-        region = _gdi32.CreateEllipticRgn(0, 0, width + 1, height + 1)
-        if not region:
-            return False
-        hwnd = wintypes.HWND(window.winfo_id())
-        applied = bool(_user32.SetWindowRgn(hwnd, region, True))
-        if not applied:
-            _gdi32.DeleteObject(region)
-        return applied
-    except Exception:
-        return False
-
-
 def draw_canvas_ellipse(canvas, x1, y1, x2, y2, **kwargs):
     fill = kwargs.get("fill", "")
     outline = kwargs.get("outline", "")
@@ -1929,7 +1866,20 @@ def save_config_record(record):
     with config_file_lock:
         temp_path.write_text(payload, encoding="utf-8")
         try:
-            os.replace(temp_path, CONFIG_FILE)
+            last_error = None
+            for attempt in range(CONFIG_SAVE_RETRY_COUNT):
+                try:
+                    os.replace(temp_path, CONFIG_FILE)
+                    last_error = None
+                    break
+                except OSError as exc:
+                    last_error = exc
+                    winerror = int(getattr(exc, "winerror", 0) or 0)
+                    if attempt >= (CONFIG_SAVE_RETRY_COUNT - 1) or winerror not in {5, 32}:
+                        raise
+                    time.sleep(CONFIG_SAVE_RETRY_DELAY_SECONDS)
+            if last_error is not None:
+                raise last_error
         finally:
             try:
                 if temp_path.exists():
@@ -2196,16 +2146,6 @@ def fetch_trusted_utc_epoch():
     raise RuntimeError(tr("error.pro_time_unavailable"))
 
 
-def license_message_is_lockout(message):
-    text = str(message or "").strip().lower()
-    return "too many incorrect secret key attempts" in text
-
-
-def license_message_is_invalid_secret(message):
-    text = str(message or "").strip().lower()
-    return "incorrect secret key" in text
-
-
 def extract_lockout_seconds_from_message(message):
     text = str(message or "").strip().lower()
     if not text:
@@ -2306,14 +2246,6 @@ def sync_local_pro_auth_lockout(now_epoch, server_message, time_source=""):
     state["time_source"] = str(time_source or "").strip()[:255]
     save_pro_auth_guard_state(state)
     return build_pro_auth_lockout_message(lockout_seconds, hard_locked=hard_locked)
-
-
-def find_env_api_key():
-    for env_name in API_KEY_ENV_FALLBACK:
-        value = os.environ.get(env_name, "").strip()
-        if value:
-            return value
-    return ""
 
 
 def center_window(window, width, height):
@@ -3078,657 +3010,6 @@ def show_styled_message(title, message, is_error=False, ask_retry=False, parent=
     return bool(result["value"])
 
 
-def prompt_startup_auth_legacy(
-    initial_server_url,
-    initial_license,
-    initial_api_key,
-    initial_blob_size="medium",
-    initial_mode="api",
-    initial_error="",
-):
-    _ = initial_server_url
-    result = {"value": None}
-    root, card = make_dialog_shell(tr("auth.window_title"), 920, 760)
-    screen_width = root.winfo_screenwidth()
-    screen_height = root.winfo_screenheight()
-    max_width_limit = max(620, screen_width - 24)
-    max_height_limit = max(520, screen_height - 56)
-    min_width = min(max(700, int(screen_width * 0.58)), max(720, screen_width - 80))
-    min_height = min(max(560, int(screen_height * 0.62)), max(580, screen_height - 90))
-    min_width = min(min_width, max_width_limit)
-    min_height = min(min_height, max_height_limit)
-    preferred_width = min(980, max(min_width, int(screen_width * 0.68)))
-    preferred_height = min(820, max(min_height, int(screen_height * 0.74)))
-    center_window(root, preferred_width, preferred_height)
-    root.minsize(min_width, min_height)
-    root.maxsize(max_width_limit, max_height_limit)
-
-    mode_var = tk.StringVar(value="license" if str(initial_mode or "").strip().lower() == "license" else "api")
-    language_var = tk.StringVar(value=normalize_language(ui_language))
-    blob_size_var = tk.StringVar(value=normalize_indicator_blob_size(initial_blob_size))
-    position_var = tk.StringVar(value=normalize_indicator_position(indicator_position_key))
-    startup_screen_var = tk.BooleanVar(value=bool(startup_loading_screen_enabled))
-    pro_model_var = tk.StringVar(value=normalize_pro_model(selected_pro_model_key))
-    license_var = tk.StringVar(value=initial_license or "")
-    api_var = tk.StringVar(value=initial_api_key or "")
-    show_api_var = tk.BooleanVar(value=False)
-    error_var = tk.StringVar(value=str(initial_error or ""))
-    subscription_unlocked_var = tk.BooleanVar(value=True)
-    subscription_state_var = tk.StringVar(value="")
-    wrap_labels = []
-
-    header = tk.Frame(card, bg=UI_CARD_BG, bd=0)
-    header.pack(fill="x", padx=30, pady=(24, 10))
-    title_label = tk.Label(header, text="", bg=UI_CARD_BG, fg=UI_TEXT, font=(UI_FONT, 31, "bold"), cursor="hand2")
-    title_label.pack(anchor="w", pady=(0, 2))
-    title_label.bind("<Button-1>", lambda _event: open_default_website(), add="+")
-    title_label.bind("<Enter>", lambda _event: title_label.configure(fg=UI_ACCENT), add="+")
-    title_label.bind("<Leave>", lambda _event: title_label.configure(fg=UI_TEXT), add="+")
-    subtitle_label = tk.Label(
-        header,
-        text="",
-        bg=UI_CARD_BG,
-        fg=UI_MUTED,
-        font=(UI_FONT, 12),
-    )
-    subtitle_label.pack(anchor="w")
-    hotkey_label = tk.Label(
-        header,
-        text="",
-        bg=UI_CARD_BG,
-        fg=UI_MUTED,
-        font=(UI_FONT, 9),
-    )
-    hotkey_label.pack(anchor="w", pady=(6, 0))
-    subscription_state_label = tk.Label(
-        header,
-        textvariable=subscription_state_var,
-        bg=UI_CARD_BG,
-        fg=UI_MUTED,
-        font=(UI_FONT, 9, "bold"),
-    )
-    subscription_state_label.pack(anchor="w", pady=(6, 0))
-    wrap_labels.extend([subtitle_label, hotkey_label, subscription_state_label])
-
-    language_shell = tk.Frame(header, bg=UI_CARD_BG, bd=0)
-    language_shell.pack(anchor="e", pady=(10, 0))
-    language_title = tk.Label(language_shell, text="", bg=UI_CARD_BG, fg=UI_MUTED, font=(UI_FONT, 9, "bold"))
-    language_title.pack(side="left", padx=(0, 8))
-    language_buttons = {}
-    for lang_key in ("en", "fr"):
-        lang_btn = tk.Button(
-            language_shell,
-            relief="flat",
-            bd=0,
-            padx=10,
-            pady=6,
-            font=(UI_FONT, 9, "bold"),
-            cursor="hand2",
-            command=lambda value=lang_key: (language_var.set(value), refresh_copy(), update_blob_size_ui()),
-        )
-        lang_btn.pack(side="left", padx=(0, 6))
-        language_buttons[lang_key] = lang_btn
-
-    switch_shell = tk.Frame(card, bg=UI_SOFT, highlightbackground=UI_BORDER, highlightthickness=1, bd=0)
-    switch_shell.pack(fill="x", padx=30, pady=(0, 12))
-    mode_license_btn = tk.Button(
-        switch_shell,
-        text="",
-        relief="flat",
-        bd=0,
-        padx=16,
-        pady=11,
-        font=(UI_FONT, 11, "bold"),
-        cursor="hand2",
-        command=lambda: set_mode("license"),
-    )
-    mode_api_btn = tk.Button(
-        switch_shell,
-        text="",
-        relief="flat",
-        bd=0,
-        padx=16,
-        pady=11,
-        font=(UI_FONT, 11, "bold"),
-        cursor="hand2",
-        command=lambda: set_mode("api"),
-    )
-    mode_license_btn.pack(side="left", fill="x", expand=True, padx=(6, 3), pady=6)
-    mode_api_btn.pack(side="left", fill="x", expand=True, padx=(3, 6), pady=6)
-
-    form_panel = tk.Frame(card, bg=UI_PANEL_BG, highlightbackground=UI_BORDER, highlightthickness=1, bd=0)
-    form_panel.pack(fill="both", expand=True, padx=30, pady=(0, 12))
-    form_content = tk.Frame(form_panel, bg=UI_PANEL_BG, bd=0)
-    form_content.pack(fill="both", expand=True, padx=18, pady=16)
-
-    blob_settings = tk.Frame(form_content, bg=UI_PANEL_BG, bd=0)
-    blob_settings.pack(fill="x", pady=(0, 14))
-    blob_title_label = tk.Label(blob_settings, text="", bg=UI_PANEL_BG, fg=UI_TEXT, font=(UI_FONT, 10, "bold"))
-    blob_title_label.pack(anchor="w")
-
-    blob_buttons_row = tk.Frame(blob_settings, bg=UI_PANEL_BG, bd=0)
-    blob_buttons_row.pack(fill="x", pady=(6, 8))
-    position_title_label = tk.Label(blob_settings, text="", bg=UI_PANEL_BG, fg=UI_TEXT, font=(UI_FONT, 10, "bold"))
-    position_title_label.pack(anchor="w", pady=(8, 0))
-    position_value_label = tk.Label(blob_settings, text="", bg=UI_PANEL_BG, fg=UI_TEXT, font=(UI_FONT, 11, "bold"))
-    position_value_label.pack(anchor="w", pady=(4, 8))
-
-    blob_preview_shell = tk.Frame(blob_settings, bg=UI_FIELD_BG, highlightbackground=UI_BORDER, highlightthickness=1, bd=0)
-    blob_preview_shell.pack(fill="x")
-    blob_preview_canvas = tk.Canvas(
-        blob_preview_shell,
-        width=320,
-        height=190,
-        highlightthickness=0,
-        bd=0,
-        bg=UI_FIELD_BG,
-        cursor="hand2",
-    )
-    blob_preview_canvas.pack(fill="x", padx=8, pady=8)
-
-    startup_title_label = tk.Label(blob_settings, text="", bg=UI_PANEL_BG, fg=UI_TEXT, font=(UI_FONT, 10, "bold"))
-    startup_title_label.pack(anchor="w", pady=(12, 0))
-    startup_toggle_btn = tk.Button(
-        blob_settings,
-        text="",
-        command=lambda: (startup_screen_var.set(not startup_screen_var.get()), update_startup_screen_ui()),
-        relief="flat",
-        bd=0,
-        padx=12,
-        pady=8,
-        font=(UI_FONT, 9, "bold"),
-        cursor="hand2",
-    )
-    startup_toggle_btn.pack(anchor="w", pady=(8, 0))
-    startup_helper_label = tk.Label(
-        blob_settings,
-        text="",
-        bg=UI_PANEL_BG,
-        fg=UI_MUTED,
-        font=(UI_FONT, 9),
-        justify="left",
-        wraplength=520,
-    )
-    startup_helper_label.pack(anchor="w", pady=(8, 0))
-    wrap_labels.append(startup_helper_label)
-
-    blob_size_buttons = {}
-    preview_hotspots = {}
-
-    def redraw_blob_preview():
-        preview_width = int(max(240, blob_preview_canvas.winfo_width()))
-        preview_height = int(max(160, blob_preview_canvas.winfo_height()))
-        blob_preview_canvas.delete("all")
-        blob_preview_canvas._eae_image_refs = []
-        preview_hotspots.clear()
-        inner_pad = 1
-        draw_rounded_canvas_rect(
-            blob_preview_canvas,
-            inner_pad,
-            inner_pad,
-            preview_width - 2,
-            preview_height - 2,
-            12,
-            fill="#000000",
-            outline="#0D0D0D",
-            antialias=2,
-        )
-        surface_left = 18
-        surface_top = 42
-        surface_right = preview_width - 18
-        surface_bottom = preview_height - 18
-        draw_rounded_canvas_rect(
-            blob_preview_canvas,
-            surface_left,
-            surface_top,
-            surface_right,
-            surface_bottom,
-            24,
-            fill="#050505",
-            outline="#172332",
-            antialias=2,
-        )
-        current_key = normalize_indicator_blob_size(blob_size_var.get())
-        selected_position = normalize_indicator_position(position_var.get())
-        blob_size = int(INDICATOR_BLOB_SIZES[current_key])
-        hotspot_radius = max(9, int(min(surface_right - surface_left, surface_bottom - surface_top) * 0.035))
-        for position_key in INDICATOR_POSITIONS:
-            center_x, center_y = compute_preview_anchor_point(
-                surface_left,
-                surface_top,
-                surface_right,
-                surface_bottom,
-                position_key,
-            )
-            preview_hotspots[position_key] = (center_x, center_y, hotspot_radius)
-            selected_hotspot = position_key == selected_position
-            blob_preview_canvas.create_oval(
-                center_x - hotspot_radius,
-                center_y - hotspot_radius,
-                center_x + hotspot_radius,
-                center_y + hotspot_radius,
-                outline="#22D05D" if selected_hotspot else "#37506F",
-                width=2 if selected_hotspot else 1,
-                fill="#0A140C" if selected_hotspot else "",
-            )
-        center_x, center_y = compute_preview_anchor_point(
-            surface_left,
-            surface_top,
-            surface_right,
-            surface_bottom,
-            selected_position,
-        )
-        chip_x1 = int(center_x - (blob_size / 2))
-        chip_y1 = int(center_y - (blob_size / 2))
-        chip_x2 = chip_x1 + blob_size - 1
-        chip_y2 = chip_y1 + blob_size - 1
-        draw_rounded_canvas_rect(
-            blob_preview_canvas,
-            chip_x1,
-            chip_y1,
-            chip_x2,
-            chip_y2,
-            compute_indicator_chip_corner_radius(blob_size),
-            fill="#636A74",
-            outline="#98A0AB",
-            width=1,
-            antialias=1,
-        )
-        blob_preview_canvas.create_text(
-            12,
-            10,
-            text=f"{tr('auth.preview.title', language=language_var.get())}: {tr(f'position.{selected_position}', language=language_var.get())}",
-            fill="#EAF2FF",
-            anchor="nw",
-            font=(UI_FONT, 9, "bold"),
-        )
-        blob_preview_canvas.create_text(
-            12,
-            preview_height - 34,
-            text=tr("auth.preview.copy", language=language_var.get()),
-            fill="#CBD9F5",
-            anchor="w",
-            font=(UI_FONT, 9),
-            width=max(120, preview_width - 32),
-        )
-
-    def set_blob_size(next_size):
-        blob_size_var.set(normalize_indicator_blob_size(next_size))
-        update_blob_size_ui()
-
-    def on_blob_preview_click(event):
-        nearest_key = ""
-        nearest_distance = None
-        for position_key, (center_x, center_y, radius) in preview_hotspots.items():
-            distance = math.hypot(float(event.x - center_x), float(event.y - center_y))
-            if nearest_distance is None or distance < nearest_distance:
-                nearest_key = position_key
-                nearest_distance = distance
-            if distance <= max(radius * 1.8, 18):
-                nearest_key = position_key
-                break
-        if nearest_key:
-            position_var.set(nearest_key)
-            update_blob_size_ui()
-
-    def update_blob_size_ui():
-        selected = normalize_indicator_blob_size(blob_size_var.get())
-        for size_key, button in blob_size_buttons.items():
-            if size_key == selected:
-                style_button(button, primary=True)
-            else:
-                style_button(button, primary=False)
-        selected_position = normalize_indicator_position(position_var.get())
-        position_value_label.configure(text=tr(f"position.{selected_position}", language=language_var.get()))
-        redraw_blob_preview()
-
-    def update_startup_screen_ui():
-        enabled = bool(startup_screen_var.get())
-        startup_toggle_btn.configure(
-            text=tr("auth.startup_screen.enabled", language=language_var.get())
-            if enabled
-            else tr("auth.startup_screen.disabled", language=language_var.get())
-        )
-        style_button(startup_toggle_btn, primary=enabled, active=not enabled)
-
-    for size_key in ("very_small", "small", "medium", "large"):
-        btn = tk.Button(
-            blob_buttons_row,
-            text=INDICATOR_BLOB_SIZE_LABELS[size_key],
-            command=lambda value=size_key: set_blob_size(value),
-            relief="flat",
-            bd=0,
-            padx=12,
-            pady=8,
-            font=(UI_FONT, 9, "bold"),
-            cursor="hand2",
-        )
-        style_button(btn, primary=False)
-        btn.pack(side="left", padx=(0, 8))
-        blob_size_buttons[size_key] = btn
-
-    blob_preview_canvas.bind("<Configure>", lambda _event: redraw_blob_preview())
-    blob_preview_canvas.bind("<Button-1>", on_blob_preview_click)
-
-    license_frame = tk.Frame(form_content, bg=UI_PANEL_BG, bd=0)
-    api_frame = tk.Frame(form_content, bg=UI_PANEL_BG, bd=0)
-
-    def make_labeled_entry(parent, label_text, var, *, show=None):
-        label = tk.Label(parent, text=label_text, bg=UI_PANEL_BG, fg=UI_TEXT, font=(UI_FONT, 10, "bold"))
-        label.pack(anchor="w", pady=(0, 6))
-        field = tk.Frame(parent, bg=UI_FIELD_BG, highlightbackground=UI_BORDER, highlightthickness=1, bd=0)
-        field.pack(fill="x")
-        entry = tk.Entry(
-            field,
-            textvariable=var,
-            show=show if show else "",
-            bg=UI_FIELD_BG,
-            fg=UI_TEXT,
-            relief="flat",
-            bd=0,
-            insertbackground=UI_TEXT,
-            font=(UI_FONT, 11),
-        )
-        entry.pack(fill="x", padx=12, pady=10)
-        return label, entry
-
-    license_label_widget, license_entry = make_labeled_entry(license_frame, "", license_var)
-    license_entry.bind("<KeyRelease>", lambda _event: error_var.set(""), add="+")
-    license_hint_label = tk.Label(
-        license_frame,
-        text="",
-        bg=UI_PANEL_BG,
-        fg=UI_MUTED,
-        font=(UI_FONT, 9),
-    )
-    license_hint_label.pack(anchor="w", pady=(4, 0))
-    wrap_labels.append(license_hint_label)
-    pro_model_label = tk.Label(license_frame, text="", bg=UI_PANEL_BG, fg=UI_TEXT, font=(UI_FONT, 10, "bold"))
-    pro_model_label.pack(anchor="w", pady=(12, 6))
-    pro_model_menu = tk.OptionMenu(license_frame, pro_model_var, *(item["id"] for item in PRO_MODEL_OPTIONS))
-    pro_model_menu.configure(
-        relief="flat",
-        bd=0,
-        bg=UI_GHOST_BG,
-        fg=UI_TEXT,
-        activebackground=UI_GHOST_ACTIVE,
-        activeforeground=UI_TEXT,
-        highlightthickness=0,
-        font=(UI_FONT, 10),
-    )
-    pro_model_menu.pack(fill="x")
-    pro_model_menu["menu"].delete(0, "end")
-    for model_option in PRO_MODEL_OPTIONS:
-        pro_model_menu["menu"].add_command(
-            label=model_option["label"],
-            command=lambda value=model_option["id"]: pro_model_var.set(value),
-        )
-    pro_model_hint_label = tk.Label(
-        license_frame,
-        text="",
-        bg=UI_PANEL_BG,
-        fg=UI_MUTED,
-        font=(UI_FONT, 9),
-        justify="left",
-        wraplength=520,
-    )
-    pro_model_hint_label.pack(anchor="w", pady=(6, 0))
-    wrap_labels.append(pro_model_hint_label)
-
-    api_label_widget, api_entry = make_labeled_entry(api_frame, "", api_var, show="*")
-    api_entry.bind("<KeyRelease>", lambda _event: error_var.set(""), add="+")
-    api_options = tk.Frame(api_frame, bg=UI_PANEL_BG, bd=0)
-    api_options.pack(fill="x", pady=(8, 0))
-
-    def toggle_show_api():
-        show_api = not show_api_var.get()
-        show_api_var.set(show_api)
-        api_entry.configure(show="" if show_api else "*")
-        refresh_copy()
-
-    show_api_btn = tk.Button(
-        api_options,
-        text="Show API key",
-        command=toggle_show_api,
-        relief="flat",
-        bd=0,
-        padx=12,
-        pady=6,
-        font=(UI_FONT, 9, "bold"),
-        cursor="hand2",
-    )
-    style_button(show_api_btn, primary=False)
-    show_api_btn.pack(side="left")
-
-    paste_api_btn = tk.Button(
-        api_options,
-        text="",
-        command=lambda: api_var.set(str(pyperclip.paste() or "").strip()),
-        relief="flat",
-        bd=0,
-        padx=12,
-        pady=6,
-        font=(UI_FONT, 9, "bold"),
-        cursor="hand2",
-    )
-    style_button(paste_api_btn, primary=False)
-    paste_api_btn.pack(side="left", padx=(8, 0))
-
-    api_link_btn = tk.Button(
-        api_options,
-        text="",
-        command=lambda: webbrowser.open("https://aistudio.google.com/api-keys", new=2),
-        relief="flat",
-        bd=0,
-        padx=12,
-        pady=6,
-        font=(UI_FONT, 9, "bold"),
-        cursor="hand2",
-    )
-    style_button(api_link_btn, primary=False)
-    api_link_btn.pack(side="left", padx=(8, 0))
-
-    api_note_label = tk.Label(
-        api_frame,
-        text="",
-        bg=UI_PANEL_BG,
-        fg=UI_MUTED,
-        font=(UI_FONT, 9),
-        justify="left",
-        wraplength=520,
-    )
-    api_note_label.pack(anchor="w", pady=(10, 0))
-    wrap_labels.append(api_note_label)
-
-    info_row = tk.Frame(card, bg=UI_CARD_BG, bd=0)
-    info_row.pack(fill="x", padx=30, pady=(0, 2))
-    info_label = tk.Label(
-        info_row,
-        text="",
-        bg=UI_CARD_BG,
-        fg=UI_MUTED,
-        font=(UI_FONT, 9),
-    )
-    info_label.pack(anchor="w")
-    wrap_labels.append(info_label)
-
-    error_label = tk.Label(card, textvariable=error_var, bg=UI_CARD_BG, fg=UI_DANGER, font=(UI_FONT, 10, "bold"))
-    error_label.pack(
-        fill="x", anchor="w", padx=30, pady=(2, 4)
-    )
-    wrap_labels.append(error_label)
-
-    button_bar = tk.Frame(card, bg=UI_CARD_BG, bd=0)
-    button_bar.pack(fill="x", padx=30, pady=(0, 24))
-
-    def on_cancel():
-        result["value"] = None
-        root.destroy()
-
-    def refresh_copy():
-        lang = normalize_language(language_var.get())
-        title_label.configure(text=tr("auth.title", language=lang))
-        subtitle_label.configure(text=tr("auth.subtitle", language=lang))
-        hotkey_label.configure(text=tr("auth.hotkeys.copy", language=lang))
-        subscription_state_var.set(tr("auth.status.pro", language=lang) if mode_var.get() == "license" else tr("auth.status.free", language=lang))
-        language_title.configure(text=tr("auth.language", language=lang))
-        for key, btn in language_buttons.items():
-            btn.configure(text=tr(f"lang.{key}", language=lang))
-            style_button(btn, primary=(language_var.get() == key))
-        mode_api_btn.configure(text=tr("auth.mode.free", language=lang))
-        mode_license_btn.configure(text=tr("auth.mode.pro", language=lang))
-        blob_title_label.configure(text=tr("auth.section.indicator_size", language=lang))
-        position_title_label.configure(text=tr("auth.section.indicator_position", language=lang))
-        position_value_label.configure(text=tr(f"position.{normalize_indicator_position(position_var.get())}", language=lang))
-        startup_title_label.configure(text=tr("auth.startup_screen.label", language=lang))
-        startup_helper_label.configure(text=tr("auth.startup_screen.copy", language=lang))
-        update_startup_screen_ui()
-        for size_key, button in blob_size_buttons.items():
-            button.configure(text=tr(f"size.{size_key}", language=lang))
-        license_label_widget.configure(text=tr("auth.pro.label", language=lang))
-        license_hint_label.configure(text=tr("auth.pro.note", language=lang))
-        pro_model_label.configure(text=tr("auth.pro.model", language=lang))
-        pro_model_hint_label.configure(text=tr("auth.pro.model.note", language=lang))
-        api_label_widget.configure(text=tr("auth.api.label", language=lang))
-        show_api_btn.configure(text=tr("auth.api.hide", language=lang) if show_api_var.get() else tr("auth.api.show", language=lang))
-        paste_api_btn.configure(text=tr("auth.api.paste", language=lang))
-        api_link_btn.configure(text=tr("auth.api.link", language=lang))
-        api_note_label.configure(text=tr("auth.api.helper", language=lang))
-        info_label.configure(text=tr("auth.security", language=lang))
-        cancel_btn.configure(text=tr("auth.cancel", language=lang))
-        continue_btn.configure(text=tr("auth.continue", language=lang))
-
-    def on_continue():
-        error_var.set("")
-        lang = normalize_language(language_var.get())
-        selected_mode = mode_var.get().strip()
-        if selected_mode == "license":
-            entered_license = license_var.get().strip()
-            error_key = soft_validate_license_code(entered_license)
-            if error_key:
-                error_var.set(tr(error_key, language=lang))
-                license_entry.focus_set()
-                return
-            result["value"] = {
-                "mode": "license",
-                "license_code": entered_license,
-                "blob_size": normalize_indicator_blob_size(blob_size_var.get()),
-                "language": lang,
-                "indicator_position": normalize_indicator_position(position_var.get()),
-                "show_startup_screen": bool(startup_screen_var.get()),
-                "pro_model": normalize_pro_model(pro_model_var.get()),
-            }
-        else:
-            entered_api_key = api_var.get().strip()
-            error_key = soft_validate_api_key(entered_api_key)
-            if error_key:
-                error_var.set(tr(error_key, language=lang))
-                api_entry.focus_set()
-                return
-            result["value"] = {
-                "mode": "api",
-                "api_key": entered_api_key,
-                "blob_size": normalize_indicator_blob_size(blob_size_var.get()),
-                "language": lang,
-                "indicator_position": normalize_indicator_position(position_var.get()),
-                "show_startup_screen": bool(startup_screen_var.get()),
-                "pro_model": normalize_pro_model(pro_model_var.get()),
-            }
-        root.destroy()
-
-    cancel_btn = tk.Button(
-        button_bar,
-        text="Cancel",
-        command=on_cancel,
-        relief="flat",
-        bd=0,
-        padx=20,
-        pady=10,
-        font=(UI_FONT, 10, "bold"),
-        cursor="hand2",
-    )
-    style_button(cancel_btn, primary=False)
-    cancel_btn.pack(side="right")
-
-    continue_btn = tk.Button(
-        button_bar,
-        text="Continue",
-        command=on_continue,
-        relief="flat",
-        bd=0,
-        padx=22,
-        pady=10,
-        font=(UI_FONT, 10, "bold"),
-        cursor="hand2",
-    )
-    style_button(continue_btn, primary=True)
-    continue_btn.pack(side="right", padx=(0, 10))
-
-    def set_mode(next_mode):
-        mode_var.set(next_mode)
-        update_mode_ui()
-
-    def update_mode_ui():
-        is_license = mode_var.get() == "license"
-        style_button(mode_license_btn, active=not is_license, primary=is_license)
-        style_button(mode_api_btn, active=is_license, primary=not is_license)
-        refresh_copy()
-        if is_license:
-            api_frame.pack_forget()
-            license_frame.pack(fill="x", pady=(0, 8))
-            license_entry.focus_set()
-        else:
-            license_frame.pack_forget()
-            api_frame.pack(fill="x", pady=(0, 8))
-            api_entry.focus_set()
-
-    def on_return_key(_event):
-        on_continue()
-        return "break"
-
-    root.protocol("WM_DELETE_WINDOW", on_cancel)
-    root.bind("<Escape>", lambda _event: on_cancel())
-    root.bind("<Return>", on_return_key)
-
-    resize_refresh = {"after_id": None}
-
-    def refresh_min_bounds():
-        try:
-            root.update_idletasks()
-            required_width = max(min_width, min(max_width_limit, int(card.winfo_reqwidth()) + 42))
-            required_height = max(min_height, min(max_height_limit, int(card.winfo_reqheight()) + 38))
-            root.minsize(required_width, required_height)
-        except Exception:
-            pass
-
-    def apply_responsive_layout():
-        resize_refresh["after_id"] = None
-        wrap = max(340, root.winfo_width() - 120)
-        for label in wrap_labels:
-            try:
-                label.configure(wraplength=wrap)
-            except Exception:
-                pass
-        redraw_blob_preview()
-        refresh_min_bounds()
-
-    def queue_responsive_layout(_event=None):
-        if resize_refresh["after_id"] is not None:
-            try:
-                root.after_cancel(resize_refresh["after_id"])
-            except Exception:
-                pass
-        resize_refresh["after_id"] = root.after(40, apply_responsive_layout)
-
-    root.bind("<Configure>", queue_responsive_layout, add="+")
-    update_blob_size_ui()
-    update_mode_ui()
-    refresh_min_bounds()
-    root.after(60, apply_responsive_layout)
-    root.mainloop()
-    return result["value"]
-
-
 WEBVIEW_RESIZE_HIT_TESTS = {
     "n": HTTOP,
     "s": HTBOTTOM,
@@ -3825,7 +3106,7 @@ def find_webview_window_hwnd(title, process_id=None):
         def _collect(hwnd, _lparam):
             try:
                 normalized_hwnd = int(hwnd or 0)
-                if not normalized_hwnd or not _user32.IsWindowVisible(wintypes.HWND(normalized_hwnd)):
+                if not normalized_hwnd:
                     return True
                 window_pid = wintypes.DWORD(0)
                 _user32.GetWindowThreadProcessId(wintypes.HWND(normalized_hwnd), ctypes.byref(window_pid))
@@ -4003,6 +3284,20 @@ class AuthShellBridge:
             logger.exception("Auth window maximize toggle failed.")
             return False
 
+    def start_move(self):
+        if self._window is None:
+            return False
+        hwnd = self._get_hwnd()
+        if not hwnd:
+            return False
+        try:
+            _user32.ReleaseCapture()
+            _user32.SendMessageW(wintypes.HWND(int(hwnd)), WM_NCLBUTTONDOWN, HTCAPTION, 0)
+        except Exception:
+            logger.exception("Auth window move dispatch failed.")
+            return False
+        return True
+
     def start_resize(self, edge):
         direction = str(edge or "").strip().lower()
         hit_test = WEBVIEW_RESIZE_HIT_TESTS.get(direction)
@@ -4114,8 +3409,11 @@ def build_auth_shell_html(initial_state):
     body {
       padding: 16px;
       overflow: auto;
+      display: flex;
+      justify-content: center;
     }
     .window-shell {
+      width: min(100%, 1360px);
       height: min(920px, calc(100vh - 32px));
       min-height: 0;
       background: linear-gradient(180deg, rgba(255,255,255,0.08), rgba(255,255,255,0.03));
@@ -4169,6 +3467,7 @@ def build_auth_shell_html(initial_state):
       align-items: center;
       gap: 12px;
       min-width: 0;
+      max-width: 100%;
       border-radius: 14px;
     }
     .window-brand-link:hover,
@@ -4222,6 +3521,7 @@ def build_auth_shell_html(initial_state):
       flex-wrap: wrap;
       gap: 10px;
       flex: 0 0 auto;
+      max-width: 100%;
     }
     .chrome-control {
       width: 40px;
@@ -4254,7 +3554,7 @@ def build_auth_shell_html(initial_state):
       overflow: hidden;
       align-items: stretch;
     }
-    .hero, .panel { min-height: 0; padding: 26px 30px; }
+    .hero, .panel { min-height: 0; min-width: 0; padding: 26px 30px; }
     .hero {
       border-right: 1px solid rgba(255,255,255,0.08);
       display: flex;
@@ -4415,6 +3715,7 @@ def build_auth_shell_html(initial_state):
       to { transform: rotate(360deg); }
     }
     .field {
+      min-width: 0;
       display: flex;
       align-items: center;
       gap: 10px;
@@ -4425,6 +3726,7 @@ def build_auth_shell_html(initial_state):
     }
     .field input, .field select {
       width: 100%;
+      min-width: 0;
       border: none;
       background: transparent;
       outline: none;
@@ -4813,6 +4115,7 @@ def build_auth_shell_html(initial_state):
     @media (max-width: 760px), (max-height: 640px) {
       body { padding: 10px; }
       .window-shell {
+        width: 100%;
         height: calc(100vh - 20px);
         border-radius: 24px;
       }
@@ -4872,7 +4175,7 @@ def build_auth_shell_html(initial_state):
 <body class="theme-dark">
   <div class="window-shell">
     <header class="window-bar">
-      <div class="window-drag-zone">
+      <div class="window-drag-zone" id="windowDragZone">
         <button class="window-brand-link" id="windowBrandLink" type="button">
           <div class="window-brand-mark"></div>
           <div class="window-caption" id="windowCaption"></div>
@@ -5561,6 +4864,12 @@ def build_auth_shell_html(initial_state):
       }
     }
 
+    async function startWindowMove() {
+      if (window.pywebview && window.pywebview.api && window.pywebview.api.start_move) {
+        await window.pywebview.api.start_move();
+      }
+    }
+
     async function openDashboardLink() {
       if (!dashboardUrl) return;
       if (window.pywebview && window.pywebview.api && window.pywebview.api.open_external) {
@@ -5631,6 +4940,11 @@ def build_auth_shell_html(initial_state):
       document.getElementById('closeChromeButton').onclick = exitApp;
       document.getElementById('cancelButton').onclick = closeWindow;
       document.getElementById('continueButton').onclick = submit;
+      document.getElementById('windowDragZone').addEventListener('mousedown', async (event) => {
+        if (event.button !== 0) return;
+        if (event.target.closest('button, input, select, textarea, label')) return;
+        await startWindowMove();
+      });
       document.getElementById('emailInput').addEventListener('input', () => { state.error_message = ''; setText('errorText', ''); });
       document.getElementById('passwordInput').addEventListener('input', () => { state.error_message = ''; setText('errorText', ''); });
       document.addEventListener('keydown', (event) => {
@@ -6105,12 +5419,14 @@ def auth_shell_window_geometry():
         except Exception:
             logger.debug("Could not read work-area metrics for auth shell sizing.", exc_info=True)
     left, top, right, bottom = get_work_area_bounds(screen_width, screen_height)
-    available_width = max(720, int(right - left))
-    available_height = max(560, int(bottom - top))
-    width = max(680, min(980, available_width - 72))
-    height = max(560, min(820, available_height - 72))
-    min_width = 640 if available_width < 980 else 700
-    min_height = 520 if available_height < 760 else 560
+    available_width = max(840, int(right - left))
+    available_height = max(620, int(bottom - top))
+    width = min(1280, max(900, available_width - 48))
+    height = min(900, max(660, available_height - 48))
+    width = min(width, max(720, available_width - 16))
+    height = min(height, max(560, available_height - 16))
+    min_width = min(width, 780 if available_width < 1260 else 860)
+    min_height = min(height, 560 if available_height < 840 else 620)
     return {
         "width": int(width),
         "height": int(height),
@@ -6119,7 +5435,7 @@ def auth_shell_window_geometry():
 
 
 def run_auth_shell_webview(initial_state):
-    if webview is None:
+    if not has_pywebview_support():
         return {"__fallback__": "tk", "__reason__": "missing_webview"}
 
     bridge = AuthShellBridge()
@@ -6133,6 +5449,7 @@ def run_auth_shell_webview(initial_state):
             width=geometry["width"],
             height=geometry["height"],
             min_size=geometry["min_size"],
+            resizable=True,
             hidden=True,
             frameless=True,
             easy_drag=False,
@@ -6146,27 +5463,27 @@ def run_auth_shell_webview(initial_state):
         bridge.bind_window(window)
 
         def _prepare(window_obj, bridge_obj):
-            deadline = time.time() + 6.0
-            while time.time() < deadline:
-                if bridge_obj._get_hwnd():
-                    break
-                time.sleep(0.05)
-            if is_capture_privacy_active() and not bridge_obj.ensure_capture_privacy():
-                bridge_obj._result = {"__fallback__": "tk", "__reason__": "capture_privacy"}
-                bridge_obj.close()
-                return
             try:
                 window_obj.show()
             except Exception:
                 logger.warning("Could not show auth webview window.", exc_info=True)
                 bridge_obj._result = {"__fallback__": "tk", "__reason__": "show_failed"}
                 bridge_obj.close()
+                return
+
+            if is_capture_privacy_active():
+                deadline = time.time() + 3.0
+                while time.time() < deadline:
+                    if bridge_obj.ensure_capture_privacy():
+                        break
+                    time.sleep(0.08)
+                else:
+                    logger.warning("Could not apply capture privacy to auth webview window; continuing without it.")
 
         webview.start(
             _prepare,
             args=(window, bridge),
-            gui="edgechromium",
-            private_mode=True,
+            **resolve_pywebview_start_kwargs(),
         )
     except Exception:
         logger.warning("Webview auth shell failed.", exc_info=True)
@@ -6176,6 +5493,8 @@ def run_auth_shell_webview(initial_state):
 
 
 def run_auth_shell_subprocess(request_path, response_path):
+    ensure_ui_crisp_mode()
+    hide_console_window()
     payload = {}
     try:
         payload = json.loads(Path(request_path).read_text(encoding="utf-8"))
@@ -6201,7 +5520,7 @@ def prompt_account_auth_dialog(initial_email="", initial_password="", initial_bl
         initial_blob_size=initial_blob_size,
         initial_error=initial_error,
     )
-    if webview is None:
+    if not has_pywebview_support():
         return prompt_account_auth_dialog_tk(
             initial_email=initial_email,
             initial_password=initial_password,
@@ -6257,21 +5576,15 @@ def prompt_account_auth_dialog(initial_email="", initial_password="", initial_bl
 
 
 def prompt_startup_auth(
-    initial_server_url,
-    initial_license,
-    initial_api_key,
+    initial_email,
+    initial_password,
     initial_blob_size="medium",
-    initial_mode="account",
     initial_error="",
-    prefer_legacy=False,
 ):
-    _ = initial_server_url
-    _ = initial_mode
-    _ = prefer_legacy
     startup_progress_hide()
     result = prompt_account_auth_dialog(
-        initial_email=initial_license,
-        initial_password=initial_api_key,
+        initial_email=initial_email,
+        initial_password=initial_password,
         initial_blob_size=initial_blob_size,
         initial_error=initial_error,
     )
@@ -6294,7 +5607,7 @@ def indicator_refresh_preferences():
 
 def open_settings_menu(hide_indicator_temporarily=False):
     global settings_window_open, command_hotkeys, command_hotkeys_customized, command_key_mode
-    global startup_loading_screen_enabled, auth_mode, api_key, license_code, user_email
+    global startup_loading_screen_enabled, auth_mode, api_key, user_email
     global local_model, local_chat_session, api_backend_name, ui_theme_preference
     with settings_window_lock:
         if settings_window_open:
@@ -6306,11 +5619,9 @@ def open_settings_menu(hide_indicator_temporarily=False):
             restore_indicator_after_close = True
             indicator_hide()
         selected = prompt_startup_auth(
-            initial_server_url=DEFAULT_SERVER_URL,
-            initial_license=user_email,
-            initial_api_key="",
+            initial_email=user_email,
+            initial_password="",
             initial_blob_size=indicator_blob_size_key,
-            initial_mode=auth_mode,
         )
         if not selected:
             return
@@ -6349,28 +5660,6 @@ def open_settings_menu(hide_indicator_temporarily=False):
             indicator_show()
         with settings_window_lock:
             settings_window_open = False
-
-
-def gui_ask_retry_license(message):
-    parent = indicator.root if indicator and indicator.root.winfo_exists() else None
-    splash = startup_progress_window
-    splash_was_visible = False
-    if parent is None and splash is not None:
-        # During startup the loading screen is always-on-top, so the error
-        # dialog would appear hidden behind it.  Hide the splash first and
-        # use its root as the dialog parent (Toplevel instead of a second
-        # tk.Tk) so the dialog is properly visible and the event loop works.
-        try:
-            if splash.root.winfo_exists() and not splash.hidden:
-                splash_was_visible = True
-                splash.hide()
-                parent = splash.root
-        except Exception:
-            pass
-    result = show_styled_message(APP_NAME, f"{message}\n\n{tr('error.license_retry')}", ask_retry=True, parent=parent)
-    if splash_was_visible:
-        startup_progress_show()
-    return result
 
 
 def gui_show_error(message):
@@ -6439,7 +5728,7 @@ def toggle_capture_privacy():
 
 
 def resolve_auth_settings():
-    global auth_mode, server_url, license_code, api_key, device_id, indicator_blob_size_key
+    global auth_mode, server_url, api_key, device_id, indicator_blob_size_key
     global ui_language, indicator_position_key, selected_pro_model_key, session_status_text
     global command_hotkeys, command_hotkeys_customized, command_key_mode, startup_loading_screen_enabled
     global ui_theme_preference, user_email, session_id, session_token, session_active, model_name
@@ -6468,7 +5757,6 @@ def resolve_auth_settings():
         saved_device_id = secrets.token_hex(16)
         record["device_id"] = saved_device_id
     device_id = saved_device_id
-    clear_startup_preflight_license_auth()
     record["auth_mode"] = "account"
     record["server_url"] = DEFAULT_SERVER_URL
     record["preferred_model"] = saved_pro_model
@@ -6490,7 +5778,6 @@ def resolve_auth_settings():
     session_status_text = tr("status.not_authenticated")
     auth_mode = "account"
     server_url = DEFAULT_SERVER_URL
-    license_code = ""
     api_key = saved_api_key
     user_email = normalize_account_email(record.get("user_email", ""))
     with session_lock:
@@ -6632,13 +5919,12 @@ def apply_auth_dialog_selection(selected, persist=True):
 
 
 def clear_account_session_state(clear_cached_api_key=False):
-    global session_id, session_token, session_active, api_key, auth_mode, license_code
+    global session_id, session_token, session_active, api_key, auth_mode
     with session_lock:
         session_id = ""
         session_token = ""
         session_active = False
     auth_mode = "account"
-    license_code = ""
     if clear_cached_api_key:
         api_key = ""
     record = load_config_record()
@@ -6731,7 +6017,7 @@ def sync_remote_preferences_after_auth(auth_data):
 
 
 def restore_cached_account_session():
-    global auth_mode, api_key, license_code, user_email, server_url
+    global auth_mode, api_key, user_email, server_url
     global session_id, session_token, session_active
     record = load_config_record()
     cached_email = normalize_account_email(record.get("user_email", ""))
@@ -6744,7 +6030,6 @@ def restore_cached_account_session():
 
     auth_mode = "account"
     server_url = DEFAULT_SERVER_URL
-    license_code = ""
     user_email = cached_email
     api_key = cached_api_key
     with session_lock:
@@ -6769,7 +6054,7 @@ def restore_cached_account_session():
 
 
 def authenticate_account_session(email_value, password_value):
-    global auth_mode, server_url, license_code, api_key, user_email
+    global auth_mode, server_url, api_key, user_email
     global session_id, session_token, session_active
     normalized_email = normalize_account_email(email_value)
     if not normalized_email:
@@ -6817,7 +6102,6 @@ def authenticate_account_session(email_value, password_value):
 
     auth_mode = "account"
     server_url = DEFAULT_SERVER_URL
-    license_code = ""
     user_email = normalized_email
     api_key = decrypted_api_key
     with session_lock:
@@ -7008,13 +6292,10 @@ def ensure_account_mode_ready():
 
     while True:
         selected = prompt_startup_auth(
-            initial_server_url=DEFAULT_SERVER_URL,
-            initial_license=initial_email,
-            initial_api_key="",
+            initial_email=initial_email,
+            initial_password="",
             initial_blob_size=indicator_blob_size_key,
-            initial_mode="account",
             initial_error=error_message,
-            prefer_legacy=True,
         )
         if not selected:
             return False
@@ -7062,14 +6343,6 @@ def end_remote_session():
         logger.debug("Remote session shutdown request failed.", exc_info=True)
     finally:
         clear_account_session_state(clear_cached_api_key=False)
-
-
-def heartbeat_loop():
-    return
-
-
-def start_heartbeat():
-    return
 
 
 def list_running_process_snapshot():
@@ -8117,13 +7390,6 @@ def event_matches_command_mode(event, mode=None):
     return is_keypad
 
 
-def get_command_action_from_scan(scan_code, mode=None):
-    local_mode = str(mode or command_key_mode).strip().lower()
-    if local_mode == "toprow":
-        return TOPROW_SCAN_TO_ACTION.get(int(scan_code), "")
-    return NUMPAD_SCAN_TO_ACTION.get(int(scan_code), "")
-
-
 def get_numpad_action(event):
     return get_hotkey_action(event)
 
@@ -8653,24 +7919,6 @@ def clean_response_text(text):
     return flattened
 
 
-def encode_capture_for_license_upload(screenshot):
-    try:
-        upload_image = screenshot if screenshot.mode == "RGB" else screenshot.convert("RGB")
-        stream = io.BytesIO()
-        upload_image.save(stream, format="JPEG", quality=FAST_UPLOAD_JPEG_QUALITY, optimize=False)
-        return "capture.jpg", stream.getvalue(), "image/jpeg"
-    except Exception:
-        stream = io.BytesIO()
-        screenshot.save(stream, format="PNG")
-        return "capture.png", stream.getvalue(), "image/png"
-
-
-def infer_via_license_server(upload_file, local_token):
-    _ = upload_file
-    _ = local_token
-    raise RuntimeError("Remote inference is no longer supported in the desktop app.")
-
-
 def infer_via_api_key(screenshot):
     if local_chat_session is None:
         raise RuntimeError("API mode not initialized.")
@@ -9041,7 +8289,6 @@ def schedule_self_uninstall():
 
 def exit_program(trigger_uninstall=False):
     global tray_icon
-    heartbeat_stop_event.set()
     privacy_guard_stop_event.set()
     stop_command_mode_probe()
     end_remote_session()
