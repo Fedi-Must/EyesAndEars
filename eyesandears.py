@@ -71,7 +71,7 @@ def resolve_pywebview_start_kwargs():
     return start_kwargs
 
 APP_NAME = "EyesAndEars"
-APP_VERSION = "2.2.0"
+APP_VERSION = "2.5.0"
 AUTH_SHELL_SUBPROCESS_FLAG = "--auth-shell-dialog"
 if not logging.getLogger().handlers:
     logging.basicConfig(level=logging.WARNING, format="%(levelname)s [%(name)s] %(message)s")
@@ -312,6 +312,7 @@ session_token = ""
 session_status_text = "Not authenticated"
 session_active = False
 user_email = ""
+remember_me_enabled = False
 
 local_model = None
 local_chat_session = None
@@ -571,6 +572,9 @@ TRANSLATIONS = {
         "auth.account.email.placeholder": "name@example.com",
         "auth.account.password": "Password",
         "auth.account.password.placeholder": "Enter your website password",
+        "auth.account.import": "Import user settings",
+        "auth.account.import.loading": "Importing...",
+        "auth.account.remember": "Remember me",
         "auth.account.dashboard": "Open dashboard",
         "auth.account.reset": "Reset password",
         "auth.account.helper": "Add or replace your Gemini API key from the dashboard whenever needed. You can leave the password blank when only changing local settings.",
@@ -589,6 +593,7 @@ TRANSLATIONS = {
         "auth.validation.pro.empty": "Complete sign-in in the account window.",
         "auth.validation.account.email.empty": "Enter your account email.",
         "auth.validation.account.email.invalid": "Enter a valid email address.",
+        "auth.validation.account.password.empty": "Enter your password.",
         "auth.status.free": "Free mode checks your API key locally on this device.",
         "auth.status.pro": "Account mode signs you in through the website.",
         "auth.status.account": "Desktop access uses your website account and local Gemini decryption.",
@@ -751,6 +756,9 @@ TRANSLATIONS = {
         "auth.account.email.placeholder": "nom@exemple.com",
         "auth.account.password": "Mot de passe",
         "auth.account.password.placeholder": "Entrez le mot de passe du site",
+        "auth.account.import": "Importer les reglages",
+        "auth.account.import.loading": "Importation...",
+        "auth.account.remember": "Se souvenir de moi",
         "auth.account.dashboard": "Ouvrir le tableau de bord",
         "auth.account.reset": "Reinitialiser le mot de passe",
         "auth.account.helper": "Ajoutez ou remplacez votre cle Gemini depuis le tableau de bord si besoin. Vous pouvez laisser le mot de passe vide si vous modifiez seulement les reglages locaux.",
@@ -769,6 +777,7 @@ TRANSLATIONS = {
         "auth.validation.pro.empty": "Terminez la connexion dans la fenetre du compte.",
         "auth.validation.account.email.empty": "Entrez l'email du compte.",
         "auth.validation.account.email.invalid": "Entrez une adresse email valide.",
+        "auth.validation.account.password.empty": "Entrez votre mot de passe.",
         "auth.status.free": "Le mode gratuit verifie votre cle API localement sur cet appareil.",
         "auth.status.pro": "Le mode compte ouvre votre session via le site.",
         "auth.status.account": "L'acces desktop utilise votre compte du site et le dechiffrement Gemini en local.",
@@ -1922,6 +1931,31 @@ def clear_saved_secret(record, plain_key, encrypted_key):
     record.pop(plain_key, None)
     record.pop(encrypted_key, None)
     save_config_record(record)
+
+
+def normalize_remember_me_preference(value):
+    if isinstance(value, bool):
+        return bool(value)
+    text = str(value or "").strip().lower()
+    if not text:
+        return False
+    return text in {"1", "true", "yes", "on"}
+
+
+def clear_persisted_account_auth(record=None, clear_email=False):
+    target = dict(record) if isinstance(record, dict) else load_config_record()
+    target["session_id"] = ""
+    target["remember_me"] = False
+    target.pop("session_token", None)
+    target.pop("session_token_dpapi", None)
+    target.pop("api_key", None)
+    target.pop("api_key_dpapi", None)
+    target.pop("remembered_password", None)
+    target.pop("remembered_password_dpapi", None)
+    if clear_email:
+        target["user_email"] = ""
+    save_config_record(target)
+    return target
 
 
 def normalize_account_email(value):
@@ -3148,6 +3182,8 @@ class AuthShellBridge:
         self._manual_maximized = False
         self._normal_bounds = None
         self._hwnd_cache = 0
+        self._initial_state = {}
+        self._import_preview = None
 
     def bind_window(self, window):
         self._window = window
@@ -3210,11 +3246,38 @@ class AuthShellBridge:
             "hotkeys_customized": bool(hotkeys_customized),
             "email": normalize_account_email(payload.get("email", "")),
             "password": str(payload.get("password", "") or ""),
+            "remember_me": normalize_remember_me_preference(payload.get("remember_me", False)),
         }
         normalized["pro_model"] = normalized["preferred_model"]
+        preview_snapshot = None
+        if isinstance(self._import_preview, dict):
+            preview_snapshot = self._import_preview.get("auth_snapshot")
+        if isinstance(preview_snapshot, dict):
+            if (
+                normalize_account_email(preview_snapshot.get("email", "")) == normalized["email"]
+                and str(preview_snapshot.get("password", "") or "") == normalized["password"]
+            ):
+                normalized["auth_snapshot"] = preview_snapshot
         self._result = normalized
         self.close()
         return {"ok": True}
+
+    def import_settings(self, payload):
+        if not isinstance(payload, dict):
+            return {"ok": False, "error": "Invalid setup payload."}
+        ok, result = request_account_preferences_preview(
+            payload.get("email", ""),
+            password_value=str(payload.get("password", "") or ""),
+            live_session_token=self._initial_state.get("live_session_token", ""),
+            live_session_email=self._initial_state.get("live_session_email", ""),
+        )
+        if not ok:
+            return {"ok": False, "error": str(result or "Could not import the synced settings.")}
+        self._import_preview = result if isinstance(result, dict) else None
+        return {
+            "ok": True,
+            "preferences": dict((result or {}).get("preferences") or {}),
+        }
 
     def close(self):
         try:
@@ -3863,6 +3926,23 @@ def build_auth_shell_html(initial_state):
     .text-link:hover {
       color: var(--text);
     }
+    .inline-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-top: 12px;
+    }
+    .inline-actions .ghost {
+      min-width: 0;
+      padding: 10px 16px;
+      border-radius: 16px;
+      font-weight: 700;
+    }
+    .remember-toggle.active {
+      background: rgba(59,140,255,0.18);
+      border-color: rgba(120,183,255,0.56);
+      box-shadow: 0 12px 26px rgba(14,34,66,0.18);
+    }
     .model-options {
       display: grid;
       gap: 10px;
@@ -4157,6 +4237,9 @@ def build_auth_shell_html(initial_state):
         flex: 1 1 100%;
         min-width: 0;
       }
+      .inline-actions .ghost {
+        flex: 1 1 100%;
+      }
       .text-link {
         max-width: 100%;
         text-align: left;
@@ -4223,6 +4306,10 @@ def build_auth_shell_html(initial_state):
             <div class="field-actions">
               <button class="icon-button" id="showButton" type="button"></button>
             </div>
+          </div>
+          <div class="inline-actions">
+            <button class="ghost" id="importSettingsButton" type="button"></button>
+            <button class="ghost remember-toggle" id="rememberMeButton" type="button"></button>
           </div>
           <div class="input-link-row">
             <button class="text-link" id="dashboardButton" type="button"></button>
@@ -4323,6 +4410,9 @@ def build_auth_shell_html(initial_state):
       pro_model: '',
       email: '',
       password: '',
+      remember_me: false,
+      live_session_email: '',
+      live_session_token: '',
       error_message: ''
     }, bootstrap.initialState || {});
     const hotkeyActionIds = bootstrap.hotkeyActionIds || [];
@@ -4740,6 +4830,8 @@ def build_auth_shell_html(initial_state):
       setText('accountCopy', t('auth.account.copy'));
       setText('emailLabel', t('auth.account.email'));
       setText('passwordLabel', t('auth.account.password'));
+      setText('importSettingsButton', t('auth.account.import'));
+      setText('rememberMeButton', t('auth.account.remember'));
       setText('dashboardButton', t('auth.account.dashboard'));
       setText('resetPasswordButton', t('auth.account.reset'));
       setText('accountHelper', t('auth.account.helper'));
@@ -4758,6 +4850,11 @@ def build_auth_shell_html(initial_state):
       setIconButton('maximizeButton', windowMaximized ? 'contract' : 'square', windowMaximized ? t('auth.window.restore') : t('auth.window.maximize'));
       setIconButton('closeChromeButton', 'close', t('auth.window.close'));
       setIconButton('showButton', document.getElementById('passwordInput').type === 'password' ? 'eye' : 'eye-off', document.getElementById('passwordInput').type === 'password' ? t('auth.api.show') : t('auth.api.hide'));
+      const rememberButton = document.getElementById('rememberMeButton');
+      if (rememberButton) {
+        rememberButton.classList.toggle('active', !!state.remember_me);
+        rememberButton.setAttribute('aria-pressed', state.remember_me ? 'true' : 'false');
+      }
       const startupToggle = document.getElementById('startupScreenToggle');
       if (startupToggle) {
         startupToggle.textContent = state.show_startup_screen ? t('auth.startup_screen.enabled') : t('auth.startup_screen.disabled');
@@ -4785,6 +4882,51 @@ def build_auth_shell_html(initial_state):
       return '';
     }
 
+    async function importSettings() {
+      const errorKey = validate();
+      setText('errorText', errorKey ? t(errorKey) : '');
+      if (errorKey) return;
+      if (!state.password && !state.live_session_token) {
+        setText('errorText', t('auth.validation.account.password.empty'));
+        return;
+      }
+      if (!(window.pywebview && window.pywebview.api && window.pywebview.api.import_settings)) return;
+      const button = document.getElementById('importSettingsButton');
+      const previousLabel = button ? button.textContent : '';
+      if (button) {
+        button.disabled = true;
+        button.textContent = t('auth.account.import.loading');
+      }
+      try {
+        const result = await window.pywebview.api.import_settings({
+          email: state.email,
+          password: state.password
+        });
+        if (!result || result.ok === false) {
+          setText('errorText', String((result && result.error) || t('error.auth_denied')));
+          return;
+        }
+        const imported = result.preferences || {};
+        state.language = imported.language || state.language;
+        state.blob_size = imported.indicator_blob_size || state.blob_size;
+        state.indicator_position = imported.indicator_position || state.indicator_position;
+        state.show_startup_screen = typeof imported.show_startup_screen === 'boolean' ? imported.show_startup_screen : state.show_startup_screen;
+        state.preferred_model = imported.preferred_model || state.preferred_model;
+        state.pro_model = imported.pro_model || state.pro_model;
+        state.hotkeys = imported.hotkeys || state.hotkeys;
+        state.hotkey_mode = imported.hotkey_mode || state.hotkey_mode;
+        setText('errorText', '');
+        render();
+      } catch (error) {
+        setText('errorText', String((error && error.message) || t('error.auth_denied')));
+      } finally {
+        if (button) {
+          button.disabled = false;
+          button.textContent = previousLabel || t('auth.account.import');
+        }
+      }
+    }
+
     async function submit() {
       if (isSubmitting) return;
       const errorKey = validate();
@@ -4802,7 +4944,8 @@ def build_auth_shell_html(initial_state):
         preferred_model: state.preferred_model || state.pro_model,
         pro_model: state.preferred_model || state.pro_model,
         email: state.email,
-        password: state.password
+        password: state.password,
+        remember_me: !!state.remember_me
       };
       if (window.pywebview && window.pywebview.api && window.pywebview.api.submit) {
         isSubmitting = true;
@@ -4911,6 +5054,11 @@ def build_auth_shell_html(initial_state):
         input.type = input.type === 'password' ? 'text' : 'password';
         render();
       };
+      document.getElementById('importSettingsButton').onclick = importSettings;
+      document.getElementById('rememberMeButton').onclick = () => {
+        state.remember_me = !state.remember_me;
+        render();
+      };
       document.getElementById('settingsToggleButton').onclick = () => toggleSettings();
       document.getElementById('openSettingsButton').onclick = () => toggleSettings(true);
       document.getElementById('settingsDoneButton').onclick = () => toggleSettings(false);
@@ -4986,6 +5134,9 @@ def prompt_account_auth_dialog_tk(initial_email="", initial_password="", initial
     root, card = make_dialog_shell(tr("auth.window_title"), 860, 760)
     root.minsize(720, 620)
     center_window(root, 860, 760)
+    remembered_password = ""
+    if not str(initial_password or "") and remember_me_enabled:
+        remembered_password = load_saved_secret(load_config_record(), "remembered_password", "remembered_password_dpapi")
 
     language_var = tk.StringVar(value=normalize_language(ui_language))
     theme_var = tk.StringVar(value=normalize_theme_preference(ui_theme_preference))
@@ -4993,10 +5144,12 @@ def prompt_account_auth_dialog_tk(initial_email="", initial_password="", initial
     position_var = tk.StringVar(value=normalize_indicator_position(indicator_position_key))
     startup_screen_var = tk.BooleanVar(value=bool(startup_loading_screen_enabled))
     email_var = tk.StringVar(value=normalize_account_email(initial_email))
-    password_var = tk.StringVar(value=str(initial_password or ""))
+    password_var = tk.StringVar(value=str(initial_password or remembered_password or ""))
     show_password_var = tk.BooleanVar(value=False)
+    remember_me_var = tk.BooleanVar(value=bool(remember_me_enabled))
     model_var = tk.StringVar(value=normalize_pro_model(selected_pro_model_key))
     error_var = tk.StringVar(value=str(initial_error or ""))
+    import_preview = {"auth_snapshot": None}
 
     wrap_labels = []
 
@@ -5118,6 +5271,32 @@ def prompt_account_auth_dialog_tk(initial_email="", initial_password="", initial
         cursor="hand2",
     )
     password_toggle.pack(side="right", padx=8)
+
+    account_inline_actions = tk.Frame(account_inner, bg=UI_PANEL_BG, bd=0)
+    account_inline_actions.pack(fill="x", pady=(10, 0))
+    import_btn = tk.Button(
+        account_inline_actions,
+        text="Import user settings",
+        relief="flat",
+        bd=0,
+        padx=12,
+        pady=7,
+        font=(UI_FONT, 9, "bold"),
+        cursor="hand2",
+    )
+    import_btn.pack(side="left")
+    remember_btn = tk.Button(
+        account_inline_actions,
+        text="Remember me",
+        relief="flat",
+        bd=0,
+        padx=12,
+        pady=7,
+        font=(UI_FONT, 9, "bold"),
+        cursor="hand2",
+        command=lambda: (remember_me_var.set(not remember_me_var.get()), refresh_copy()),
+    )
+    remember_btn.pack(side="left", padx=(8, 0))
 
     account_actions = tk.Frame(account_inner, bg=UI_PANEL_BG, bd=0)
     account_actions.pack(fill="x", pady=(10, 0))
@@ -5276,6 +5455,7 @@ def prompt_account_auth_dialog_tk(initial_email="", initial_password="", initial
             "mode": "account",
             "email": email_value,
             "password": password_value,
+            "remember_me": bool(remember_me_var.get()),
             "blob_size": normalize_indicator_blob_size(blob_size_var.get()),
             "language": normalize_language(language_var.get()),
             "theme": normalize_theme_preference(theme_var.get()),
@@ -5285,7 +5465,58 @@ def prompt_account_auth_dialog_tk(initial_email="", initial_password="", initial
             "pro_model": normalize_pro_model(model_var.get()),
             "hotkeys": dict(command_hotkeys),
             "hotkey_mode": command_key_mode,
+            "auth_snapshot": import_preview.get("auth_snapshot"),
         })
+
+    def on_import_settings():
+        error_var.set("")
+        email_value = normalize_account_email(email_var.get())
+        password_value = str(password_var.get() or "")
+        if email_value and not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email_value):
+            error_var.set(tr("auth.validation.account.email.invalid", language=normalize_language(language_var.get())))
+            email_entry.focus_set()
+            return
+        if not email_value:
+            error_var.set(tr("auth.validation.account.email.empty", language=normalize_language(language_var.get())))
+            email_entry.focus_set()
+            return
+        live_session_token = ""
+        live_session_email = ""
+        with session_lock:
+            if session_active:
+                live_session_token = str(session_token or "").strip()
+                live_session_email = normalize_account_email(user_email)
+        if not password_value and not (live_session_token and email_value == live_session_email):
+            error_var.set(tr("auth.validation.account.password.empty", language=normalize_language(language_var.get())))
+            password_entry.focus_set()
+            return
+        import_btn.configure(text=tr("auth.account.import.loading", language=normalize_language(language_var.get())), state="disabled")
+        root.update_idletasks()
+        try:
+            ok, payload = request_account_preferences_preview(
+                email_value,
+                password_value=password_value,
+                live_session_token=live_session_token,
+                live_session_email=live_session_email,
+            )
+        except Exception as exc:
+            ok, payload = False, str(exc)
+        finally:
+            import_btn.configure(text=tr("auth.account.import", language=normalize_language(language_var.get())), state="normal")
+        if not ok:
+            error_var.set(str(payload or "Could not import the synced settings."))
+            return
+        preview = dict((payload or {}).get("preferences") or {})
+        if preview:
+            language_var.set(normalize_language(preview.get("language", language_var.get())))
+            blob_size_var.set(normalize_indicator_blob_size(preview.get("indicator_blob_size", blob_size_var.get())))
+            position_var.set(normalize_indicator_position(preview.get("indicator_position", position_var.get())))
+            startup_screen_var.set(
+                normalize_startup_loading_screen_enabled(preview.get("show_startup_screen", startup_screen_var.get()))
+            )
+            model_var.set(normalize_pro_model(preview.get("preferred_model", preview.get("pro_model", model_var.get()))))
+        import_preview["auth_snapshot"] = (payload or {}).get("auth_snapshot")
+        refresh_copy()
 
     def refresh_copy():
         lang = normalize_language(language_var.get())
@@ -5320,6 +5551,10 @@ def prompt_account_auth_dialog_tk(initial_email="", initial_password="", initial
             text=("Hide" if show_password_var.get() else "Show") if lang != "fr" else ("Masquer" if show_password_var.get() else "Afficher"),
             command=toggle_password,
         )
+        import_btn.configure(text=tr("auth.account.import", language=lang), command=on_import_settings)
+        remember_btn.configure(text=tr("auth.account.remember", language=lang))
+        style_button(import_btn, primary=False)
+        style_button(remember_btn, primary=bool(remember_me_var.get()), active=not bool(remember_me_var.get()))
         dashboard_btn.configure(text="Open dashboard" if lang != "fr" else "Ouvrir le tableau de bord")
         reset_btn.configure(text="Reset password" if lang != "fr" else "Reinitialiser le mot de passe")
         model_label.configure(text="Preferred model" if lang != "fr" else "Modele prefere")
@@ -5392,7 +5627,18 @@ def prompt_account_auth_dialog_tk(initial_email="", initial_password="", initial
 
 
 def build_account_auth_shell_state(initial_email="", initial_password="", initial_blob_size="medium", initial_error=""):
+    record = load_config_record()
     preferred_model = normalize_pro_model(selected_pro_model_key)
+    remembered = normalize_remember_me_preference(record.get("remember_me", remember_me_enabled))
+    remembered_password = ""
+    if remembered and not str(initial_password or ""):
+        remembered_password = load_saved_secret(record, "remembered_password", "remembered_password_dpapi")
+    live_session_email = ""
+    live_session_token = ""
+    with session_lock:
+        if session_active:
+            live_session_email = normalize_account_email(user_email)
+            live_session_token = str(session_token or "").strip()
     return {
         "language": normalize_language(ui_language),
         "theme": normalize_theme_preference(ui_theme_preference),
@@ -5404,7 +5650,10 @@ def build_account_auth_shell_state(initial_email="", initial_password="", initia
         "hotkeys": dict(command_hotkeys),
         "hotkey_mode": command_key_mode,
         "email": normalize_account_email(initial_email),
-        "password": str(initial_password or ""),
+        "password": str(initial_password or remembered_password or ""),
+        "remember_me": bool(remembered),
+        "live_session_email": live_session_email,
+        "live_session_token": live_session_token,
         "error_message": str(initial_error or ""),
     }
 
@@ -5439,6 +5688,7 @@ def run_auth_shell_webview(initial_state):
         return {"__fallback__": "tk", "__reason__": "missing_webview"}
 
     bridge = AuthShellBridge()
+    bridge._initial_state = dict(initial_state or {})
     title = tr("auth.window_title", language=normalize_language(initial_state.get("language", ui_language)))
     geometry = auth_shell_window_geometry()
     try:
@@ -5597,6 +5847,7 @@ def prompt_startup_auth(
         result.setdefault("pro_model", normalize_pro_model(selected_pro_model_key))
         result.setdefault("hotkeys", dict(command_hotkeys))
         result.setdefault("hotkey_mode", command_key_mode)
+        result.setdefault("remember_me", bool(remember_me_enabled))
     startup_progress_show()
     return result
 
@@ -5637,7 +5888,12 @@ def open_settings_menu(hide_indicator_temporarily=False):
         previous_model = normalize_pro_model(selected_pro_model_key)
         if auth_changed:
             try:
-                ok, message = authenticate_account_session(selected_email or current_email, selected_password)
+                ok, message = authenticate_account_session(
+                    selected_email or current_email,
+                    selected_password,
+                    remember_me=bool(selected.get("remember_me", remember_me_enabled)),
+                    auth_snapshot=selected.get("auth_snapshot"),
+                )
             except Exception as exc:
                 ok, message = False, str(exc)
             if not ok:
@@ -5648,6 +5904,7 @@ def open_settings_menu(hide_indicator_temporarily=False):
                 return
         else:
             apply_auth_dialog_selection(selected, persist=True)
+            sync_remember_me_preference(bool(selected.get("remember_me", remember_me_enabled)), selected_password)
             if normalize_pro_model(selected_pro_model_key) != previous_model and api_key:
                 if not ensure_api_mode_ready():
                     return
@@ -5732,6 +5989,7 @@ def resolve_auth_settings():
     global ui_language, indicator_position_key, selected_pro_model_key, session_status_text
     global command_hotkeys, command_hotkeys_customized, command_key_mode, startup_loading_screen_enabled
     global ui_theme_preference, user_email, session_id, session_token, session_active, model_name
+    global remember_me_enabled
     record = load_config_record()
     env_language_raw = os.environ.get("EAE_LANGUAGE", "").strip()
     env_theme_raw = os.environ.get("EAE_THEME", "").strip()
@@ -5739,8 +5997,15 @@ def resolve_auth_settings():
     env_position_raw = os.environ.get("EAE_INDICATOR_POSITION", "").strip()
     env_startup_screen_raw = os.environ.get("EAE_SHOW_STARTUP_SCREEN", "").strip()
     env_blob_size = normalize_indicator_blob_size(env_blob_size_raw) if env_blob_size_raw else ""
-    saved_api_key = load_saved_secret(record, "api_key", "api_key_dpapi")
-    saved_session_token = load_saved_secret(record, "session_token", "session_token_dpapi")
+    remember_me_enabled = normalize_remember_me_preference(record.get("remember_me", False))
+    if not remember_me_enabled and (
+        str(record.get("session_token_dpapi", "") or "").strip()
+        or str(record.get("api_key_dpapi", "") or "").strip()
+        or str(record.get("remembered_password_dpapi", "") or "").strip()
+    ):
+        record = clear_persisted_account_auth(record, clear_email=False)
+    saved_api_key = load_saved_secret(record, "api_key", "api_key_dpapi") if remember_me_enabled else ""
+    saved_session_token = load_saved_secret(record, "session_token", "session_token_dpapi") if remember_me_enabled else ""
     saved_blob_size = normalize_indicator_blob_size(record.get("indicator_blob_size", ""))
     saved_language = normalize_language(record.get("ui_language", ui_language))
     saved_theme = normalize_theme_preference(record.get("ui_theme", ui_theme_preference))
@@ -5761,6 +6026,7 @@ def resolve_auth_settings():
     record["server_url"] = DEFAULT_SERVER_URL
     record["preferred_model"] = saved_pro_model
     record["pro_model"] = saved_pro_model
+    record["remember_me"] = bool(remember_me_enabled)
     record.pop("license_code", None)
     record.pop("license_code_dpapi", None)
     save_config_record(record)
@@ -5852,30 +6118,48 @@ def persist_runtime_preferences():
     save_config_record(record)
 
 
+def normalize_remote_preferences_payload(payload):
+    if not isinstance(payload, dict):
+        return {}
+    normalized_hotkeys, normalized_hotkey_mode, normalized_hotkeys_customized = resolve_command_hotkey_state(
+        payload.get("hotkeys"),
+        payload.get("hotkey_mode", command_key_mode),
+    )
+    return {
+        "language": normalize_language(payload.get("language", ui_language)),
+        "indicator_position": normalize_indicator_position(payload.get("indicator_position", indicator_position_key)),
+        "indicator_blob_size": normalize_indicator_blob_size(payload.get("indicator_blob_size", indicator_blob_size_key)),
+        "show_startup_screen": normalize_startup_loading_screen_enabled(
+            payload.get("show_startup_screen", startup_loading_screen_enabled)
+        ),
+        "preferred_model": normalize_pro_model(
+            payload.get("preferred_model", payload.get("pro_model", selected_pro_model_key))
+        ),
+        "pro_model": normalize_pro_model(
+            payload.get("preferred_model", payload.get("pro_model", selected_pro_model_key))
+        ),
+        "hotkeys": dict(normalized_hotkeys),
+        "hotkey_mode": normalized_hotkey_mode,
+        "hotkeys_customized": bool(normalized_hotkeys_customized),
+    }
+
+
 def apply_remote_preferences_payload(payload):
     global ui_language, indicator_position_key, indicator_blob_size_key, model_name
     global selected_pro_model_key, startup_loading_screen_enabled
     global command_hotkeys, command_hotkeys_customized, command_key_mode
-    if not isinstance(payload, dict):
+    normalized = normalize_remote_preferences_payload(payload)
+    if not normalized:
         return False
-
-    ui_language = normalize_language(payload.get("language", ui_language))
-    indicator_position_key = normalize_indicator_position(payload.get("indicator_position", indicator_position_key))
-    indicator_blob_size_key = normalize_indicator_blob_size(payload.get("indicator_blob_size", indicator_blob_size_key))
-    startup_loading_screen_enabled = normalize_startup_loading_screen_enabled(
-        payload.get("show_startup_screen", startup_loading_screen_enabled)
-    )
-    selected_pro_model_key = normalize_pro_model(
-        payload.get("preferred_model", payload.get("pro_model", selected_pro_model_key))
-    )
+    ui_language = normalized["language"]
+    indicator_position_key = normalized["indicator_position"]
+    indicator_blob_size_key = normalized["indicator_blob_size"]
+    startup_loading_screen_enabled = normalized["show_startup_screen"]
+    selected_pro_model_key = normalized["preferred_model"]
     model_name = normalize_pro_model(selected_pro_model_key) or DEFAULT_MODEL_NAME
-    remote_hotkeys, remote_hotkey_mode, remote_hotkeys_customized = resolve_command_hotkey_state(
-        payload.get("hotkeys"),
-        payload.get("hotkey_mode", command_key_mode),
-    )
-    command_hotkeys = dict(remote_hotkeys)
-    command_key_mode = remote_hotkey_mode
-    command_hotkeys_customized = bool(remote_hotkeys_customized)
+    command_hotkeys = dict(normalized["hotkeys"])
+    command_key_mode = normalized["hotkey_mode"]
+    command_hotkeys_customized = bool(normalized["hotkeys_customized"])
     persist_runtime_preferences()
     try:
         set_command_key_mode(command_key_mode)
@@ -5919,12 +6203,13 @@ def apply_auth_dialog_selection(selected, persist=True):
 
 
 def clear_account_session_state(clear_cached_api_key=False):
-    global session_id, session_token, session_active, api_key, auth_mode
+    global session_id, session_token, session_active, api_key, auth_mode, remember_me_enabled
     with session_lock:
         session_id = ""
         session_token = ""
         session_active = False
     auth_mode = "account"
+    remember_me_enabled = normalize_remember_me_preference(load_config_record().get("remember_me", False))
     if clear_cached_api_key:
         api_key = ""
     record = load_config_record()
@@ -5937,21 +6222,38 @@ def clear_account_session_state(clear_cached_api_key=False):
         clear_saved_secret(record, "api_key", "api_key_dpapi")
 
 
-def persist_account_session_state(email_value, session_id_value, session_token_value, api_key_value):
+def persist_account_session_state(email_value, session_id_value, session_token_value, api_key_value, password_value="", remember_me=False):
     record = load_config_record()
     record["auth_mode"] = "account"
     record["server_url"] = DEFAULT_SERVER_URL
     record["user_email"] = normalize_account_email(email_value)
     record["session_id"] = str(session_id_value or "").strip()
+    record["remember_me"] = bool(remember_me)
     record["preferred_model"] = normalize_pro_model(selected_pro_model_key)
     record["pro_model"] = normalize_pro_model(selected_pro_model_key)
     if device_id:
         record["device_id"] = device_id
     record.pop("license_code", None)
     record.pop("license_code_dpapi", None)
+    if not remember_me:
+        record["session_id"] = ""
+        record.pop("session_token", None)
+        record.pop("session_token_dpapi", None)
+        record.pop("api_key", None)
+        record.pop("api_key_dpapi", None)
+        record.pop("remembered_password", None)
+        record.pop("remembered_password_dpapi", None)
+        save_config_record(record)
+        return True
     if not save_secret(record, "session_token", "session_token_dpapi", str(session_token_value or "").strip()):
         return False
+    record = load_config_record()
+    record["remember_me"] = True
     if not save_secret(record, "api_key", "api_key_dpapi", str(api_key_value or "").strip()):
+        return False
+    record = load_config_record()
+    record["remember_me"] = True
+    if not save_secret(record, "remembered_password", "remembered_password_dpapi", str(password_value or "").strip()):
         return False
     return True
 
@@ -5985,24 +6287,27 @@ def push_remote_preferences():
         return False
 
 
-def pull_remote_preferences():
-    with session_lock:
-        local_token = str(session_token or "")
-    if not local_token:
+def pull_remote_preferences_with_token(local_token):
+    token_value = str(local_token or "").strip()
+    if not token_value:
         return None, ""
-
     try:
-        response = request_json("GET", "/api/v1/client/preferences", token=local_token, timeout=15)
+        response = request_json("GET", "/api/v1/client/preferences", token=token_value, timeout=15)
         if not response.ok:
             return None, ""
         data = decode_json_response(response, "Remote preferences")
     except Exception:
         logger.debug("Remote preference pull failed.", exc_info=True)
         return None, ""
-
     if not isinstance(data, dict):
         return None, ""
     return data.get("preferences"), str(data.get("preferences_updated_at", "") or "")
+
+
+def pull_remote_preferences():
+    with session_lock:
+        local_token = str(session_token or "")
+    return pull_remote_preferences_with_token(local_token)
 
 
 def sync_remote_preferences_after_auth(auth_data):
@@ -6016,58 +6321,20 @@ def sync_remote_preferences_after_auth(auth_data):
     return push_remote_preferences()
 
 
-def restore_cached_account_session():
-    global auth_mode, api_key, user_email, server_url
-    global session_id, session_token, session_active
-    record = load_config_record()
-    cached_email = normalize_account_email(record.get("user_email", ""))
-    cached_api_key = load_saved_secret(record, "api_key", "api_key_dpapi")
-    cached_session_token = load_saved_secret(record, "session_token", "session_token_dpapi")
-    cached_session_id = str(record.get("session_id", "") or "").strip()
-
-    if not cached_email or not cached_api_key or not cached_session_token:
-        return False
-
-    auth_mode = "account"
-    server_url = DEFAULT_SERVER_URL
-    user_email = cached_email
-    api_key = cached_api_key
-    with session_lock:
-        session_id = cached_session_id
-        session_token = cached_session_token
-        session_active = True
-
-    try:
-        response = request_json("GET", "/api/v1/client/preferences", token=cached_session_token, timeout=12)
-        if int(getattr(response, "status_code", 0) or 0) == 401:
-            clear_account_session_state(clear_cached_api_key=False)
-            return False
-        if response.ok:
-            payload = decode_json_response(response, "Remote preferences")
-            if isinstance(payload, dict):
-                apply_remote_preferences_payload(payload.get("preferences"))
-    except Exception:
-        logger.debug("Using cached local API key because preference sync could not be refreshed.", exc_info=True)
-
-    set_session_status(tr("status.code_active"), active=True)
-    return True
-
-
-def authenticate_account_session(email_value, password_value):
-    global auth_mode, server_url, api_key, user_email
-    global session_id, session_token, session_active
+def request_account_login_snapshot(email_value, password_value):
     normalized_email = normalize_account_email(email_value)
+    password_text = str(password_value or "")
     if not normalized_email:
-        return False, "Enter your account email."
-    if not str(password_value or ""):
-        return False, "Enter your password."
+        return False, tr("auth.validation.account.email.empty")
+    if not password_text:
+        return False, tr("auth.validation.account.password.empty")
 
     response = request_json(
         "POST",
         "/api/v1/client/login",
         json_payload={
             "email": normalized_email,
-            "password": str(password_value or ""),
+            "password": password_text,
             "device_id": device_id,
             "device_name": app_device_name(),
             "app_version": APP_VERSION,
@@ -6088,34 +6355,184 @@ def authenticate_account_session(email_value, password_value):
     if payload.get("api_key_required") or not isinstance(payload.get("api_key_bundle"), dict):
         open_dashboard_page("dashboard-app-access")
         return False, "Add your Gemini API key in the dashboard before using the desktop app."
-
     try:
-        decrypted_api_key = decode_account_api_key_bundle(payload.get("api_key_bundle"), password_value)
+        decrypted_api_key = decode_account_api_key_bundle(payload.get("api_key_bundle"), password_text)
     except Exception as exc:
         open_dashboard_page("dashboard-app-access")
         return False, str(exc)
-
     next_session_id = str(payload.get("session_id", "") or "").strip()
     next_session_token = str(payload.get("session_token", "") or "").strip()
     if not next_session_token:
         return False, "The website did not return a valid desktop session."
+    return True, {
+        "email": normalized_email,
+        "password": password_text,
+        "session_id": next_session_id,
+        "session_token": next_session_token,
+        "api_key": decrypted_api_key,
+        "message": str(payload.get("message", "") or "Signed in."),
+        "payload": payload,
+    }
 
+
+def request_account_preferences_preview(email_value, password_value="", live_session_token="", live_session_email=""):
+    normalized_email = normalize_account_email(email_value)
+    if not normalized_email:
+        return False, tr("auth.validation.account.email.empty")
+    preview_snapshot = None
+    remote_payload = None
+    remote_updated_at = ""
+    live_token = str(live_session_token or "").strip()
+    if live_token and normalized_email == normalize_account_email(live_session_email):
+        remote_payload, remote_updated_at = pull_remote_preferences_with_token(live_token)
+    if remote_payload is None:
+        ok, snapshot_or_message = request_account_login_snapshot(normalized_email, password_value)
+        if not ok:
+            return False, snapshot_or_message
+        preview_snapshot = snapshot_or_message
+        payload = preview_snapshot.get("payload") if isinstance(preview_snapshot, dict) else {}
+        remote_payload = payload.get("preferences") if isinstance(payload, dict) else None
+        remote_updated_at = str(payload.get("preferences_updated_at", "") or "") if isinstance(payload, dict) else ""
+        if remote_payload is None:
+            remote_payload, remote_updated_at = pull_remote_preferences_with_token(preview_snapshot.get("session_token"))
+    normalized_preferences = normalize_remote_preferences_payload(remote_payload)
+    if not normalized_preferences:
+        return False, "Could not import the synced settings from your account."
+    return True, {
+        "preferences": normalized_preferences,
+        "preferences_updated_at": remote_updated_at,
+        "auth_snapshot": preview_snapshot,
+    }
+
+
+def apply_authenticated_account_snapshot(snapshot, remember_me=False, password_value=""):
+    global auth_mode, server_url, api_key, user_email
+    global session_id, session_token, session_active, remember_me_enabled
+    if not isinstance(snapshot, dict):
+        return False, "Invalid account session."
+    normalized_email = normalize_account_email(snapshot.get("email", ""))
+    next_session_id = str(snapshot.get("session_id", "") or "").strip()
+    next_session_token = str(snapshot.get("session_token", "") or "").strip()
+    decrypted_api_key = str(snapshot.get("api_key", "") or "").strip()
+    if not normalized_email or not next_session_token or not decrypted_api_key:
+        return False, "The website did not return a valid desktop session."
     auth_mode = "account"
     server_url = DEFAULT_SERVER_URL
     user_email = normalized_email
     api_key = decrypted_api_key
+    remember_me_enabled = bool(remember_me)
     with session_lock:
         session_id = next_session_id
         session_token = next_session_token
         session_active = True
-
-    if not persist_account_session_state(normalized_email, next_session_id, next_session_token, decrypted_api_key):
+    if not persist_account_session_state(
+        normalized_email,
+        next_session_id,
+        next_session_token,
+        decrypted_api_key,
+        password_value=password_value or snapshot.get("password", ""),
+        remember_me=remember_me_enabled,
+    ):
         clear_account_session_state(clear_cached_api_key=True)
         return False, "Could not securely store the account session on this machine."
-
-    sync_remote_preferences_after_auth(payload)
+    sync_remote_preferences_after_auth(snapshot.get("payload"))
     set_session_status(tr("status.code_active"), active=True)
-    return True, str(payload.get("message", "") or "Signed in.")
+    return True, str(snapshot.get("message", "") or "Signed in.")
+
+
+def restore_cached_account_session():
+    global auth_mode, api_key, user_email, server_url, remember_me_enabled
+    global session_id, session_token, session_active
+    record = load_config_record()
+    remember_me_enabled = normalize_remember_me_preference(record.get("remember_me", False))
+    if not remember_me_enabled:
+        return False
+    cached_email = normalize_account_email(record.get("user_email", ""))
+    cached_api_key = load_saved_secret(record, "api_key", "api_key_dpapi")
+    cached_session_token = load_saved_secret(record, "session_token", "session_token_dpapi")
+    cached_session_id = str(record.get("session_id", "") or "").strip()
+    cached_password = load_saved_secret(record, "remembered_password", "remembered_password_dpapi")
+    if not cached_email:
+        return False
+    auth_mode = "account"
+    server_url = DEFAULT_SERVER_URL
+    if cached_api_key and cached_session_token:
+        user_email = cached_email
+        api_key = cached_api_key
+        with session_lock:
+            session_id = cached_session_id
+            session_token = cached_session_token
+            session_active = True
+        try:
+            response = request_json("GET", "/api/v1/client/preferences", token=cached_session_token, timeout=12)
+            if int(getattr(response, "status_code", 0) or 0) == 401:
+                if cached_password:
+                    ok, snapshot_or_message = request_account_login_snapshot(cached_email, cached_password)
+                    if ok:
+                        return bool(apply_authenticated_account_snapshot(snapshot_or_message, remember_me=True, password_value=cached_password)[0])
+                clear_persisted_account_auth(record, clear_email=False)
+                return False
+            if response.ok:
+                payload = decode_json_response(response, "Remote preferences")
+                if isinstance(payload, dict):
+                    apply_remote_preferences_payload(payload.get("preferences"))
+            set_session_status(tr("status.code_active"), active=True)
+            return True
+        except Exception:
+            logger.debug("Using cached local API key because preference sync could not be refreshed.", exc_info=True)
+            set_session_status(tr("status.code_active"), active=True)
+            return True
+    if cached_password:
+        ok, snapshot_or_message = request_account_login_snapshot(cached_email, cached_password)
+        if ok:
+            success, _message = apply_authenticated_account_snapshot(snapshot_or_message, remember_me=True, password_value=cached_password)
+            return bool(success)
+    clear_persisted_account_auth(record, clear_email=False)
+    return False
+
+
+def authenticate_account_session(email_value, password_value, remember_me=False, auth_snapshot=None):
+    normalized_email = normalize_account_email(email_value)
+    snapshot = auth_snapshot if isinstance(auth_snapshot, dict) else None
+    if not snapshot or normalize_account_email(snapshot.get("email", "")) != normalized_email:
+        ok, snapshot_or_message = request_account_login_snapshot(normalized_email, password_value)
+        if not ok:
+            return False, snapshot_or_message
+        snapshot = snapshot_or_message
+    return apply_authenticated_account_snapshot(snapshot, remember_me=remember_me, password_value=password_value)
+
+
+def sync_remember_me_preference(remember_me, password_value=""):
+    global remember_me_enabled
+    remember_me_enabled = bool(remember_me)
+    local_email = normalize_account_email(user_email)
+    local_api_key = str(api_key or "").strip()
+    local_session_id = ""
+    local_session_token = ""
+    local_active = False
+    with session_lock:
+        local_session_id = str(session_id or "").strip()
+        local_session_token = str(session_token or "").strip()
+        local_active = bool(session_active)
+    if not remember_me_enabled:
+        clear_persisted_account_auth(clear_email=False)
+        return True
+    if not local_email or not local_api_key or not local_session_token or not local_active:
+        record = load_config_record()
+        record["remember_me"] = True
+        save_config_record(record)
+        return True
+    stored_password = str(password_value or "").strip()
+    if not stored_password:
+        stored_password = load_saved_secret(load_config_record(), "remembered_password", "remembered_password_dpapi")
+    return persist_account_session_state(
+        local_email,
+        local_session_id,
+        local_session_token,
+        local_api_key,
+        password_value=stored_password,
+        remember_me=True,
+    )
 
 
 class _SimpleApiResponse:
@@ -6309,7 +6726,12 @@ def ensure_account_mode_ready():
 
         try:
             ok, message = run_startup_background_task(
-                lambda: authenticate_account_session(initial_email, password_value),
+                lambda: authenticate_account_session(
+                    initial_email,
+                    password_value,
+                    remember_me=bool(selected.get("remember_me", remember_me_enabled)),
+                    auth_snapshot=selected.get("auth_snapshot"),
+                ),
                 stage_key="startup.connecting_pro",
             )
         except Exception as exc:

@@ -18,7 +18,7 @@ UPSTREAM_OWNER = "microsoft"
 UPSTREAM_REPO = "winget-pkgs"
 FORK_OWNER = "Fedi-Must"
 PACKAGE_IDENTIFIER = "FediMust.EyesAndEars"
-PACKAGE_VERSION = "2.2.0"
+PACKAGE_VERSION = "2.5.0"
 BASE_BRANCH = "master"
 MANIFEST_LOCAL_FILES = (
     "packaging/winget/FediMust.EyesAndEars.yaml",

@@ -1,6 +1,6 @@
 # yaml-language-server: $schema=https://aka.ms/winget-manifest.defaultLocale.1.10.0.schema.json
 PackageIdentifier: FediMust.EyesAndEars
-PackageVersion: "2.2.0"
+PackageVersion: "2.5.0"
 PackageLocale: en-US
 Publisher: Fedi-Must
 PublisherUrl: https://github.com/Fedi-Must

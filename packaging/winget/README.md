@@ -1,20 +1,20 @@
 # Winget publish checklist
 
 1. Build the portable executable:
-   - `packaging\build-portable.cmd 2.2.0`
-2. Upload `dist\EyesAndEars-2.2.0-x64.exe` to a GitHub Release at:
-   - `https://github.com/Fedi-Must/EyesAndEars/releases/tag/v2.2.0`
+   - `packaging\build-portable.cmd 2.5.0`
+2. Upload `dist\EyesAndEars-2.5.0-x64.exe` to a GitHub Release at:
+   - `https://github.com/Fedi-Must/EyesAndEars/releases/tag/v2.5.0`
 3. Copy the SHA256 from the build output.
 4. Edit these files and replace placeholders:
    - `packaging/winget/FediMust.EyesAndEars.yaml`
    - `packaging/winget/FediMust.EyesAndEars.installer.yaml`
    - `packaging/winget/FediMust.EyesAndEars.locale.en-US.yaml`
 5. Run strict local preflight (line endings + hash + URL + `winget validate`):
-   - `python packaging\winget\submit-winget-pr.py --version 2.2.0 --preflight-only`
+   - `python packaging\winget\submit-winget-pr.py --version 2.5.0 --preflight-only`
 6. Test local install and uninstall:
    - `packaging\winget\test-install-uninstall.cmd FediMust.EyesAndEars`
 7. Submit/update the PR to `microsoft/winget-pkgs`:
-   - `python packaging\winget\submit-winget-pr.py --version 2.2.0`
+   - `python packaging\winget\submit-winget-pr.py --version 2.5.0`
 8. Verify PR labels include `Validation-Completed` and do not include `Validation-Line-Endings-Error`.
 
 The automation script normalizes manifest line endings before upload to prevent mixed EOL failures.
