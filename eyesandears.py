@@ -2682,20 +2682,26 @@ class StartupProgressWindow:
             return points
 
         def build_eye_curves():
-            half_width = float(max(64, (width // 2) - 36))
-            lid_height = float(max(7.0, 18.0 * open_ratio))
-            lid_sweep = 5.8 + (open_ratio * 1.8)
+            half_width = float(max(64, (width // 2) - 34))
+            upper_lid_height = float(max(9.5, 24.0 * open_ratio))
+            upper_lid_sweep = 4.8 + (open_ratio * 1.6)
+            lower_lid_height = float(max(5.5, 13.0 * open_ratio))
             left_corner = (center_x - half_width, float(center_y))
             right_corner = (center_x + half_width, float(center_y))
             top_curve = sample_cubic(
                 left_corner,
-                (center_x - (half_width * 0.58), center_y - lid_height - lid_sweep),
-                (center_x + (half_width * 0.58), center_y - lid_height - lid_sweep),
+                (center_x - (half_width * 0.58), center_y - upper_lid_height - upper_lid_sweep),
+                (center_x + (half_width * 0.58), center_y - upper_lid_height - upper_lid_sweep),
                 right_corner,
                 steps=72,
             )
-            mirror_y = int(center_y * antialias)
-            bottom_curve = [(x, (2 * mirror_y) - y) for x, y in top_curve]
+            bottom_curve = sample_cubic(
+                left_corner,
+                (center_x - (half_width * 0.54), center_y + lower_lid_height),
+                (center_x + (half_width * 0.54), center_y + lower_lid_height),
+                right_corner,
+                steps=72,
+            )
             return top_curve, bottom_curve
 
         outline = (241, 247, 255, 242)
