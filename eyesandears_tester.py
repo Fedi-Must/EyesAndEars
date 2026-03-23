@@ -1,0 +1,10197 @@
+import base64
+import csv
+import ctypes
+import html
+import ipaddress
+import io
+import json
+import logging
+import math
+import os
+import re
+import secrets
+import subprocess
+import sys
+import tempfile
+import time
+import webbrowser
+from ctypes import wintypes
+from datetime import datetime, timezone
+from pathlib import Path
+from threading import Event, Lock, Thread
+import tkinter as tk
+import tkinter.font as tkfont
+from urllib.parse import urlparse
+
+import keyboard
+import PIL.Image
+import PIL.ImageDraw
+import PIL.ImageGrab
+import PIL.ImageTk
+import pyperclip
+import requests
+from cryptography.hazmat.primitives.hashes import SHA256
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+try:
+    import pystray
+except Exception:
+    pystray = None
+
+try:
+    import psutil
+except Exception:
+    psutil = None
+
+try:
+    import winreg
+except Exception:
+    winreg = None
+
+try:
+    import webview
+except Exception:
+    webview = None
+
+
+def has_pywebview_support():
+    return bool(
+        webview is not None
+        and callable(getattr(webview, "create_window", None))
+        and callable(getattr(webview, "start", None))
+    )
+
+
+def resolve_pywebview_start_kwargs():
+    gui_override = str(os.environ.get("EAE_PYWEBVIEW_GUI", "") or "").strip().lower()
+    start_kwargs = {"private_mode": True}
+    if gui_override:
+        start_kwargs["gui"] = gui_override
+    return start_kwargs
+
+APP_NAME = "EyesAndEars Tester"
+APP_VERSION = "2.5.0"
+AUTH_SHELL_SUBPROCESS_FLAG = "--auth-shell-dialog"
+STARTUP_SPLASH_SUBPROCESS_FLAG = "--startup-splash-dialog"
+STARTUP_SPLASH_READY_FILE_NAME = "ready.flag"
+STARTUP_SPLASH_READY_TIMEOUT_SECONDS = 8.0
+STARTUP_SPLASH_READY_POLL_SECONDS = 0.04
+if not logging.getLogger().handlers:
+    logging.basicConfig(level=logging.WARNING, format="%(levelname)s [%(name)s] %(message)s")
+logger = logging.getLogger(APP_NAME)
+
+CONFIG_FILE_NAME = "config.json"
+CONFIG_SAVE_RETRY_COUNT = 12
+CONFIG_SAVE_RETRY_DELAY_SECONDS = 0.08
+HARDCODED_SERVER_URL = os.environ.get(
+    "EAE_SERVER_URL",
+    "https://eyesandears-platform-vercel.vercel.app",
+).strip()
+DEFAULT_SERVER_URL = HARDCODED_SERVER_URL.strip().rstrip("/")
+DEFAULT_WEBSITE_URL = os.environ.get("EAE_WEBSITE_URL", DEFAULT_SERVER_URL).strip().rstrip("/") or DEFAULT_SERVER_URL
+FREE_MODEL_NAME = "gemini-2.5-flash"
+DEFAULT_MODEL_NAME = FREE_MODEL_NAME
+DEFAULT_WINGET_PACKAGE_ID = os.environ.get("EYESANDEARS_WINGET_ID", "").strip()
+DEFAULT_RELEASE_REPO = os.environ.get("EYESANDEARS_RELEASE_REPO", "Fedi-Must/EyesAndEars").strip() or "Fedi-Must/EyesAndEars"
+DEFAULT_RELEASES_API_URL = os.environ.get(
+    "EYESANDEARS_RELEASES_API_URL",
+    f"https://api.github.com/repos/{DEFAULT_RELEASE_REPO}/releases/latest",
+).strip()
+DEFAULT_RELEASES_PAGE_URL = os.environ.get(
+    "EYESANDEARS_RELEASES_PAGE_URL",
+    f"https://github.com/{DEFAULT_RELEASE_REPO}/releases/latest",
+).strip()
+AUTO_UPDATE_ENABLED = os.environ.get("EYESANDEARS_AUTO_UPDATE", "1").strip().lower() not in {"0", "false", "no", "off"}
+SELF_UNINSTALL_DELAY_SECONDS = 2
+API_KEY_ENV_FALLBACK = ("EYESANDEARS_API_KEY", "EAE_API_KEY")
+PRO_MODELS_ENV = "EAE_PRO_MODELS_JSON"
+TRUSTED_TIME_URLS_ENV = "EAE_TRUSTED_TIME_URLS"
+HTTP_SESSION = requests.Session()
+DEFAULT_TRUSTED_TIME_URLS = (
+    "https://worldtimeapi.org/api/timezone/Etc/UTC",
+    "https://timeapi.io/api/Time/current/zone?timeZone=UTC",
+)
+TRUSTED_TIME_URLS = tuple(
+    url
+    for url in (
+        part.strip()
+        for part in str(os.environ.get(TRUSTED_TIME_URLS_ENV, "") or "").split(",")
+    )
+    if url
+) or DEFAULT_TRUSTED_TIME_URLS
+
+SW_HIDE = 0
+SW_MINIMIZE = 6
+SW_RESTORE = 9
+SW_MAXIMIZE = 3
+WM_SYSCOMMAND = 0x0112
+SC_SIZE = 0xF000
+SC_MOVE = 0xF010
+SC_MAXIMIZE = 0xF030
+SC_RESTORE = 0xF120
+CRYPTPROTECT_UI_FORBIDDEN = 0x01
+FAST_UPLOAD_JPEG_QUALITY = 82
+ANSWER_PREVIEW_RETENTION_SECONDS = 5.0
+TRUSTED_TIME_TIMEOUT_SECONDS = 8
+PRO_AUTH_FAILURE_WINDOW_SECONDS = 30 * 60
+PRO_AUTH_LOCKOUT_BASE_SECONDS = 30
+PRO_AUTH_FIRST_LOCKOUT_FAILURE = 3
+PRO_AUTH_HARD_LOCKOUT_FAILURE = 9
+PRO_AUTH_HARD_LOCKOUT_SECONDS = 24 * 60 * 60
+PRO_AUTH_HIDDEN_DIR_NAME = ".runtime"
+PRO_AUTH_HIDDEN_FILE_NAME = "session.idx"
+INVALID_FILE_ATTRIBUTES = 0xFFFFFFFF
+FILE_ATTRIBUTE_HIDDEN = 0x2
+FILE_ATTRIBUTE_NOT_CONTENT_INDEXED = 0x2000
+WM_NCLBUTTONDOWN = 0x00A1
+HTCAPTION = 2
+HTLEFT = 10
+HTRIGHT = 11
+HTTOP = 12
+HTTOPLEFT = 13
+HTTOPRIGHT = 14
+HTBOTTOM = 15
+HTBOTTOMLEFT = 16
+HTBOTTOMRIGHT = 17
+HWND_TOPMOST = -1
+SWP_NOACTIVATE = 0x0010
+SWP_SHOWWINDOW = 0x0040
+
+PROMPT_TEXT = (
+    "Analyze the image provided. Your goal is to provide the direct answer/solution and NOTHING else.\n\n"
+    "RULES:\n"
+    "1. If it is a Multiple Choice Question: Output ONLY the correct letter (e.g., 'A', 'B'). Do not write the text of the option.\n"
+    "2. If it is a coding error/task: Output ONLY the corrected code block. Do not use Markdown formatting (no python ... ). Just the raw code ready to run.\n"
+    "3. If it is a general question: Output ONLY the direct answer.\n"
+    "4. ABSOLUTELY NO conversational filler, no 'Here is the answer', no explanations, no markdown backticks.\n"
+    "5. If unclear, find the most likely question on screen and answer it."
+)
+
+current_answer = ""
+current_index = 0
+last_answer = ""
+is_processing = False
+is_paused = False
+pause_pending = False
+typing_hook = None
+write_lock = Lock()
+processing_lock = Lock()
+answer_epoch_lock = Lock()
+answer_epoch = 0
+hotkey_block_until = {
+    "primary": 0.0,
+    "indicator": 0.0,
+    "clear_ctx": 0.0,
+    "paste_all": 0.0,
+    "repeat_prev": 0.0,
+    "exit": 0.0,
+}
+NUMPAD_SCAN_TO_ACTION = {
+    79: "primary",      # Numpad 1 / End
+    82: "indicator",    # Numpad 0 / Insert
+    80: "clear_ctx",    # Numpad 2 / Down
+    81: "paste_all",    # Numpad 3 / PageDown
+    75: "repeat_prev",  # Numpad 4 / Left
+    73: "exit",         # Numpad 9 / PageUp
+}
+TOPROW_SCAN_TO_ACTION = {
+    2: "primary",       # 1
+    11: "indicator",    # 0
+    3: "clear_ctx",     # 2
+    4: "paste_all",     # 3
+    5: "repeat_prev",   # 4
+    10: "exit",         # 9
+}
+HOTKEY_ACTION_ORDER = (
+    "primary",
+    "indicator",
+    "clear_ctx",
+    "paste_all",
+    "repeat_prev",
+    "exit",
+)
+DEFAULT_COMMAND_HOTKEYS = {
+    "numpad": {
+        "primary": "numpad1",
+        "indicator": "numpad0",
+        "clear_ctx": "numpad2",
+        "paste_all": "numpad3",
+        "repeat_prev": "numpad4",
+        "exit": "numpad9",
+    },
+    "toprow": {
+        "primary": "digit1",
+        "indicator": "digit0",
+        "clear_ctx": "digit2",
+        "paste_all": "digit3",
+        "repeat_prev": "digit4",
+        "exit": "digit9",
+    },
+}
+ALLOWED_HOTKEY_BINDINGS = {
+    "escape": {"scan_code": 1, "keypad": None, "label": "Esc"},
+    "digit1": {"scan_code": 2, "keypad": False, "label": "1"},
+    "digit2": {"scan_code": 3, "keypad": False, "label": "2"},
+    "digit3": {"scan_code": 4, "keypad": False, "label": "3"},
+    "digit4": {"scan_code": 5, "keypad": False, "label": "4"},
+    "digit5": {"scan_code": 6, "keypad": False, "label": "5"},
+    "digit6": {"scan_code": 7, "keypad": False, "label": "6"},
+    "digit7": {"scan_code": 8, "keypad": False, "label": "7"},
+    "digit8": {"scan_code": 9, "keypad": False, "label": "8"},
+    "digit9": {"scan_code": 10, "keypad": False, "label": "9"},
+    "digit0": {"scan_code": 11, "keypad": False, "label": "0"},
+    "tab": {"scan_code": 15, "keypad": None, "label": "Tab"},
+    "space": {"scan_code": 57, "keypad": None, "label": "Space"},
+    "f1": {"scan_code": 59, "keypad": None, "label": "F1"},
+    "f2": {"scan_code": 60, "keypad": None, "label": "F2"},
+    "f3": {"scan_code": 61, "keypad": None, "label": "F3"},
+    "f4": {"scan_code": 62, "keypad": None, "label": "F4"},
+    "f5": {"scan_code": 63, "keypad": None, "label": "F5"},
+    "f6": {"scan_code": 64, "keypad": None, "label": "F6"},
+    "f7": {"scan_code": 65, "keypad": None, "label": "F7"},
+    "f8": {"scan_code": 66, "keypad": None, "label": "F8"},
+    "f9": {"scan_code": 67, "keypad": None, "label": "F9"},
+    "f10": {"scan_code": 68, "keypad": None, "label": "F10"},
+    "home": {"scan_code": 71, "keypad": False, "label": "Home"},
+    "numpad7": {"scan_code": 71, "keypad": True, "label": "Num 7"},
+    "arrowup": {"scan_code": 72, "keypad": False, "label": "Up"},
+    "numpad8": {"scan_code": 72, "keypad": True, "label": "Num 8"},
+    "pageup": {"scan_code": 73, "keypad": False, "label": "PgUp"},
+    "numpad9": {"scan_code": 73, "keypad": True, "label": "Num 9"},
+    "numpadsubtract": {"scan_code": 74, "keypad": True, "label": "Num -"},
+    "arrowleft": {"scan_code": 75, "keypad": False, "label": "Left"},
+    "numpad4": {"scan_code": 75, "keypad": True, "label": "Num 4"},
+    "numpad5": {"scan_code": 76, "keypad": True, "label": "Num 5"},
+    "arrowright": {"scan_code": 77, "keypad": False, "label": "Right"},
+    "numpad6": {"scan_code": 77, "keypad": True, "label": "Num 6"},
+    "numpadadd": {"scan_code": 78, "keypad": True, "label": "Num +"},
+    "end": {"scan_code": 79, "keypad": False, "label": "End"},
+    "numpad1": {"scan_code": 79, "keypad": True, "label": "Num 1"},
+    "arrowdown": {"scan_code": 80, "keypad": False, "label": "Down"},
+    "numpad2": {"scan_code": 80, "keypad": True, "label": "Num 2"},
+    "pagedown": {"scan_code": 81, "keypad": False, "label": "PgDn"},
+    "numpad3": {"scan_code": 81, "keypad": True, "label": "Num 3"},
+    "insert": {"scan_code": 82, "keypad": False, "label": "Insert"},
+    "numpad0": {"scan_code": 82, "keypad": True, "label": "Num 0"},
+    "delete": {"scan_code": 83, "keypad": False, "label": "Delete"},
+    "numpaddecimal": {"scan_code": 83, "keypad": True, "label": "Num ."},
+    "numpadenter": {"scan_code": 28, "keypad": True, "label": "Num Enter"},
+    "numpadmultiply": {"scan_code": 55, "keypad": True, "label": "Num *"},
+    "numpaddivide": {"scan_code": 53, "keypad": True, "label": "Num /"},
+    "f11": {"scan_code": 87, "keypad": None, "label": "F11"},
+    "f12": {"scan_code": 88, "keypad": None, "label": "F12"},
+}
+DEFAULT_HOTKEY_MODE = "numpad"
+POST_TYPE_GUARD_SECONDS = ANSWER_PREVIEW_RETENTION_SECONDS
+
+command_key_mode = DEFAULT_HOTKEY_MODE
+command_hotkeys = dict(DEFAULT_COMMAND_HOTKEYS[DEFAULT_HOTKEY_MODE])
+command_hotkeys_customized = False
+command_key_hooks = []
+command_mode_probe_hook = None
+command_probe_window_start = 0.0
+command_probe_attempt_count = 0
+command_probe_last_scan = -1
+command_numpad_seen = False
+
+post_type_guard_lock = Lock()
+post_type_guard_hook = None
+post_type_guard_active = False
+post_type_guard_until = 0.0
+post_type_guard_mouse = None
+post_type_guard_stop = Event()
+post_type_guard_thread = None
+typing_pressed_scancodes = set()
+typing_pressed_lock = Lock()
+progress_ui_lock = Lock()
+progress_ui_last_update = 0.0
+progress_ui_last_index = -1
+PROGRESS_UI_MIN_INTERVAL = 0.035
+PROGRESS_UI_MIN_STEP = 2
+PROCESS_SNAPSHOT_CACHE_SECONDS = 4.0
+
+auth_mode = "account"
+server_url = DEFAULT_SERVER_URL
+api_key = ""
+model_name = DEFAULT_MODEL_NAME
+device_id = ""
+ui_language = "en"
+indicator_position_key = "bottom_right"
+selected_pro_model_key = ""
+ui_theme_preference = "system"
+
+session_lock = Lock()
+session_id = ""
+session_token = ""
+session_status_text = "Not authenticated"
+session_active = False
+user_email = ""
+remember_me_enabled = False
+
+local_model = None
+local_chat_session = None
+api_backend_name = "none"
+update_state_lock = Lock()
+update_check_started = False
+update_in_progress = False
+
+tray_icon = None
+indicator = None
+privacy_guard_thread = None
+privacy_guard_stop_event = Event()
+privacy_forced_hidden = False
+indicator_manual_hidden = False
+indicator_capture_protected = False
+startup_progress_window = None
+startup_progress_lock = Lock()
+settings_window_lock = Lock()
+settings_window_open = False
+config_file_lock = Lock()
+pro_auth_guard_lock = Lock()
+process_snapshot_cache_lock = Lock()
+process_snapshot_cache_at = 0.0
+process_snapshot_cache_running = set()
+process_snapshot_cache_pid = {}
+indicator_blob_size_key = str(os.environ.get("EAE_BLOB_SIZE", "medium")).strip().lower().replace("-", "_").replace(" ", "_")
+if indicator_blob_size_key not in {"very_small", "small", "medium", "large"}:
+    indicator_blob_size_key = "medium"
+
+INDICATOR_VISIBLE_BY_DEFAULT = os.environ.get("EAE_SHOW_INDICATOR", "").strip().lower() not in {"0", "false", "no", "off"}
+startup_loading_screen_enabled = os.environ.get("EAE_SHOW_STARTUP_SCREEN", "").strip().lower() not in {"0", "false", "no", "off"}
+HIDE_INDICATOR_FROM_CAPTURE = os.environ.get("EAE_HIDE_INDICATOR_FROM_CAPTURE", "").strip().lower() not in {"0", "false", "no", "off"}
+STRICT_PRIVACY_FALLBACK = os.environ.get("EAE_STRICT_PRIVACY_FALLBACK", "").strip().lower() in {"1", "true", "yes", "on"}
+capture_privacy_enabled = bool(HIDE_INDICATOR_FROM_CAPTURE)
+PRIVACY_GUARD_INTERVAL_SECONDS = 2.0
+PRIVACY_GUARD_PROCESSES = {
+    "discord.exe",
+    "obs64.exe",
+    "obs32.exe",
+    "teams.exe",
+    "ms-teams.exe",
+    "zoom.exe",
+    "webexmta.exe",
+    "slack.exe",
+}
+PRIVACY_MEET_BROWSERS = {
+    "chrome.exe",
+    "msedge.exe",
+    "brave.exe",
+    "opera.exe",
+    "firefox.exe",
+}
+PRIVACY_MEET_WINDOW_KEYWORDS = ("google meet", " meet", "meet ")
+
+UI_BG = "#E6EDF8"
+UI_CARD_BG = "#F4F8FF"
+UI_PANEL_BG = "#FFFFFF"
+UI_FIELD_BG = "#F9FBFF"
+UI_TEXT = "#102A56"
+UI_MUTED = "#4C6082"
+UI_BORDER = "#C7D7F2"
+UI_SOFT = "#DEE9FF"
+UI_PRIMARY = "#1459D9"
+UI_PRIMARY_ACTIVE = "#0F46AD"
+UI_PRIMARY_SOFT = "#9FBBF5"
+UI_GHOST_BG = "#EDF3FF"
+UI_GHOST_ACTIVE = "#DFEAFE"
+UI_DANGER = "#BA1A1A"
+UI_ACCENT = "#1C77FF"
+UI_FONT = "Segoe UI Variable Text"
+UI_GLASS = "#0C1730"
+UI_GLASS_ALT = "#122344"
+UI_SUCCESS = "#1BB56D"
+UI_WARNING = "#E6B800"
+UI_PAUSE = "#3C91FF"
+UI_READY = "#00D25E"
+UI_NEUTRAL = "#5F6980"
+INDICATOR_BLOB_SIZES = {
+    "very_small": 12,
+    "small": 16,
+    "medium": 20,
+    "large": 26,
+}
+INDICATOR_BLOB_SIZE_LABELS = {
+    "very_small": "Very Small",
+    "small": "Small",
+    "medium": "Medium",
+    "large": "Large",
+}
+INDICATOR_READY_BURST_SECONDS = 0.54
+INDICATOR_POSITIONS = {
+    "top_left": {"x": "left", "y": "top"},
+    "top_center": {"x": "center", "y": "top"},
+    "top_right": {"x": "right", "y": "top"},
+    "left_center": {"x": "left", "y": "center"},
+    "right_center": {"x": "right", "y": "center"},
+    "bottom_left": {"x": "left", "y": "bottom"},
+    "bottom_center": {"x": "center", "y": "bottom"},
+    "bottom_right": {"x": "right", "y": "bottom"},
+}
+INDICATOR_PREVIEW_POINTS = {
+    "top_left": {"x": 0.12, "y": 0.17},
+    "top_center": {"x": 0.50, "y": 0.17},
+    "top_right": {"x": 0.88, "y": 0.17},
+    "left_center": {"x": 0.12, "y": 0.50},
+    "right_center": {"x": 0.88, "y": 0.50},
+    "bottom_left": {"x": 0.12, "y": 0.83},
+    "bottom_center": {"x": 0.50, "y": 0.83},
+    "bottom_right": {"x": 0.88, "y": 0.83},
+}
+INDICATOR_MARGIN_X = 10
+INDICATOR_MARGIN_Y = 50
+ui_crisp_mode_initialized = False
+system_dark_theme_enabled = False
+
+
+LIGHT_THEME = {
+    "UI_BG": "#E6EDF8",
+    "UI_CARD_BG": "#F4F8FF",
+    "UI_PANEL_BG": "#FFFFFF",
+    "UI_FIELD_BG": "#F9FBFF",
+    "UI_TEXT": "#102A56",
+    "UI_MUTED": "#4C6082",
+    "UI_BORDER": "#C7D7F2",
+    "UI_SOFT": "#DEE9FF",
+    "UI_PRIMARY": "#1459D9",
+    "UI_PRIMARY_ACTIVE": "#0F46AD",
+    "UI_PRIMARY_SOFT": "#9FBBF5",
+    "UI_GHOST_BG": "#EDF3FF",
+    "UI_GHOST_ACTIVE": "#DFEAFE",
+    "UI_DANGER": "#BA1A1A",
+    "UI_ACCENT": "#1C77FF",
+    "UI_GLASS": "#0C1730",
+    "UI_GLASS_ALT": "#122344",
+    "UI_SUCCESS": "#1BB56D",
+    "UI_WARNING": "#E6B800",
+    "UI_PAUSE": "#3C91FF",
+    "UI_READY": "#00D25E",
+    "UI_NEUTRAL": "#5F6980",
+}
+
+
+DARK_THEME = {
+    "UI_BG": "#0A1220",
+    "UI_CARD_BG": "#101C31",
+    "UI_PANEL_BG": "#13233C",
+    "UI_FIELD_BG": "#162840",
+    "UI_TEXT": "#F2F7FF",
+    "UI_MUTED": "#A8BCD9",
+    "UI_BORDER": "#24395B",
+    "UI_SOFT": "#193254",
+    "UI_PRIMARY": "#4B9DFF",
+    "UI_PRIMARY_ACTIVE": "#2E82E8",
+    "UI_PRIMARY_SOFT": "#244775",
+    "UI_GHOST_BG": "#15253D",
+    "UI_GHOST_ACTIVE": "#1C3152",
+    "UI_DANGER": "#FF8F8F",
+    "UI_ACCENT": "#66AEFF",
+    "UI_GLASS": "#081321",
+    "UI_GLASS_ALT": "#0E1D34",
+    "UI_SUCCESS": "#3DDB8A",
+    "UI_WARNING": "#F4C95D",
+    "UI_PAUSE": "#65A9FF",
+    "UI_READY": "#41E17E",
+    "UI_NEUTRAL": "#7A869B",
+}
+
+TRANSLATIONS = {
+    "en": {
+        "lang.en": "English",
+        "lang.fr": "French",
+        "dialog.heading.info": "Information",
+        "dialog.heading.error": "Something needs attention",
+        "dialog.heading.retry": "Connection issue",
+        "dialog.ok": "OK",
+        "dialog.retry": "Retry",
+        "dialog.quit": "Quit",
+        "dialog.retry_login": "Retry login",
+        "dialog.cancel": "Cancel",
+        "startup.title": "Starting EyesAndEars",
+        "startup.subtitle": "Preparing your private desktop assistant",
+        "startup.launching": "Launching",
+        "startup.restoring": "Restoring your preferences",
+        "startup.opening_setup": "Opening setup",
+        "startup.checking_auth": "Checking your sign-in mode",
+        "startup.connecting_pro": "Signing in",
+        "startup.initializing_model": "Initializing AI backend",
+        "startup.starting_indicator": "Starting indicator",
+        "startup.ready": "Ready",
+        "startup.detail.launching": "Loading interface",
+        "startup.detail.restoring": "Restoring saved settings and secure secrets",
+        "startup.detail.opening_setup": "Waiting for your setup choices",
+        "startup.detail.checking_auth": "Validating the selected access mode",
+        "startup.detail.connecting_pro": "Signing in to your account",
+        "startup.detail.initializing_model": "Checking your API key and model runtime",
+        "startup.detail.starting_indicator": "Starting the floating capture indicator",
+        "startup.detail.ready": "EyesAndEars is ready",
+        "auth.window_title": "EyesAndEars Setup",
+        "auth.window_caption": "Setup",
+        "auth.title": "Eyes & Ears",
+        "auth.subtitle": "Modern desktop capture assistant with private local controls.",
+        "auth.settings": "Settings",
+        "auth.settings.copy": "Language, startup screen, indicator location, appearance, and hotkeys.",
+        "auth.settings.done": "Done",
+        "auth.open_site": "Open website",
+        "auth.window.minimize": "Minimize",
+        "auth.window.maximize": "Maximize",
+        "auth.window.restore": "Restore",
+        "auth.window.close": "Close",
+        "auth.language": "Language",
+        "auth.mode.free": "Free mode",
+        "auth.mode.free.help": "Use your own Gemini API key",
+        "auth.mode.pro": "Account mode",
+        "auth.mode.pro.help": "Use your website account",
+        "auth.section.startup": "Startup",
+        "auth.startup_screen.label": "Loading screen",
+        "auth.startup_screen.copy": "Disable this to launch directly without the animated splash screen.",
+        "auth.startup_screen.enabled": "Enabled",
+        "auth.startup_screen.disabled": "Disabled",
+        "auth.section.appearance": "Appearance",
+        "auth.section.theme": "Theme",
+        "auth.theme.copy": "Pick whether the setup windows follow your system or stay in one mode.",
+        "theme.system": "System",
+        "theme.dark": "Dark",
+        "theme.light": "Light",
+        "auth.section.indicator_size": "Indicator size",
+        "auth.section.indicator_position": "Indicator placement",
+        "auth.section.free": "Use your own Gemini API key",
+        "auth.section.pro": "Sign in with your account",
+        "auth.section.hotkeys": "Hotkeys",
+        "auth.hotkeys.copy": "Click an action, then press the replacement key. Letters are not allowed.",
+        "auth.hotkeys.waiting": "Press a new key...",
+        "auth.hotkeys.invalid": "Letters and unsupported keys are not allowed here.",
+        "auth.hotkeys.duplicate": "That key is already assigned to another action.",
+        "auth.hotkeys.reset": "Reset to default numpad",
+        "auth.hotkeys.reset_done": "Default numpad controls restored.",
+        "auth.hotkey.primary": "Capture / Pause / Resume",
+        "auth.hotkey.indicator": "Toggle indicator",
+        "auth.hotkey.clear_ctx": "Clear pending",
+        "auth.hotkey.paste_all": "Paste remaining",
+        "auth.hotkey.repeat_prev": "Repeat previous",
+        "auth.hotkey.exit": "Quit",
+        "auth.hotkey.settings": "Double-click Open settings",
+        "auth.api.label": "Gemini API key",
+        "auth.api.placeholder": "Paste your Gemini API key",
+        "auth.api.paste": "Paste",
+        "auth.api.show": "Show",
+        "auth.api.hide": "Hide",
+        "auth.api.link": "Don't have a key ? Get one here",
+        "auth.api.note": "Stored locally with Windows data protection (DPAPI).",
+        "auth.api.helper": "We verify your key by initializing Gemini. A local format check only blocks obvious garbage.",
+        "auth.pro.label": "Account access",
+        "auth.pro.placeholder": "Use the account sign-in window",
+        "auth.pro.note": "Desktop access now uses your website email and password.",
+        "auth.account.title": "Website account",
+        "auth.account.copy": "Sign in with your website email and password. Your Gemini API key stays encrypted in the dashboard and is decrypted locally on this device.",
+        "auth.account.email": "Email",
+        "auth.account.email.placeholder": "name@example.com",
+        "auth.account.password": "Password",
+        "auth.account.password.placeholder": "Enter your website password",
+        "auth.account.import": "Import user settings",
+        "auth.account.import.loading": "Importing...",
+        "auth.account.remember": "Remember me",
+        "auth.account.dashboard": "Open dashboard",
+        "auth.account.reset": "Reset password",
+        "auth.account.helper": "Add or replace your Gemini API key from the dashboard whenever needed. You can leave the password blank when only changing local settings.",
+        "auth.pro.model": "Preferred model",
+        "auth.pro.model.note": "Current Gemini screenshot models that support direct text answers.",
+        "auth.preview.title": "Indicator location",
+        "auth.preview.copy": "The floating indicator stays native, smooth, and capture-protected.",
+        "auth.security": "Windows privacy protections and secure local secret storage stay enabled.",
+        "auth.continue": "Continue",
+        "auth.continue.loading": "Checking...",
+        "auth.cancel": "Cancel",
+        "auth.validation.api.empty": "Enter your Gemini API key.",
+        "auth.validation.api.short": "This key looks too short. Remove accidental truncation and try again.",
+        "auth.validation.api.whitespace": "Remove spaces or line breaks from the API key and try again.",
+        "auth.validation.api.shape": "This key still looks malformed. Check for extra characters and try again.",
+        "auth.validation.pro.empty": "Complete sign-in in the account window.",
+        "auth.validation.account.email.empty": "Enter your account email.",
+        "auth.validation.account.email.invalid": "Enter a valid email address.",
+        "auth.validation.account.password.empty": "Enter your password.",
+        "auth.status.free": "Free mode checks your API key locally on this device.",
+        "auth.status.pro": "Account mode signs you in through the website.",
+        "auth.status.account": "Desktop access uses your website account and local Gemini decryption.",
+        "position.top_left": "Top left",
+        "position.top_center": "Top center",
+        "position.top_right": "Top right",
+        "position.left_center": "Left center",
+        "position.right_center": "Right center",
+        "position.bottom_left": "Bottom left",
+        "position.bottom_center": "Bottom center",
+        "position.bottom_right": "Bottom right",
+        "size.very_small": "Very small",
+        "size.small": "Small",
+        "size.medium": "Medium",
+        "size.large": "Large",
+        "status.window_title": "EyesAndEars Status",
+        "status.mode": "Mode",
+        "status.mode.free": "Free mode",
+        "status.mode.pro": "Account mode",
+        "status.status": "Status",
+        "status.server": "Server",
+        "status.user": "User",
+        "status.code": "Code",
+        "status.backend": "Backend",
+        "status.model": "Model",
+        "status.api_key": "API key",
+        "status.pro_model": "Preferred model",
+        "status.not_set": "-",
+        "tray.open": "Open status",
+        "tray.toggle": "Toggle indicator",
+        "tray.capture_disable": "Allow screenshots for debugging",
+        "tray.capture_enable": "Re-enable screenshot hiding",
+        "tray.check_updates": "Check for updates",
+        "tray.quit": "Quit",
+        "tray.status": "Status: {status}",
+        "update.current": "EyesAndEars is already up to date.",
+        "update.available": "Updating to version {version}. EyesAndEars will restart.",
+        "update.failed": "Update failed: {detail}",
+        "error.save_code": "Could not securely save your code on this machine.",
+        "error.save_api": "Could not securely save your API key on this machine.",
+        "error.connect_server": "Could not connect to the server.\n{detail}",
+        "error.server_non_json": "The server returned an unexpected response ({status_code}).",
+        "error.auth_failed": "Authentication request failed ({status_code}). {detail}",
+        "error.auth_denied": "Authentication denied.",
+        "error.pro_lockout_wait": "Too many incorrect sign-in attempts. Try again in {seconds} seconds.",
+        "error.pro_lockout_locked": "Too many incorrect sign-in attempts. This device is locked for {seconds} seconds.",
+        "error.pro_time_unavailable": "Couldn't verify trusted online time. Check your connection and try again.",
+        "error.api_empty": "API key is empty.",
+        "error.no_sdk": "Could not initialize API mode.\n{detail}",
+        "error.api_credits": "Your API key ran out of credits.\nAdd credits or enter a new key.",
+        "error.api_invalid": "Your API key is invalid or expired.\nEnter a valid Gemini API key.",
+        "error.api_init": "Could not initialize API mode.\n{detail}",
+        "error.api_required": "API mode needs a valid Gemini API key.",
+        "error.api_select_mode": "Select Free mode and enter a valid Gemini API key.",
+        "error.session_inactive": "Session inactive. Restart the app and sign in again.",
+        "error.license_retry": "Retry sign-in?",
+        "status.code_active": "Account session active",
+        "status.code_disconnected": "Account sign-in failed: {detail}",
+        "status.code_session_lost": "Account session lost",
+        "status.code_network_error": "Account connection lost",
+        "status.code_expired": "Account session expired. Sign in again.",
+        "status.code_inactive": "Account sign-in required",
+        "status.api_active": "Local Gemini ready ({backend})",
+        "status.api_invalid": "Gemini API key invalid - update it in the dashboard",
+        "status.api_credits": "Gemini API key needs credits - update it in the dashboard",
+        "status.api_required": "Gemini API key missing - add it in the dashboard",
+        "status.stopped": "Stopped",
+        "status.not_authenticated": "Not authenticated",
+        "indicator.cooldown": "Typing finished. Controls unlock in {seconds}s.",
+    },
+    "fr": {
+        "lang.en": "Anglais",
+        "lang.fr": "Francais",
+        "dialog.heading.info": "Information",
+        "dialog.heading.error": "Une action est requise",
+        "dialog.heading.retry": "Probleme de connexion",
+        "dialog.ok": "OK",
+        "dialog.retry": "Reessayer",
+        "dialog.quit": "Quitter",
+        "dialog.retry_login": "Reessayer",
+        "dialog.cancel": "Annuler",
+        "startup.title": "Demarrage de EyesAndEars",
+        "startup.subtitle": "Preparation de votre assistant prive",
+        "startup.launching": "Lancement",
+        "startup.restoring": "Restauration de vos preferences",
+        "startup.opening_setup": "Ouverture de la configuration",
+        "startup.checking_auth": "Verification du mode de connexion",
+        "startup.connecting_pro": "Connexion au compte",
+        "startup.initializing_model": "Initialisation du moteur IA",
+        "startup.starting_indicator": "Demarrage de l'indicateur",
+        "startup.ready": "Pret",
+        "startup.detail.launching": "Chargement de l'interface",
+        "startup.detail.restoring": "Restauration des reglages et secrets securises",
+        "startup.detail.opening_setup": "En attente de vos choix de configuration",
+        "startup.detail.checking_auth": "Validation du mode d'acces selectionne",
+        "startup.detail.connecting_pro": "Connexion a votre compte",
+        "startup.detail.initializing_model": "Verification de votre cle API et du moteur",
+        "startup.detail.starting_indicator": "Demarrage de l'indicateur flottant",
+        "startup.detail.ready": "EyesAndEars est pret",
+        "auth.window_title": "Configuration EyesAndEars",
+        "auth.window_caption": "Configuration",
+        "auth.title": "Eyes & Ears",
+        "auth.subtitle": "Assistant moderne de capture avec controles locaux et prives.",
+        "auth.settings": "Reglages",
+        "auth.settings.copy": "Langue, ecran de demarrage, emplacement de l'indicateur, apparence et raccourcis.",
+        "auth.settings.done": "Terminer",
+        "auth.open_site": "Ouvrir le site",
+        "auth.window.minimize": "Reduire",
+        "auth.window.maximize": "Agrandir",
+        "auth.window.restore": "Restaurer",
+        "auth.window.close": "Fermer",
+        "auth.language": "Langue",
+        "auth.mode.free": "Mode gratuit",
+        "auth.mode.free.help": "Utiliser votre propre cle Gemini",
+        "auth.mode.pro": "Mode compte",
+        "auth.mode.pro.help": "Utiliser votre compte du site",
+        "auth.section.startup": "Demarrage",
+        "auth.startup_screen.label": "Ecran de chargement",
+        "auth.startup_screen.copy": "Desactivez ceci pour lancer directement l'application sans l'ecran anime.",
+        "auth.startup_screen.enabled": "Active",
+        "auth.startup_screen.disabled": "Desactive",
+        "auth.section.appearance": "Apparence",
+        "auth.section.theme": "Theme",
+        "auth.theme.copy": "Choisissez si la configuration suit le systeme ou reste dans un mode fixe.",
+        "theme.system": "Systeme",
+        "theme.dark": "Sombre",
+        "theme.light": "Clair",
+        "auth.section.indicator_size": "Taille de l'indicateur",
+        "auth.section.indicator_position": "Position de l'indicateur",
+        "auth.section.free": "Utiliser votre propre cle Gemini",
+        "auth.section.pro": "Connexion avec votre compte",
+        "auth.section.hotkeys": "Raccourcis",
+        "auth.hotkeys.copy": "Cliquez sur une action puis appuyez sur la nouvelle touche. Les lettres sont interdites.",
+        "auth.hotkeys.waiting": "Appuyez sur une nouvelle touche...",
+        "auth.hotkeys.invalid": "Les lettres et les touches non prises en charge sont interdites ici.",
+        "auth.hotkeys.duplicate": "Cette touche est deja utilisee par une autre action.",
+        "auth.hotkeys.reset": "Reinitialiser au pave numerique",
+        "auth.hotkeys.reset_done": "Les controles numeriques par defaut ont ete restaures.",
+        "auth.hotkey.primary": "Capturer / Pause / Reprendre",
+        "auth.hotkey.indicator": "Afficher ou masquer l'indicateur",
+        "auth.hotkey.clear_ctx": "Effacer l'attente",
+        "auth.hotkey.paste_all": "Coller le reste",
+        "auth.hotkey.repeat_prev": "Repeter la precedente",
+        "auth.hotkey.exit": "Quitter",
+        "auth.hotkey.settings": "Double-clic Ouvrir les reglages",
+        "auth.api.label": "Cle API Gemini",
+        "auth.api.placeholder": "Collez votre cle API Gemini",
+        "auth.api.paste": "Coller",
+        "auth.api.show": "Afficher",
+        "auth.api.hide": "Masquer",
+        "auth.api.link": "Pas de cle ? Obtenez-en une ici",
+        "auth.api.note": "Stockee localement avec la protection Windows (DPAPI).",
+        "auth.api.helper": "Nous verifions votre cle en initialisant Gemini. Le controle local ne bloque que les erreurs evidentes.",
+        "auth.pro.label": "Acces au compte",
+        "auth.pro.placeholder": "Utilisez la fenetre de connexion au compte",
+        "auth.pro.note": "L'acces desktop utilise maintenant l'email et le mot de passe du site.",
+        "auth.account.title": "Compte du site",
+        "auth.account.copy": "Connectez-vous avec l'email et le mot de passe du site. Votre cle Gemini reste chiffree dans le tableau de bord et n'est dechiffree que localement sur cet appareil.",
+        "auth.account.email": "Email",
+        "auth.account.email.placeholder": "nom@exemple.com",
+        "auth.account.password": "Mot de passe",
+        "auth.account.password.placeholder": "Entrez le mot de passe du site",
+        "auth.account.import": "Importer les reglages",
+        "auth.account.import.loading": "Importation...",
+        "auth.account.remember": "Se souvenir de moi",
+        "auth.account.dashboard": "Ouvrir le tableau de bord",
+        "auth.account.reset": "Reinitialiser le mot de passe",
+        "auth.account.helper": "Ajoutez ou remplacez votre cle Gemini depuis le tableau de bord si besoin. Vous pouvez laisser le mot de passe vide si vous modifiez seulement les reglages locaux.",
+        "auth.pro.model": "Modele prefere",
+        "auth.pro.model.note": "Modeles Gemini actuels pour les captures avec reponse texte directe.",
+        "auth.preview.title": "Emplacement de l'indicateur",
+        "auth.preview.copy": "L'indicateur flottant reste natif, fluide et protege des captures.",
+        "auth.security": "Les protections de confidentialite Windows et le stockage local securise restent actifs.",
+        "auth.continue": "Continuer",
+        "auth.continue.loading": "Verification...",
+        "auth.cancel": "Annuler",
+        "auth.validation.api.empty": "Entrez votre cle API Gemini.",
+        "auth.validation.api.short": "Cette cle semble trop courte. Verifiez si elle a ete tronquee.",
+        "auth.validation.api.whitespace": "Supprimez les espaces ou retours a la ligne de la cle API.",
+        "auth.validation.api.shape": "Cette cle semble mal formee. Verifiez les caracteres supplementaires.",
+        "auth.validation.pro.empty": "Terminez la connexion dans la fenetre du compte.",
+        "auth.validation.account.email.empty": "Entrez l'email du compte.",
+        "auth.validation.account.email.invalid": "Entrez une adresse email valide.",
+        "auth.validation.account.password.empty": "Entrez votre mot de passe.",
+        "auth.status.free": "Le mode gratuit verifie votre cle API localement sur cet appareil.",
+        "auth.status.pro": "Le mode compte ouvre votre session via le site.",
+        "auth.status.account": "L'acces desktop utilise votre compte du site et le dechiffrement Gemini en local.",
+        "position.top_left": "Haut gauche",
+        "position.top_center": "Haut centre",
+        "position.top_right": "Haut droite",
+        "position.left_center": "Centre gauche",
+        "position.right_center": "Centre droite",
+        "position.bottom_left": "Bas gauche",
+        "position.bottom_center": "Bas centre",
+        "position.bottom_right": "Bas droite",
+        "size.very_small": "Tres petite",
+        "size.small": "Petite",
+        "size.medium": "Moyenne",
+        "size.large": "Grande",
+        "status.window_title": "Statut EyesAndEars",
+        "status.mode": "Mode",
+        "status.mode.free": "Mode gratuit",
+        "status.mode.pro": "Mode compte",
+        "status.status": "Statut",
+        "status.server": "Serveur",
+        "status.user": "Utilisateur",
+        "status.code": "Code",
+        "status.backend": "Moteur",
+        "status.model": "Modele",
+        "status.api_key": "Cle API",
+        "status.pro_model": "Modele prefere",
+        "status.not_set": "-",
+        "tray.open": "Ouvrir le statut",
+        "tray.toggle": "Afficher ou masquer l'indicateur",
+        "tray.capture_disable": "Autoriser les captures pour le debug",
+        "tray.capture_enable": "Reactiver le masquage des captures",
+        "tray.check_updates": "Verifier les mises a jour",
+        "tray.quit": "Quitter",
+        "tray.status": "Statut : {status}",
+        "update.current": "EyesAndEars est deja a jour.",
+        "update.available": "Mise a jour vers la version {version}. EyesAndEars va redemarrer.",
+        "update.failed": "La mise a jour a echoue : {detail}",
+        "error.save_code": "Impossible d'enregistrer votre code de maniere securisee sur cette machine.",
+        "error.save_api": "Impossible d'enregistrer votre cle API de maniere securisee sur cette machine.",
+        "error.connect_server": "Impossible de se connecter au serveur.\n{detail}",
+        "error.server_non_json": "Le serveur a renvoye une reponse inattendue ({status_code}).",
+        "error.auth_failed": "La demande d'authentification a echoue ({status_code}). {detail}",
+        "error.auth_denied": "Authentification refusee.",
+        "error.pro_lockout_wait": "Trop de tentatives de connexion incorrectes. Reessayez dans {seconds} secondes.",
+        "error.pro_lockout_locked": "Trop de tentatives de connexion incorrectes. Cet appareil est bloque pour {seconds} secondes.",
+        "error.pro_time_unavailable": "Impossible de verifier l'heure en ligne. Verifiez votre connexion puis reessayez.",
+        "error.api_empty": "La cle API est vide.",
+        "error.no_sdk": "Impossible d'initialiser le mode API.\n{detail}",
+        "error.api_credits": "Votre cle API n'a plus de credits.\nAjoutez des credits ou entrez une nouvelle cle.",
+        "error.api_invalid": "Votre cle API est invalide ou expiree.\nEntrez une cle Gemini valide.",
+        "error.api_init": "Impossible d'initialiser le mode API.\n{detail}",
+        "error.api_required": "Le mode gratuit a besoin d'une cle API Gemini valide.",
+        "error.api_select_mode": "Selectionnez le mode gratuit et entrez une cle API Gemini valide.",
+        "error.session_inactive": "Session inactive. Redemarrez l'application et reconnectez-vous.",
+        "error.license_retry": "Reessayer la connexion ?",
+        "status.code_active": "Session du compte active",
+        "status.code_disconnected": "Echec de connexion au compte : {detail}",
+        "status.code_session_lost": "Session du compte perdue",
+        "status.code_network_error": "Connexion au compte perdue",
+        "status.code_expired": "La session du compte a expire. Reconnectez-vous.",
+        "status.code_inactive": "Connexion au compte requise",
+        "status.api_active": "Gemini local pret ({backend})",
+        "status.api_invalid": "Cle Gemini invalide - mettez-la a jour depuis le tableau de bord",
+        "status.api_credits": "La cle Gemini n'a plus de credits - mettez-la a jour depuis le tableau de bord",
+        "status.api_required": "Cle Gemini manquante - ajoutez-la depuis le tableau de bord",
+        "status.stopped": "Arrete",
+        "status.not_authenticated": "Non authentifie",
+        "indicator.cooldown": "Saisie terminee. Les commandes reviennent dans {seconds}s.",
+    },
+}
+
+DEFAULT_PRO_MODEL_OPTIONS = [
+    {
+        "id": "gemini-3-flash-preview",
+        "label": "Gemini 3 Flash Preview",
+        "description": "Current fastest Gemini 3 preview for lightweight local work.",
+    },
+    {
+        "id": "gemini-3.1-flash-lite-preview",
+        "label": "Gemini 3.1 Flash-Lite Preview",
+        "description": "Lowest-latency Gemini 3.1 option for lightweight local work.",
+    },
+    {
+        "id": "gemini-3.1-pro-preview",
+        "label": "Gemini 3.1 Preview",
+        "description": "Highest-quality Gemini 3.1 reasoning preview.",
+    },
+    {
+        "id": "gemini-2.5-flash",
+        "label": "Gemini 2.5 Flash",
+        "description": "Faster replies with lower latency.",
+    },
+    {
+        "id": "gemini-2.5-flash-preview-09-2025",
+        "label": "Gemini 2.5 Flash Preview (09-2025)",
+        "description": "Pinned Gemini 2.5 Flash preview build.",
+    },
+    {
+        "id": "gemini-2.5-flash-lite",
+        "label": "Gemini 2.5 Flash Lite",
+        "description": "Cheaper Gemini 2.5 Flash Lite for lightweight prompts.",
+    },
+    {
+        "id": "gemini-2.5-flash-lite-preview-09-2025",
+        "label": "Gemini 2.5 Flash Lite Preview (09-2025)",
+        "description": "Pinned Gemini 2.5 Flash Lite preview build.",
+    },
+    {
+        "id": "gemini-2.5-pro",
+        "label": "Gemini 2.5 Advanced",
+        "description": "Highest reasoning quality when available.",
+    },
+]
+
+
+def normalize_indicator_blob_size(value):
+    normalized = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+    if normalized in INDICATOR_BLOB_SIZES:
+        return normalized
+    return "medium"
+
+
+def compute_indicator_chip_corner_radius(chip_size):
+    size = int(max(1, chip_size))
+    return max(4, min(int(round(size * 0.32)), max(4, (size // 2) - 2)))
+
+
+def hex_to_rgba(color, alpha):
+    candidate = str(color or "").strip().lstrip("#")
+    if len(candidate) != 6:
+        return color
+    try:
+        return (
+            int(candidate[0:2], 16),
+            int(candidate[2:4], 16),
+            int(candidate[4:6], 16),
+            int(max(0, min(255, alpha))),
+        )
+    except Exception:
+        return color
+
+
+def detect_system_dark_mode():
+    if os.name != "nt" or winreg is None:
+        return False
+    try:
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize",
+        ) as key:
+            apps_use_light_theme, _ = winreg.QueryValueEx(key, "AppsUseLightTheme")
+        return int(apps_use_light_theme) == 0
+    except Exception:
+        return False
+
+
+def normalize_theme_preference(value):
+    normalized = str(value or "").strip().lower()
+    if normalized in {"dark", "light", "system"}:
+        return normalized
+    return "system"
+
+
+def resolve_theme_dark(preference=None):
+    selected = normalize_theme_preference(preference if preference is not None else ui_theme_preference)
+    if selected == "dark":
+        return True
+    if selected == "light":
+        return False
+    return detect_system_dark_mode()
+
+
+def apply_ui_theme(use_dark):
+    global system_dark_theme_enabled
+    system_dark_theme_enabled = bool(use_dark)
+    palette = DARK_THEME if system_dark_theme_enabled else LIGHT_THEME
+    globals().update(palette)
+
+
+def apply_ui_theme_preference(preference=None):
+    global ui_theme_preference
+    ui_theme_preference = normalize_theme_preference(preference)
+    apply_ui_theme(resolve_theme_dark(ui_theme_preference))
+
+
+apply_ui_theme_preference(os.environ.get("EAE_THEME", ui_theme_preference))
+
+
+def normalize_language(value):
+    normalized = str(value or "").strip().lower()
+    if normalized in TRANSLATIONS:
+        return normalized
+    return "en"
+
+
+def normalize_indicator_position(value):
+    normalized = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+    if normalized in INDICATOR_POSITIONS:
+        return normalized
+    return "bottom_right"
+
+
+def normalize_startup_loading_screen_enabled(value):
+    if isinstance(value, bool):
+        return bool(value)
+    text = str(value or "").strip().lower()
+    if not text:
+        return True
+    return text not in {"0", "false", "no", "off"}
+
+
+def load_pro_model_catalog():
+    raw_value = str(os.environ.get(PRO_MODELS_ENV, "") or "").strip()
+    if not raw_value:
+        return [dict(item) for item in DEFAULT_PRO_MODEL_OPTIONS]
+    try:
+        parsed = json.loads(raw_value)
+    except Exception:
+        return [dict(item) for item in DEFAULT_PRO_MODEL_OPTIONS]
+    if not isinstance(parsed, list):
+        return [dict(item) for item in DEFAULT_PRO_MODEL_OPTIONS]
+    catalog = []
+    for item in parsed:
+        if isinstance(item, str):
+            candidate_id = str(item).strip()
+            if candidate_id:
+                catalog.append(
+                    {
+                        "id": candidate_id,
+                        "label": candidate_id,
+                        "description": "",
+                    }
+                )
+            continue
+        if not isinstance(item, dict):
+            continue
+        candidate_id = str(item.get("id", "") or "").strip()
+        if not candidate_id:
+            continue
+        catalog.append(
+            {
+                "id": candidate_id,
+                "label": str(item.get("label", "") or candidate_id).strip(),
+                "description": str(item.get("description", "") or "").strip(),
+            }
+        )
+    if not catalog:
+        return [dict(item) for item in DEFAULT_PRO_MODEL_OPTIONS]
+    return catalog
+
+
+PRO_MODEL_OPTIONS = load_pro_model_catalog()
+
+
+def normalize_pro_model(value):
+    candidate = str(value or "").strip()
+    for item in PRO_MODEL_OPTIONS:
+        if candidate == item["id"]:
+            return candidate
+    for item in PRO_MODEL_OPTIONS:
+        if item["id"] == DEFAULT_MODEL_NAME:
+            return item["id"]
+    return str(PRO_MODEL_OPTIONS[0]["id"])
+
+
+selected_pro_model_key = normalize_pro_model(selected_pro_model_key)
+
+
+def tr(key, language=None, **kwargs):
+    lang = normalize_language(language or ui_language)
+    table = TRANSLATIONS.get(lang, TRANSLATIONS["en"])
+    text = table.get(key, TRANSLATIONS["en"].get(key, key))
+    if kwargs:
+        try:
+            return str(text).format(**kwargs)
+        except Exception:
+            return str(text)
+    return str(text)
+
+
+def get_default_command_hotkeys(mode=None):
+    local_mode = "toprow" if str(mode or command_key_mode).strip().lower() == "toprow" else "numpad"
+    return dict(DEFAULT_COMMAND_HOTKEYS[local_mode])
+
+
+def hotkey_action_label(action, language=None):
+    return tr(f"auth.hotkey.{str(action or '').strip().lower()}", language=language)
+
+
+def hotkey_binding_label(binding_key):
+    meta = ALLOWED_HOTKEY_BINDINGS.get(str(binding_key or "").strip().lower(), {})
+    return str(meta.get("label", "?"))
+
+
+def infer_hotkey_mode_from_bindings(value, fallback=None):
+    bindings = value if isinstance(value, dict) else {}
+    fallback_mode = "toprow" if str(fallback or command_key_mode).strip().lower() == "toprow" else "numpad"
+    if bindings == DEFAULT_COMMAND_HOTKEYS["toprow"]:
+        return "toprow"
+    if bindings == DEFAULT_COMMAND_HOTKEYS["numpad"]:
+        return "numpad"
+    keypad_flags = []
+    for action in HOTKEY_ACTION_ORDER:
+        meta = ALLOWED_HOTKEY_BINDINGS.get(str(bindings.get(action, "")).strip().lower(), {})
+        keypad_flags.append(meta.get("keypad"))
+    if keypad_flags and all(flag is True for flag in keypad_flags):
+        return "numpad"
+    if keypad_flags and all(flag is False for flag in keypad_flags):
+        return "toprow"
+    return fallback_mode
+
+
+def normalize_command_hotkeys(value, mode=None):
+    defaults = get_default_command_hotkeys(mode)
+    source = value if isinstance(value, dict) else {}
+    normalized = {}
+    used = set()
+    customized = False
+    remaining = [key for key in ALLOWED_HOTKEY_BINDINGS if key not in defaults.values()]
+    for action in HOTKEY_ACTION_ORDER:
+        candidate = str(source.get(action, "") or "").strip().lower()
+        if candidate in ALLOWED_HOTKEY_BINDINGS and candidate not in used:
+            normalized[action] = candidate
+            used.add(candidate)
+            if candidate != defaults[action]:
+                customized = True
+            continue
+        fallback = defaults[action]
+        if fallback in used:
+            fallback = next((key for key in remaining if key not in used), fallback)
+        normalized[action] = fallback
+        used.add(fallback)
+        if fallback != defaults[action]:
+            customized = True
+    return normalized, customized
+
+
+def resolve_command_hotkey_state(value, mode=None):
+    fallback_mode = "toprow" if str(mode or command_key_mode).strip().lower() == "toprow" else "numpad"
+    normalized, customized = normalize_command_hotkeys(value, fallback_mode)
+    resolved_mode = infer_hotkey_mode_from_bindings(normalized, fallback_mode)
+    if normalized == DEFAULT_COMMAND_HOTKEYS.get(resolved_mode, {}):
+        customized = False
+    return normalized, resolved_mode, customized
+
+
+def hotkey_event_matches_binding(event, binding_key):
+    meta = ALLOWED_HOTKEY_BINDINGS.get(str(binding_key or "").strip().lower())
+    if not meta:
+        return False
+    if get_event_scan_code(event) != int(meta["scan_code"]):
+        return False
+    expected_keypad = meta.get("keypad")
+    actual_keypad = getattr(event, "is_keypad", None)
+    if expected_keypad is not None and actual_keypad is not None and bool(actual_keypad) != bool(expected_keypad):
+        return False
+    return True
+
+
+def get_hotkey_action(event):
+    for action in HOTKEY_ACTION_ORDER:
+        binding_key = command_hotkeys.get(action, "")
+        if binding_key and hotkey_event_matches_binding(event, binding_key):
+            return action
+    return ""
+
+
+def soft_validate_api_key(value):
+    cleaned = str(value or "").strip()
+    if not cleaned:
+        return "auth.validation.api.empty"
+    if any(ch.isspace() for ch in cleaned):
+        return "auth.validation.api.whitespace"
+    if len(cleaned) < 12:
+        return "auth.validation.api.short"
+    if len(set(cleaned)) < 4:
+        return "auth.validation.api.shape"
+    if not re.search(r"[A-Za-z]", cleaned) or not re.search(r"[A-Za-z0-9]", cleaned):
+        return "auth.validation.api.shape"
+    return ""
+
+
+def compute_indicator_origin(work_left, work_top, work_right, work_bottom, width, height, position_key):
+    layout = INDICATOR_POSITIONS.get(normalize_indicator_position(position_key), INDICATOR_POSITIONS["bottom_right"])
+    usable_width = max(1, work_right - work_left)
+    usable_height = max(1, work_bottom - work_top)
+    if layout["x"] == "left":
+        x = work_left + INDICATOR_MARGIN_X
+    elif layout["x"] == "center":
+        x = work_left + (usable_width - width) // 2
+    else:
+        x = work_right - width - INDICATOR_MARGIN_X
+    if layout["y"] == "top":
+        y = work_top + INDICATOR_MARGIN_Y
+    elif layout["y"] == "center":
+        y = work_top + (usable_height - height) // 2
+    else:
+        y = work_bottom - height - INDICATOR_MARGIN_Y
+    x = min(max(work_left, int(x)), max(work_left, work_right - width))
+    y = min(max(work_top, int(y)), max(work_top, work_bottom - height))
+    return x, y
+
+
+def compute_preview_anchor_point(left, top, right, bottom, position_key):
+    point = INDICATOR_PREVIEW_POINTS.get(
+        normalize_indicator_position(position_key),
+        INDICATOR_PREVIEW_POINTS["bottom_right"],
+    )
+    usable_width = max(1, int(right) - int(left))
+    usable_height = max(1, int(bottom) - int(top))
+    x = int(round(int(left) + (usable_width * float(point["x"]))))
+    y = int(round(int(top) + (usable_height * float(point["y"]))))
+    return x, y
+
+
+def is_loopback_hostname(hostname):
+    candidate = str(hostname or "").strip().strip("[]").lower()
+    if not candidate:
+        return False
+    if candidate == "localhost":
+        return True
+    try:
+        return bool(ipaddress.ip_address(candidate).is_loopback)
+    except Exception:
+        return False
+
+
+def normalize_server_url(value):
+    candidate = str(value or "").strip().rstrip("/")
+    if not candidate:
+        return DEFAULT_SERVER_URL
+    try:
+        parsed = urlparse(candidate)
+    except Exception:
+        return ""
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return ""
+    if parsed.username or parsed.password:
+        return ""
+    hostname = str(parsed.hostname or "").strip()
+    if parsed.scheme != "https" and not is_loopback_hostname(hostname):
+        return ""
+    normalized = f"{parsed.scheme}://{parsed.netloc}"
+    path = str(parsed.path or "").strip()
+    if path and path != "/":
+        normalized = f"{normalized}{path.rstrip('/')}"
+    return normalized
+
+
+def describe_unexpected_json_response(response):
+    content_type = str(getattr(response, "headers", {}).get("content-type", "") or "").strip().lower()
+    try:
+        snippet = str(getattr(response, "text", "") or "").strip()
+    except Exception:
+        snippet = ""
+    snippet = " ".join(snippet.split())[:320]
+    plain_text = " ".join(re.sub(r"<[^>]+>", " ", html.unescape(snippet)).split())
+    if not plain_text:
+        return f"content-type={content_type or 'unknown'}"
+    missing_relation_match = re.search(r'relation\s+"([^"]+)"\s+does not exist', plain_text, flags=re.IGNORECASE)
+    if missing_relation_match:
+        return f"Server database is missing table '{missing_relation_match.group(1)}'."
+    fatal_match = re.search(r"Fatal error:\s*(.+)", plain_text, flags=re.IGNORECASE)
+    if fatal_match:
+        return f"Server PHP fatal error: {fatal_match.group(1).strip()[:220]}"
+    if "html" in content_type:
+        return f"Server returned HTML: {plain_text[:220]}"
+    return plain_text[:220]
+
+
+def decode_json_response(response, context_label):
+    try:
+        return response.json()
+    except Exception:
+        content_type = str(response.headers.get("content-type", "") or "").strip().lower()
+        try:
+            snippet = str(response.text or "").strip()
+        except Exception:
+            snippet = ""
+        snippet = " ".join(snippet.split())[:220]
+        logger.warning(
+            "%s returned non-JSON data (status %s, content-type=%s, body=%r).",
+            context_label,
+            getattr(response, "status_code", "?"),
+            content_type or "unknown",
+            snippet,
+            exc_info=True,
+        )
+        return None
+
+
+def open_default_website():
+    target = str(DEFAULT_WEBSITE_URL or "").strip()
+    if not target:
+        return False
+    try:
+        parsed = urlparse(target)
+    except Exception:
+        return False
+    if parsed.scheme not in {"http", "https"}:
+        return False
+    try:
+        return bool(webbrowser.open(target, new=2))
+    except Exception:
+        return False
+
+
+def open_dashboard_page(anchor="dashboard-app-access"):
+    target = str(DEFAULT_WEBSITE_URL or DEFAULT_SERVER_URL).strip().rstrip("/")
+    if not target:
+        return False
+    if not target.lower().endswith(".php") and not target.endswith("/dashboard.php"):
+        target = f"{target}/dashboard.php"
+    if anchor:
+        target = f"{target}#{str(anchor).strip().lstrip('#')}"
+    try:
+        parsed = urlparse(target)
+    except Exception:
+        return False
+    if parsed.scheme not in {"http", "https"}:
+        return False
+    try:
+        return bool(webbrowser.open(target, new=2))
+    except Exception:
+        return False
+
+
+def resolve_install_root():
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+def resolve_data_dir(install_root):
+    portable_data_dir = install_root / ".eyesandears"
+    try:
+        portable_data_dir.mkdir(parents=True, exist_ok=True)
+        probe = portable_data_dir / ".write_probe"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink()
+        return portable_data_dir
+    except Exception:
+        fallback_data_dir = Path(os.environ.get("APPDATA", ".")) / APP_NAME
+        fallback_data_dir.mkdir(parents=True, exist_ok=True)
+        return fallback_data_dir
+
+
+APP_INSTALL_ROOT = resolve_install_root()
+APP_DATA_DIR = resolve_data_dir(APP_INSTALL_ROOT)
+CONFIG_FILE = APP_DATA_DIR / CONFIG_FILE_NAME
+PRO_AUTH_RUNTIME_DIR = APP_DATA_DIR / PRO_AUTH_HIDDEN_DIR_NAME
+PRO_AUTH_LOCK_FILE = PRO_AUTH_RUNTIME_DIR / PRO_AUTH_HIDDEN_FILE_NAME
+
+if os.name == "nt":
+    HRESULT = getattr(wintypes, "HRESULT", ctypes.c_long)
+    WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    WDA_NONE = 0x0
+    WDA_MONITOR = 0x1
+    WDA_EXCLUDEFROMCAPTURE = 0x11
+    GA_ROOT = 2
+    DWMWA_USE_IMMERSIVE_DARK_MODE = 20
+    DWMWA_WINDOW_CORNER_PREFERENCE = 33
+    DWMWA_SYSTEMBACKDROP_TYPE = 38
+    DWMWA_MICA_EFFECT = 1029
+    DWMWCP_ROUND = 2
+    DWMSBT_MAINWINDOW = 2
+    DWMSBT_TRANSIENTWINDOW = 3
+
+    class DATA_BLOB(ctypes.Structure):
+        _fields_ = [
+            ("cbData", wintypes.DWORD),
+            ("pbData", ctypes.POINTER(ctypes.c_byte)),
+        ]
+
+    _crypt32 = ctypes.windll.crypt32
+    _kernel32 = ctypes.windll.kernel32
+    _user32 = ctypes.windll.user32
+    _dwmapi = ctypes.windll.dwmapi
+    _gdi32 = ctypes.windll.gdi32
+    _crypt32.CryptProtectData.argtypes = [
+        ctypes.POINTER(DATA_BLOB),
+        wintypes.LPCWSTR,
+        ctypes.POINTER(DATA_BLOB),
+        wintypes.LPVOID,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        ctypes.POINTER(DATA_BLOB),
+    ]
+    _crypt32.CryptProtectData.restype = wintypes.BOOL
+    _crypt32.CryptUnprotectData.argtypes = [
+        ctypes.POINTER(DATA_BLOB),
+        ctypes.POINTER(wintypes.LPWSTR),
+        ctypes.POINTER(DATA_BLOB),
+        wintypes.LPVOID,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        ctypes.POINTER(DATA_BLOB),
+    ]
+    _crypt32.CryptUnprotectData.restype = wintypes.BOOL
+    _kernel32.LocalFree.argtypes = [wintypes.HLOCAL]
+    _kernel32.LocalFree.restype = wintypes.HLOCAL
+    _user32.SetWindowDisplayAffinity.argtypes = [wintypes.HWND, wintypes.DWORD]
+    _user32.SetWindowDisplayAffinity.restype = wintypes.BOOL
+    _user32.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
+    _user32.GetAncestor.restype = wintypes.HWND
+    _user32.GetForegroundWindow.argtypes = []
+    _user32.GetForegroundWindow.restype = wintypes.HWND
+    _user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    _user32.GetWindowTextW.restype = ctypes.c_int
+    _user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+    _user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+    _user32.GetCursorPos.argtypes = [ctypes.POINTER(wintypes.POINT)]
+    _user32.GetCursorPos.restype = wintypes.BOOL
+    _user32.FindWindowW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR]
+    _user32.FindWindowW.restype = wintypes.HWND
+    _user32.EnumWindows.argtypes = [WNDENUMPROC, wintypes.LPARAM]
+    _user32.EnumWindows.restype = wintypes.BOOL
+    _user32.IsWindow.argtypes = [wintypes.HWND]
+    _user32.IsWindow.restype = wintypes.BOOL
+    _user32.IsWindowVisible.argtypes = [wintypes.HWND]
+    _user32.IsWindowVisible.restype = wintypes.BOOL
+    _user32.ReleaseCapture.argtypes = []
+    _user32.ReleaseCapture.restype = wintypes.BOOL
+    _user32.SendMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+    _user32.SendMessageW.restype = wintypes.LPARAM
+    _user32.MoveWindow.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, wintypes.BOOL]
+    _user32.MoveWindow.restype = wintypes.BOOL
+    _user32.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, wintypes.UINT]
+    _user32.SetWindowPos.restype = wintypes.BOOL
+    _user32.SetWindowRgn.argtypes = [wintypes.HWND, wintypes.HANDLE, wintypes.BOOL]
+    _user32.SetWindowRgn.restype = ctypes.c_int
+    _dwmapi.DwmSetWindowAttribute.argtypes = [
+        wintypes.HWND,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+    ]
+    _dwmapi.DwmSetWindowAttribute.restype = HRESULT
+    _gdi32.CreateRoundRectRgn.argtypes = [
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+    ]
+    _gdi32.CreateRoundRectRgn.restype = wintypes.HANDLE
+    _gdi32.CreateEllipticRgn.argtypes = [
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+    ]
+    _gdi32.CreateEllipticRgn.restype = wintypes.HANDLE
+    _gdi32.DeleteObject.argtypes = [wintypes.HANDLE]
+    _gdi32.DeleteObject.restype = wintypes.BOOL
+
+
+def hide_console_window():
+    if os.name != "nt":
+        return
+    try:
+        console_window = ctypes.windll.kernel32.GetConsoleWindow()
+        if console_window:
+            ctypes.windll.user32.ShowWindow(console_window, SW_HIDE)
+    except Exception:
+        pass
+
+
+def ensure_ui_crisp_mode():
+    global ui_crisp_mode_initialized
+    if ui_crisp_mode_initialized:
+        return
+    ui_crisp_mode_initialized = True
+    if os.name != "nt":
+        return
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)
+    except Exception:
+        pass
+    try:
+        dpi_context_v2 = ctypes.c_void_p(-4)  # DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
+        ctypes.windll.user32.SetProcessDpiAwarenessContext(dpi_context_v2)
+    except Exception:
+        pass
+    try:
+        ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:
+        pass
+
+
+def apply_tk_scaling(window):
+    if window is None:
+        return
+    try:
+        dpi = float(window.winfo_fpixels("1i"))
+        if dpi <= 0:
+            return
+        scale = max(1.0, dpi / 72.0)
+        window.tk.call("tk", "scaling", scale)
+    except Exception:
+        pass
+
+
+def get_work_area_bounds(screen_width, screen_height):
+    left = 0
+    top = 0
+    right = int(max(1, screen_width))
+    bottom = int(max(1, screen_height))
+    if os.name != "nt":
+        return left, top, right, bottom
+    try:
+        rect = wintypes.RECT()
+        SPI_GETWORKAREA = 0x0030
+        if ctypes.windll.user32.SystemParametersInfoW(SPI_GETWORKAREA, 0, ctypes.byref(rect), 0):
+            left = int(rect.left)
+            top = int(rect.top)
+            right = int(rect.right)
+            bottom = int(rect.bottom)
+    except Exception:
+        pass
+    if right <= left or bottom <= top:
+        return 0, 0, int(max(1, screen_width)), int(max(1, screen_height))
+    return left, top, right, bottom
+
+
+def get_active_monitor_work_area(fallback_width=None, fallback_height=None):
+    default_width = int(max(1, fallback_width or 1920))
+    default_height = int(max(1, fallback_height or 1080))
+    if os.name != "nt":
+        return 0, 0, default_width, default_height
+    try:
+        class MONITORINFO(ctypes.Structure):
+            _fields_ = [
+                ("cbSize", wintypes.DWORD),
+                ("rcMonitor", wintypes.RECT),
+                ("rcWork", wintypes.RECT),
+                ("dwFlags", wintypes.DWORD),
+            ]
+
+        point = wintypes.POINT()
+        if not ctypes.windll.user32.GetCursorPos(ctypes.byref(point)):
+            raise RuntimeError("GetCursorPos failed")
+        monitor = ctypes.windll.user32.MonitorFromPoint(point, 2)
+        if not monitor:
+            raise RuntimeError("MonitorFromPoint failed")
+        monitor_info = MONITORINFO()
+        monitor_info.cbSize = ctypes.sizeof(MONITORINFO)
+        if not ctypes.windll.user32.GetMonitorInfoW(monitor, ctypes.byref(monitor_info)):
+            raise RuntimeError("GetMonitorInfoW failed")
+        rect = monitor_info.rcWork
+        left = int(rect.left)
+        top = int(rect.top)
+        right = int(rect.right)
+        bottom = int(rect.bottom)
+        if right > left and bottom > top:
+            return left, top, right, bottom
+    except Exception:
+        pass
+
+    screen_width = default_width
+    screen_height = default_height
+    try:
+        screen_width = int(ctypes.windll.user32.GetSystemMetrics(0))
+        screen_height = int(ctypes.windll.user32.GetSystemMetrics(1))
+    except Exception:
+        pass
+    return get_work_area_bounds(screen_width, screen_height)
+
+
+def set_window_capture_excluded(hwnd, enabled=True):
+    if os.name != "nt":
+        return False
+    try:
+        normalized = int(hwnd or 0)
+        if not normalized:
+            return False
+        top_level = int(_user32.GetAncestor(wintypes.HWND(normalized), GA_ROOT) or 0)
+        if top_level:
+            normalized = top_level
+        if not enabled:
+            return bool(_user32.SetWindowDisplayAffinity(wintypes.HWND(normalized), WDA_NONE))
+        # Preferred (Win10 2004+): completely exclude from capture.
+        if _user32.SetWindowDisplayAffinity(wintypes.HWND(normalized), WDA_EXCLUDEFROMCAPTURE):
+            return True
+        # Fallback: capture sees a blank/black window while user still sees it locally.
+        return bool(_user32.SetWindowDisplayAffinity(wintypes.HWND(normalized), WDA_MONITOR))
+    except Exception:
+        logger.debug("Window capture privacy update failed.", exc_info=True)
+        return False
+
+
+def get_top_level_window_handle(hwnd):
+    if os.name != "nt":
+        return 0
+    try:
+        normalized = int(hwnd or 0)
+        if not normalized:
+            return 0
+        top_level = int(_user32.GetAncestor(wintypes.HWND(normalized), GA_ROOT) or 0)
+        candidate = top_level if top_level else normalized
+        if is_valid_window_handle(candidate):
+            return int(candidate)
+    except Exception:
+        pass
+    return 0
+
+
+def apply_capture_privacy_to_window(window, enabled=True):
+    if os.name != "nt" or window is None:
+        return False
+    try:
+        if not window.winfo_exists():
+            return False
+        window.update_idletasks()
+        return set_window_capture_excluded(window.winfo_id(), enabled=enabled)
+    except Exception:
+        logger.debug("Window capture privacy application failed.", exc_info=True)
+        return False
+
+
+def is_capture_privacy_active():
+    return bool(capture_privacy_enabled)
+
+
+def schedule_window_privacy_refresh(window, refresh_ms=1800):
+    if os.name != "nt" or window is None:
+        return
+    if getattr(window, "_eae_privacy_refresh_enabled", False):
+        return
+    window._eae_privacy_refresh_enabled = True
+    window._eae_privacy_refresh_after_id = None
+
+    def _cancel(_event=None):
+        after_id = getattr(window, "_eae_privacy_refresh_after_id", None)
+        if after_id:
+            try:
+                window.after_cancel(after_id)
+            except Exception:
+                pass
+        window._eae_privacy_refresh_after_id = None
+
+    def _tick():
+        try:
+            if not window.winfo_exists():
+                return
+            apply_capture_privacy_to_window(window, enabled=is_capture_privacy_active())
+            window._eae_privacy_refresh_after_id = window.after(refresh_ms, _tick)
+        except Exception:
+            pass
+
+    try:
+        window.bind("<Destroy>", _cancel, add="+")
+    except Exception:
+        pass
+    try:
+        window._eae_privacy_refresh_after_id = window.after(80, _tick)
+    except Exception:
+        pass
+
+
+def configure_private_window(window, *, dark=False, translucent=False, refresh_ms=1800):
+    apply_win11_window_style(window, dark=dark, translucent=translucent)
+    apply_capture_privacy_to_window(window, enabled=is_capture_privacy_active())
+    schedule_window_privacy_refresh(window, refresh_ms=refresh_ms)
+
+
+def apply_window_corner_region(window, radius):
+    if os.name != "nt" or window is None:
+        return False
+    try:
+        if not window.winfo_exists():
+            return False
+        window.update_idletasks()
+        width = int(max(1, window.winfo_width()))
+        height = int(max(1, window.winfo_height()))
+        radius = int(max(2, min(radius, width // 2, height // 2)))
+        region = _gdi32.CreateRoundRectRgn(0, 0, width + 1, height + 1, radius * 2, radius * 2)
+        if not region:
+            return False
+        hwnd = wintypes.HWND(window.winfo_id())
+        applied = bool(_user32.SetWindowRgn(hwnd, region, True))
+        if not applied:
+            _gdi32.DeleteObject(region)
+        return applied
+    except Exception:
+        return False
+
+
+def draw_canvas_ellipse(canvas, x1, y1, x2, y2, **kwargs):
+    fill = kwargs.get("fill", "")
+    outline = kwargs.get("outline", "")
+    line_width = int(max(1, kwargs.get("width", 1)))
+    antialias = int(max(1, kwargs.get("antialias", 1)))
+    x1 = int(x1)
+    y1 = int(y1)
+    x2 = int(x2)
+    y2 = int(y2)
+    if x2 <= x1 or y2 <= y1:
+        return []
+
+    if antialias > 1:
+        width_px = int(max(1, x2 - x1 + 1))
+        height_px = int(max(1, y2 - y1 + 1))
+        aa_width = width_px * antialias
+        aa_height = height_px * antialias
+        aa_line = max(1, line_width * antialias)
+        cache = getattr(canvas, "_eae_ellipse_cache", None)
+        if cache is None:
+            cache = {}
+            canvas._eae_ellipse_cache = cache
+        cache_key = (width_px, height_px, fill, outline, line_width, antialias)
+        image_ref = cache.get(cache_key)
+        if image_ref is None:
+            img = PIL.Image.new("RGBA", (aa_width, aa_height), (0, 0, 0, 0))
+            drawer = PIL.ImageDraw.Draw(img)
+            shape = (0, 0, aa_width - 1, aa_height - 1)
+            if fill and outline:
+                drawer.ellipse(shape, fill=fill, outline=outline, width=aa_line)
+            elif fill:
+                drawer.ellipse(shape, fill=fill)
+            elif outline:
+                drawer.ellipse(shape, outline=outline, width=aa_line)
+            resampling = getattr(getattr(PIL.Image, "Resampling", PIL.Image), "BILINEAR", PIL.Image.BILINEAR)
+            img = img.resize((width_px, height_px), resampling)
+            image_ref = PIL.ImageTk.PhotoImage(img, master=canvas)
+            cache[cache_key] = image_ref
+            if len(cache) > 32:
+                try:
+                    cache.pop(next(iter(cache)))
+                except Exception:
+                    pass
+        refs = getattr(canvas, "_eae_image_refs", None)
+        if refs is None:
+            refs = []
+            canvas._eae_image_refs = refs
+        refs.append(image_ref)
+        return [canvas.create_image(x1, y1, image=image_ref, anchor="nw")]
+
+    return [
+        canvas.create_oval(
+            x1,
+            y1,
+            x2,
+            y2,
+            fill=fill,
+            outline=outline,
+            width=line_width,
+        )
+    ]
+
+
+def draw_rounded_canvas_rect(canvas, x1, y1, x2, y2, radius, **kwargs):
+    fill = kwargs.get("fill", "")
+    outline = kwargs.get("outline", "")
+    line_width = int(max(1, kwargs.get("width", 1)))
+    antialias = int(max(1, kwargs.get("antialias", 1)))
+    x1 = int(x1)
+    y1 = int(y1)
+    x2 = int(x2)
+    y2 = int(y2)
+    if x2 <= x1 or y2 <= y1:
+        return []
+
+    radius = int(max(0, min(radius, (x2 - x1) // 2, (y2 - y1) // 2)))
+    if antialias > 1:
+        width_px = int(max(1, x2 - x1 + 1))
+        height_px = int(max(1, y2 - y1 + 1))
+        aa_width = width_px * antialias
+        aa_height = height_px * antialias
+        aa_radius = radius * antialias
+        aa_line = max(1, line_width * antialias)
+        cache = getattr(canvas, "_eae_rr_cache", None)
+        if cache is None:
+            cache = {}
+            canvas._eae_rr_cache = cache
+        cache_key = (width_px, height_px, radius, fill, outline, line_width, antialias)
+        image_ref = cache.get(cache_key)
+        if image_ref is None:
+            img = PIL.Image.new("RGBA", (aa_width, aa_height), (0, 0, 0, 0))
+            drawer = PIL.ImageDraw.Draw(img)
+            shape = (0, 0, aa_width - 1, aa_height - 1)
+            if fill and outline:
+                drawer.rounded_rectangle(shape, radius=aa_radius, fill=fill, outline=outline, width=aa_line)
+            elif fill:
+                drawer.rounded_rectangle(shape, radius=aa_radius, fill=fill)
+            elif outline:
+                drawer.rounded_rectangle(shape, radius=aa_radius, outline=outline, width=aa_line)
+            resampling = getattr(getattr(PIL.Image, "Resampling", PIL.Image), "BILINEAR", PIL.Image.BILINEAR)
+            img = img.resize((width_px, height_px), resampling)
+            image_ref = PIL.ImageTk.PhotoImage(img, master=canvas)
+            cache[cache_key] = image_ref
+            if len(cache) > 32:
+                try:
+                    cache.pop(next(iter(cache)))
+                except Exception:
+                    pass
+        refs = getattr(canvas, "_eae_image_refs", None)
+        if refs is None:
+            refs = []
+            canvas._eae_image_refs = refs
+        refs.append(image_ref)
+        return [canvas.create_image(x1, y1, image=image_ref, anchor="nw")]
+
+    def _draw_fill(rx1, ry1, rx2, ry2, rr, color):
+        if rr <= 0:
+            return [canvas.create_rectangle(rx1, ry1, rx2, ry2, fill=color, outline="")]
+        items = []
+        items.append(canvas.create_rectangle(rx1 + rr, ry1, rx2 - rr, ry2, fill=color, outline=""))
+        items.append(canvas.create_rectangle(rx1, ry1 + rr, rx2, ry2 - rr, fill=color, outline=""))
+        items.append(canvas.create_arc(rx1, ry1, rx1 + rr * 2, ry1 + rr * 2, start=90, extent=90, style=tk.PIESLICE, fill=color, outline=""))
+        items.append(canvas.create_arc(rx2 - rr * 2, ry1, rx2, ry1 + rr * 2, start=0, extent=90, style=tk.PIESLICE, fill=color, outline=""))
+        items.append(canvas.create_arc(rx1, ry2 - rr * 2, rx1 + rr * 2, ry2, start=180, extent=90, style=tk.PIESLICE, fill=color, outline=""))
+        items.append(canvas.create_arc(rx2 - rr * 2, ry2 - rr * 2, rx2, ry2, start=270, extent=90, style=tk.PIESLICE, fill=color, outline=""))
+        return items
+
+    items = []
+    if fill:
+        items.extend(_draw_fill(x1, y1, x2, y2, radius, fill))
+    if outline:
+        if radius <= 0:
+            items.append(canvas.create_rectangle(x1, y1, x2, y2, outline=outline, width=line_width))
+        else:
+            items.append(canvas.create_arc(x1, y1, x1 + radius * 2, y1 + radius * 2, start=90, extent=90, style=tk.ARC, outline=outline, width=line_width))
+            items.append(canvas.create_arc(x2 - radius * 2, y1, x2, y1 + radius * 2, start=0, extent=90, style=tk.ARC, outline=outline, width=line_width))
+            items.append(canvas.create_arc(x1, y2 - radius * 2, x1 + radius * 2, y2, start=180, extent=90, style=tk.ARC, outline=outline, width=line_width))
+            items.append(canvas.create_arc(x2 - radius * 2, y2 - radius * 2, x2, y2, start=270, extent=90, style=tk.ARC, outline=outline, width=line_width))
+            items.append(canvas.create_line(x1 + radius, y1, x2 - radius, y1, fill=outline, width=line_width))
+            items.append(canvas.create_line(x1 + radius, y2, x2 - radius, y2, fill=outline, width=line_width))
+            items.append(canvas.create_line(x1, y1 + radius, x1, y2 - radius, fill=outline, width=line_width))
+            items.append(canvas.create_line(x2, y1 + radius, x2, y2 - radius, fill=outline, width=line_width))
+    return items
+
+
+def apply_win11_window_style(window, dark=False, translucent=False):
+    if os.name != "nt":
+        return
+    try:
+        window.update_idletasks()
+        hwnd = wintypes.HWND(window.winfo_id())
+        rounded = ctypes.c_int(DWMWCP_ROUND)
+        backdrop = ctypes.c_int(DWMSBT_TRANSIENTWINDOW if translucent else DWMSBT_MAINWINDOW)
+        mica_enabled = ctypes.c_int(1 if translucent else 0)
+        dark_mode = ctypes.c_int(1 if dark else 0)
+        _dwmapi.DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_WINDOW_CORNER_PREFERENCE,
+            ctypes.byref(rounded),
+            ctypes.sizeof(rounded),
+        )
+        _dwmapi.DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_SYSTEMBACKDROP_TYPE,
+            ctypes.byref(backdrop),
+            ctypes.sizeof(backdrop),
+        )
+        _dwmapi.DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_MICA_EFFECT,
+            ctypes.byref(mica_enabled),
+            ctypes.sizeof(mica_enabled),
+        )
+        _dwmapi.DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_USE_IMMERSIVE_DARK_MODE,
+            ctypes.byref(dark_mode),
+            ctypes.sizeof(dark_mode),
+        )
+    except Exception:
+        pass
+
+
+def bytes_to_blob(raw_bytes):
+    if not raw_bytes:
+        return DATA_BLOB(0, None), None
+    raw_buffer = (ctypes.c_byte * len(raw_bytes)).from_buffer_copy(raw_bytes)
+    blob = DATA_BLOB(len(raw_bytes), ctypes.cast(raw_buffer, ctypes.POINTER(ctypes.c_byte)))
+    return blob, raw_buffer
+
+
+def blob_to_bytes(blob):
+    if not blob.cbData:
+        return b""
+    return ctypes.string_at(blob.pbData, blob.cbData)
+
+
+def encrypt_with_dpapi(plain_text):
+    if os.name != "nt":
+        return ""
+    plain_bytes = plain_text.encode("utf-8")
+    in_blob, _ = bytes_to_blob(plain_bytes)
+    out_blob = DATA_BLOB()
+    if not _crypt32.CryptProtectData(
+        ctypes.byref(in_blob),
+        "EyesAndEars Secret",
+        None,
+        None,
+        None,
+        CRYPTPROTECT_UI_FORBIDDEN,
+        ctypes.byref(out_blob),
+    ):
+        return ""
+    try:
+        protected_bytes = blob_to_bytes(out_blob)
+        return base64.b64encode(protected_bytes).decode("ascii")
+    finally:
+        _kernel32.LocalFree(out_blob.pbData)
+
+
+def decrypt_with_dpapi(cipher_b64):
+    if os.name != "nt":
+        return ""
+    try:
+        cipher_bytes = base64.b64decode(cipher_b64)
+    except Exception:
+        return ""
+    in_blob, _ = bytes_to_blob(cipher_bytes)
+    out_blob = DATA_BLOB()
+    description = wintypes.LPWSTR()
+    if not _crypt32.CryptUnprotectData(
+        ctypes.byref(in_blob),
+        ctypes.byref(description),
+        None,
+        None,
+        None,
+        CRYPTPROTECT_UI_FORBIDDEN,
+        ctypes.byref(out_blob),
+    ):
+        return ""
+    try:
+        plain_bytes = blob_to_bytes(out_blob)
+        return plain_bytes.decode("utf-8")
+    except Exception:
+        return ""
+    finally:
+        if description:
+            _kernel32.LocalFree(description)
+        _kernel32.LocalFree(out_blob.pbData)
+
+
+def load_config_record():
+    with config_file_lock:
+        if not CONFIG_FILE.exists():
+            return {}
+        try:
+            data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return data
+        except Exception:
+            pass
+    return {}
+
+
+def save_config_record(record):
+    APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps(record, indent=2)
+    temp_path = APP_DATA_DIR / f"{CONFIG_FILE_NAME}.{secrets.token_hex(8)}.tmp"
+    with config_file_lock:
+        temp_path.write_text(payload, encoding="utf-8")
+        try:
+            last_error = None
+            for attempt in range(CONFIG_SAVE_RETRY_COUNT):
+                try:
+                    os.replace(temp_path, CONFIG_FILE)
+                    last_error = None
+                    break
+                except OSError as exc:
+                    last_error = exc
+                    winerror = int(getattr(exc, "winerror", 0) or 0)
+                    if attempt >= (CONFIG_SAVE_RETRY_COUNT - 1) or winerror not in {5, 32}:
+                        raise
+                    time.sleep(CONFIG_SAVE_RETRY_DELAY_SECONDS)
+            if last_error is not None:
+                raise last_error
+        finally:
+            try:
+                if temp_path.exists():
+                    temp_path.unlink()
+            except Exception:
+                pass
+
+
+def load_saved_secret(record, plain_key, encrypted_key):
+    encrypted = str(record.get(encrypted_key, "")).strip()
+    if encrypted:
+        decrypted = decrypt_with_dpapi(encrypted)
+        if decrypted:
+            return decrypted
+    legacy = str(record.get(plain_key, "")).strip()
+    if legacy:
+        encrypted = encrypt_with_dpapi(legacy)
+        if encrypted:
+            record[encrypted_key] = encrypted
+            record.pop(plain_key, None)
+            save_config_record(record)
+        return legacy
+    return ""
+
+
+def save_secret(record, plain_key, encrypted_key, value):
+    encrypted = encrypt_with_dpapi(value)
+    record.pop(plain_key, None)
+    if encrypted:
+        record[encrypted_key] = encrypted
+    elif os.name != "nt":
+        record[plain_key] = value
+    else:
+        return False
+    save_config_record(record)
+    return True
+
+
+def clear_saved_secret(record, plain_key, encrypted_key):
+    record.pop(plain_key, None)
+    record.pop(encrypted_key, None)
+    save_config_record(record)
+
+
+def normalize_remember_me_preference(value):
+    if isinstance(value, bool):
+        return bool(value)
+    text = str(value or "").strip().lower()
+    if not text:
+        return False
+    return text in {"1", "true", "yes", "on"}
+
+
+def clear_persisted_account_auth(record=None, clear_email=False):
+    target = dict(record) if isinstance(record, dict) else load_config_record()
+    target["session_id"] = ""
+    target["remember_me"] = False
+    target.pop("session_token", None)
+    target.pop("session_token_dpapi", None)
+    target.pop("api_key", None)
+    target.pop("api_key_dpapi", None)
+    target.pop("remembered_password", None)
+    target.pop("remembered_password_dpapi", None)
+    if clear_email:
+        target["user_email"] = ""
+    save_config_record(target)
+    return target
+
+
+def normalize_account_email(value):
+    candidate = str(value or "").strip().lower()
+    if not candidate:
+        return ""
+    return candidate
+
+
+def decode_account_api_key_bundle(bundle, password):
+    if not isinstance(bundle, dict):
+        raise RuntimeError("No encrypted API key was returned by the website.")
+    if str(bundle.get("kdf_name", "")).strip().lower() not in {"", "pbkdf2-sha256"}:
+        raise RuntimeError("The website returned an unsupported API-key format.")
+    try:
+        salt = base64.b64decode(str(bundle.get("salt", "") or ""))
+        nonce = base64.b64decode(str(bundle.get("nonce", "") or ""))
+        ciphertext = base64.b64decode(str(bundle.get("ciphertext", "") or ""))
+    except Exception as exc:
+        raise RuntimeError("The website returned a malformed encrypted API key.") from exc
+
+    iterations = int(bundle.get("opslimit", 600000) or 600000)
+    if iterations < 100000:
+        iterations = 100000
+    if len(salt) < 8 or len(nonce) < 12 or not ciphertext:
+        raise RuntimeError("The website returned an incomplete encrypted API key.")
+
+    password_bytes = str(password or "").encode("utf-8")
+    if not password_bytes:
+        raise RuntimeError("Password is required to unlock the encrypted API key.")
+
+    try:
+        kdf = PBKDF2HMAC(algorithm=SHA256(), length=32, salt=salt, iterations=iterations)
+        aes_key = kdf.derive(password_bytes)
+        plaintext = AESGCM(aes_key).decrypt(nonce, ciphertext, None)
+    except Exception as exc:
+        raise RuntimeError("Could not unlock the encrypted API key with that password.") from exc
+
+    resolved = str(plaintext.decode("utf-8", errors="strict") or "").strip()
+    if not resolved:
+        raise RuntimeError("The decrypted API key was empty.")
+    return resolved
+
+
+def set_hidden_path_flag(path):
+    if os.name != "nt":
+        return False
+    try:
+        normalized = str(Path(path))
+        get_attributes = getattr(ctypes.windll.kernel32, "GetFileAttributesW", None)
+        set_attributes = getattr(ctypes.windll.kernel32, "SetFileAttributesW", None)
+        if get_attributes is None or set_attributes is None:
+            return False
+        current_attributes = int(get_attributes(normalized))
+        if current_attributes == INVALID_FILE_ATTRIBUTES:
+            current_attributes = 0
+        desired_attributes = current_attributes | FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_NOT_CONTENT_INDEXED
+        if desired_attributes != current_attributes:
+            return bool(set_attributes(normalized, desired_attributes))
+        return True
+    except Exception:
+        logger.debug("Failed to mark hidden runtime path: %s", path, exc_info=True)
+        return False
+
+
+def ensure_pro_auth_runtime_dir():
+    PRO_AUTH_RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+    set_hidden_path_flag(PRO_AUTH_RUNTIME_DIR)
+    return PRO_AUTH_RUNTIME_DIR
+
+
+def normalize_pro_auth_guard_state(payload=None):
+    data = payload if isinstance(payload, dict) else {}
+    normalized = {
+        "version": 1,
+        "failure_count": 0,
+        "last_failure_at": 0,
+        "locked_at": 0,
+        "locked_until": 0,
+        "hard_locked": False,
+        "time_source": "",
+    }
+    for key in ("version", "failure_count", "last_failure_at", "locked_at", "locked_until"):
+        try:
+            normalized[key] = max(0, int(data.get(key, normalized[key])))
+        except Exception:
+            pass
+    normalized["hard_locked"] = bool(data.get("hard_locked", False))
+    normalized["time_source"] = str(data.get("time_source", "") or "").strip()[:255]
+    return normalized
+
+
+def load_pro_auth_guard_state():
+    with pro_auth_guard_lock:
+        if not PRO_AUTH_LOCK_FILE.exists():
+            return normalize_pro_auth_guard_state()
+        try:
+            raw_payload = PRO_AUTH_LOCK_FILE.read_text(encoding="utf-8").strip()
+        except Exception:
+            return normalize_pro_auth_guard_state()
+    if not raw_payload:
+        return normalize_pro_auth_guard_state()
+    if os.name == "nt":
+        plain_payload = decrypt_with_dpapi(raw_payload)
+    else:
+        try:
+            plain_payload = base64.b64decode(raw_payload).decode("utf-8")
+        except Exception:
+            plain_payload = ""
+    if not plain_payload:
+        return normalize_pro_auth_guard_state()
+    try:
+        decoded = json.loads(plain_payload)
+    except Exception:
+        decoded = {}
+    return normalize_pro_auth_guard_state(decoded)
+
+
+def save_pro_auth_guard_state(payload):
+    state = normalize_pro_auth_guard_state(payload)
+    should_clear = (
+        state["failure_count"] <= 0
+        and state["last_failure_at"] <= 0
+        and state["locked_at"] <= 0
+        and state["locked_until"] <= 0
+        and not state["hard_locked"]
+    )
+    ensure_pro_auth_runtime_dir()
+    with pro_auth_guard_lock:
+        if should_clear:
+            try:
+                if PRO_AUTH_LOCK_FILE.exists():
+                    PRO_AUTH_LOCK_FILE.unlink()
+            except Exception:
+                pass
+            return
+        serialized = json.dumps(state, separators=(",", ":"), sort_keys=True)
+        if os.name == "nt":
+            stored_payload = encrypt_with_dpapi(serialized)
+            if not stored_payload:
+                raise RuntimeError("Could not protect the legacy auth guard state with DPAPI.")
+        else:
+            stored_payload = base64.b64encode(serialized.encode("utf-8")).decode("ascii")
+        temp_path = PRO_AUTH_RUNTIME_DIR / f"{PRO_AUTH_HIDDEN_FILE_NAME}.{secrets.token_hex(6)}.tmp"
+        temp_path.write_text(stored_payload, encoding="utf-8")
+        try:
+            os.replace(temp_path, PRO_AUTH_LOCK_FILE)
+            set_hidden_path_flag(PRO_AUTH_LOCK_FILE)
+        finally:
+            try:
+                if temp_path.exists():
+                    temp_path.unlink()
+            except Exception:
+                pass
+
+
+def clear_pro_auth_guard_state():
+    save_pro_auth_guard_state({})
+
+
+def parse_remote_utc_epoch(value):
+    text = str(value or "").strip()
+    if not text:
+        return 0
+    try:
+        normalized = text.replace("Z", "+00:00")
+        normalized = re.sub(r"\.(\d{6})\d+(?=([+-]\d{2}:\d{2})?$)", r".\1", normalized)
+        parsed = datetime.fromisoformat(normalized)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return max(0, int(parsed.timestamp()))
+    except Exception:
+        return 0
+
+
+def extract_trusted_epoch_from_payload(payload):
+    if not isinstance(payload, dict):
+        return 0
+    for key in ("unixtime", "unixTime", "timestamp"):
+        raw_value = payload.get(key)
+        if isinstance(raw_value, (int, float)):
+            return max(0, int(raw_value))
+        try:
+            candidate = int(str(raw_value or "").strip())
+            if candidate > 0:
+                return candidate
+        except Exception:
+            pass
+    for key in ("utc_datetime", "utcDateTime", "datetime", "dateTime", "currentDateTime"):
+        candidate = parse_remote_utc_epoch(payload.get(key))
+        if candidate > 0:
+            return candidate
+    return 0
+
+
+def fetch_trusted_utc_epoch():
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": f"{APP_NAME}/{APP_VERSION}",
+    }
+    failures = []
+    for url in TRUSTED_TIME_URLS:
+        try:
+            response = HTTP_SESSION.get(url, headers=headers, timeout=TRUSTED_TIME_TIMEOUT_SECONDS, allow_redirects=True)
+        except requests.RequestException as exc:
+            failures.append(f"{url} ({exc})")
+            continue
+        if not response.ok:
+            failures.append(f"{url} (status {response.status_code})")
+            continue
+        try:
+            payload = response.json()
+        except Exception:
+            failures.append(f"{url} (non-JSON)")
+            continue
+        trusted_epoch = extract_trusted_epoch_from_payload(payload)
+        if trusted_epoch > 0:
+            return trusted_epoch, url
+        failures.append(f"{url} (missing time value)")
+    if failures:
+        logger.warning("Trusted online time lookup failed: %s", "; ".join(failures[:3]))
+    raise RuntimeError(tr("error.pro_time_unavailable"))
+
+
+def extract_lockout_seconds_from_message(message):
+    text = str(message or "").strip().lower()
+    if not text:
+        return 0, False
+    seconds_match = re.search(r"(\d+)\s+seconds?", text)
+    if seconds_match:
+        seconds_value = max(0, int(seconds_match.group(1)))
+        return seconds_value, "locked for" in text
+    hours_match = re.search(r"(\d+)\s+hours?", text)
+    if hours_match:
+        return max(0, int(hours_match.group(1))) * 3600, True
+    return 0, False
+
+
+def pro_auth_lockout_duration_for_failure_count(failure_count):
+    count = max(0, int(failure_count or 0))
+    if count >= PRO_AUTH_HARD_LOCKOUT_FAILURE:
+        return PRO_AUTH_HARD_LOCKOUT_SECONDS, True
+    if count < PRO_AUTH_FIRST_LOCKOUT_FAILURE:
+        return 0, False
+    lockout_level = max(0, count - 2)
+    return PRO_AUTH_LOCKOUT_BASE_SECONDS * (2 ** max(0, lockout_level - 1)), False
+
+
+def build_pro_auth_lockout_message(seconds, hard_locked=False):
+    remaining_seconds = max(1, int(math.ceil(float(seconds or 0))))
+    key = "error.pro_lockout_locked" if hard_locked else "error.pro_lockout_wait"
+    return tr(key, seconds=remaining_seconds)
+
+
+def inspect_pro_auth_guard(now_epoch):
+    current_time = max(0, int(now_epoch or 0))
+    state = load_pro_auth_guard_state()
+    changed = False
+    if state["locked_until"] > 0 and current_time >= state["locked_until"]:
+        state = normalize_pro_auth_guard_state()
+        changed = True
+    elif state["failure_count"] > 0 and state["last_failure_at"] > 0:
+        if current_time - state["last_failure_at"] > PRO_AUTH_FAILURE_WINDOW_SECONDS:
+            state = normalize_pro_auth_guard_state()
+            changed = True
+    if changed:
+        save_pro_auth_guard_state(state)
+    if state["locked_until"] > current_time:
+        remaining = max(1, state["locked_until"] - current_time)
+        return True, remaining, bool(state["hard_locked"]), state
+    return False, 0, False, state
+
+
+def get_live_pro_auth_lockout_state():
+    try:
+        trusted_now, _time_source = fetch_trusted_utc_epoch()
+    except Exception:
+        return 0, False
+    is_locked, remaining_seconds, hard_locked, _state = inspect_pro_auth_guard(trusted_now)
+    if not is_locked or remaining_seconds <= 0:
+        return 0, False
+    return int(max(1, remaining_seconds)), bool(hard_locked)
+
+
+def record_local_pro_auth_failure(now_epoch, time_source=""):
+    current_time = max(0, int(now_epoch or 0))
+    _, _, _, state = inspect_pro_auth_guard(current_time)
+    if state["failure_count"] > 0 and state["last_failure_at"] > 0:
+        if current_time - state["last_failure_at"] > PRO_AUTH_FAILURE_WINDOW_SECONDS:
+            state = normalize_pro_auth_guard_state()
+    state["failure_count"] = max(0, int(state.get("failure_count", 0))) + 1
+    state["last_failure_at"] = current_time
+    state["time_source"] = str(time_source or "").strip()[:255]
+    lockout_seconds, hard_locked = pro_auth_lockout_duration_for_failure_count(state["failure_count"])
+    if lockout_seconds > 0:
+        state["locked_at"] = current_time
+        state["locked_until"] = current_time + lockout_seconds
+        state["hard_locked"] = bool(hard_locked)
+    else:
+        state["locked_at"] = 0
+        state["locked_until"] = 0
+        state["hard_locked"] = False
+    save_pro_auth_guard_state(state)
+    if lockout_seconds > 0:
+        return build_pro_auth_lockout_message(lockout_seconds, hard_locked=hard_locked)
+    return ""
+
+
+def sync_local_pro_auth_lockout(now_epoch, server_message, time_source=""):
+    lockout_seconds, hard_locked = extract_lockout_seconds_from_message(server_message)
+    if lockout_seconds <= 0:
+        return str(server_message or tr("error.auth_denied"))
+    state = load_pro_auth_guard_state()
+    state["failure_count"] = max(
+        int(state.get("failure_count", 0) or 0),
+        PRO_AUTH_HARD_LOCKOUT_FAILURE if hard_locked else PRO_AUTH_FIRST_LOCKOUT_FAILURE,
+    )
+    state["last_failure_at"] = max(0, int(now_epoch or 0))
+    state["locked_at"] = max(0, int(now_epoch or 0))
+    state["locked_until"] = state["locked_at"] + lockout_seconds
+    state["hard_locked"] = bool(hard_locked)
+    state["time_source"] = str(time_source or "").strip()[:255]
+    save_pro_auth_guard_state(state)
+    return build_pro_auth_lockout_message(lockout_seconds, hard_locked=hard_locked)
+
+
+def center_window(window, width, height):
+    window.update_idletasks()
+    screen_width = int(window.winfo_screenwidth())
+    screen_height = int(window.winfo_screenheight())
+    left, top, right, bottom = get_active_monitor_work_area(screen_width, screen_height)
+    work_width = max(1, int(right - left))
+    work_height = max(1, int(bottom - top))
+    max_width = max(360, work_width - 24)
+    max_height = max(280, work_height - 56)
+    width = int(max(320, min(int(width), max_width)))
+    height = int(max(240, min(int(height), max_height)))
+    x = int(left + max(0, (work_width - width) // 2))
+    y = int(top + max(0, (work_height - height) // 2))
+    window.geometry(f"{width}x{height}+{x}+{y}")
+
+
+def fit_window_to_content(window, min_width=0, min_height=0, max_width=0, max_height=0):
+    try:
+        window.update_idletasks()
+        target_width = max(int(min_width), int(window.winfo_width()), int(window.winfo_reqwidth()))
+        target_height = max(int(min_height), int(window.winfo_height()), int(window.winfo_reqheight()))
+        if max_width:
+            target_width = min(target_width, int(max_width))
+        if max_height:
+            target_height = min(target_height, int(max_height))
+        center_window(window, target_width, target_height)
+    except Exception:
+        pass
+
+
+def make_dialog_shell(title, width, height, parent=None):
+    ensure_ui_crisp_mode()
+    root = tk.Toplevel(parent) if parent else tk.Tk()
+    apply_tk_scaling(root)
+    root.title(title)
+    root.configure(bg=UI_BG)
+    center_window(root, width, height)
+    screen_width = root.winfo_screenwidth()
+    screen_height = root.winfo_screenheight()
+    min_width = min(max(420, min(width, 960)), max(320, screen_width - 24))
+    min_height = min(max(280, min(height, 860)), max(240, screen_height - 56))
+    root.minsize(min_width, min_height)
+    root.resizable(True, True)
+    configure_private_window(root, dark=system_dark_theme_enabled, translucent=True)
+    try:
+        root.attributes("-alpha", 0.985)
+    except Exception:
+        pass
+    if parent:
+        try:
+            root.transient(parent)
+        except Exception:
+            pass
+    root.lift()
+    try:
+        root.attributes("-topmost", True)
+        root.after(250, lambda: root.attributes("-topmost", False))
+    except Exception:
+        pass
+
+    shell = tk.Frame(root, bg=UI_BG, bd=0)
+    shell.pack(fill="both", expand=True, padx=18, pady=16)
+
+    accent = tk.Frame(shell, bg=UI_ACCENT, height=5, bd=0)
+    accent.pack(fill="x", pady=(0, 10))
+
+    card = tk.Frame(
+        shell,
+        bg=UI_CARD_BG,
+        highlightbackground=UI_BORDER,
+        highlightthickness=1,
+        bd=0,
+    )
+    card.pack(fill="both", expand=True)
+    return root, card
+
+
+def apply_widget_corner_region(widget, radius=12):
+    if os.name != "nt" or widget is None:
+        return False
+    try:
+        if not widget.winfo_exists():
+            return False
+        widget.update_idletasks()
+        width = int(max(1, widget.winfo_width()))
+        height = int(max(1, widget.winfo_height()))
+        if width <= 2 or height <= 2:
+            return False
+        radius = int(max(2, min(radius, width // 2, height // 2)))
+        region = _gdi32.CreateRoundRectRgn(0, 0, width + 1, height + 1, radius * 2, radius * 2)
+        if not region:
+            return False
+        hwnd = wintypes.HWND(widget.winfo_id())
+        applied = bool(_user32.SetWindowRgn(hwnd, region, True))
+        if not applied:
+            _gdi32.DeleteObject(region)
+        return applied
+    except Exception:
+        return False
+
+
+def schedule_widget_rounding(widget, radius=12):
+    if os.name != "nt" or widget is None:
+        return
+    widget._eae_round_radius = int(max(2, radius))
+
+    def _apply(_event=None):
+        try:
+            if widget.winfo_exists():
+                apply_widget_corner_region(widget, int(getattr(widget, "_eae_round_radius", radius)))
+        except Exception:
+            pass
+
+    if not getattr(widget, "_eae_round_bound", False):
+        try:
+            widget.bind("<Configure>", _apply, add="+")
+            widget._eae_round_bound = True
+        except Exception:
+            pass
+    try:
+        widget.after(16, _apply)
+    except Exception:
+        pass
+
+
+def style_button(widget, *, primary=False, active=False):
+    if primary:
+        widget.configure(
+            bg=UI_PRIMARY,
+            fg="white",
+            activebackground=UI_PRIMARY_ACTIVE,
+            activeforeground="white",
+            highlightbackground=UI_PRIMARY,
+            highlightcolor=UI_PRIMARY,
+        )
+        schedule_widget_rounding(widget, radius=14)
+        return
+    if active:
+        widget.configure(
+            bg=UI_SOFT,
+            fg=UI_TEXT,
+            activebackground=UI_SOFT,
+            activeforeground=UI_TEXT,
+            highlightbackground=UI_SOFT,
+            highlightcolor=UI_SOFT,
+        )
+        schedule_widget_rounding(widget, radius=14)
+        return
+    widget.configure(
+        bg=UI_GHOST_BG,
+        fg=UI_TEXT,
+        activebackground=UI_GHOST_ACTIVE,
+        activeforeground=UI_TEXT,
+        highlightbackground=UI_BORDER,
+        highlightcolor=UI_BORDER,
+    )
+    schedule_widget_rounding(widget, radius=14)
+
+
+class StartupProgressWindow:
+    STAGE_ORDER = [
+        "startup.launching",
+        "startup.restoring",
+        "startup.opening_setup",
+        "startup.checking_auth",
+        "startup.connecting_pro",
+        "startup.initializing_model",
+        "startup.starting_indicator",
+        "startup.ready",
+    ]
+
+    def __init__(self):
+        ensure_ui_crisp_mode()
+        self.root = tk.Tk()
+        apply_tk_scaling(self.root)
+        self.root.overrideredirect(True)
+        self.root.configure(bg=UI_BG)
+        self._base_window_width = 540
+        self._base_window_height = 384
+        self._window_fit_active = False
+        center_window(self.root, self._base_window_width, self._base_window_height)
+        self.root.resizable(False, False)
+        try:
+            self.root.attributes("-topmost", True)
+        except Exception:
+            pass
+        self.root.protocol("WM_DELETE_WINDOW", lambda: None)
+        self.root.bind("<Escape>", lambda _event: "break")
+        self.root.bind("<Configure>", self._on_configure, add="+")
+        self.stage_key = "startup.launching"
+        self.hidden = False
+        self.animation_after_id = None
+        self._eye_photo = None
+        self._base_title_font_size = 22
+        self._base_stage_font_size = 13
+
+        configure_private_window(self.root, dark=system_dark_theme_enabled, translucent=True)
+        try:
+            self.root.attributes("-alpha", 0.985)
+        except Exception:
+            pass
+
+        shell = tk.Frame(self.root, bg=UI_BG, bd=0)
+        shell.pack(fill="both", expand=True, padx=16, pady=16)
+
+        card = tk.Frame(
+            shell,
+            bg=UI_CARD_BG,
+            highlightbackground=UI_BORDER,
+            highlightthickness=1,
+            bd=0,
+        )
+        card.pack(fill="both", expand=True)
+
+        self.inner = tk.Frame(card, bg=UI_CARD_BG, bd=0)
+        self.inner.pack(fill="both", expand=True, padx=30, pady=26)
+
+        self.eye_canvas = tk.Canvas(
+            self.inner,
+            width=220,
+            height=116,
+            highlightthickness=0,
+            bd=0,
+            bg=UI_CARD_BG,
+        )
+        self.eye_canvas.pack(pady=(2, 14))
+
+        self.title_font = tkfont.Font(root=self.root, family=UI_FONT, size=self._base_title_font_size, weight="bold")
+        self.stage_font = tkfont.Font(root=self.root, family=UI_FONT, size=self._base_stage_font_size, weight="bold")
+
+        self.title_label = tk.Label(
+            self.inner,
+            text="",
+            bg=UI_CARD_BG,
+            fg=UI_TEXT,
+            font=self.title_font,
+            justify="center",
+            anchor="center",
+        )
+        self.title_label.pack(fill="x")
+
+        self.stage_label = tk.Label(
+            self.inner,
+            text="",
+            bg=UI_CARD_BG,
+            fg=UI_TEXT,
+            font=self.stage_font,
+            justify="center",
+            anchor="center",
+        )
+        self.stage_label.pack(fill="x", pady=(10, 0))
+
+        self.detail_label = tk.Label(
+            self.inner,
+            text="",
+            bg=UI_CARD_BG,
+            fg=UI_MUTED,
+            font=(UI_FONT, 10),
+            justify="center",
+            wraplength=320,
+            anchor="center",
+        )
+        self.detail_label.pack(fill="x", pady=(8, 0))
+
+        self.root.update_idletasks()
+        self._refresh_layout()
+        self._apply_window_rounding()
+        self._animate_eye()
+        self.set_stage("startup.launching")
+
+    def _on_configure(self, _event=None):
+        self._apply_window_rounding()
+        self._refresh_layout()
+
+    def _apply_window_rounding(self):
+        try:
+            apply_window_corner_region(self.root, 26)
+        except Exception:
+            pass
+
+    def _fit_window_to_content(self):
+        if self._window_fit_active:
+            return
+        self._window_fit_active = True
+        try:
+            fit_window_to_content(
+                self.root,
+                min_width=self._base_window_width,
+                min_height=self._base_window_height,
+                max_width=max(360, int(self.root.winfo_screenwidth()) - 24),
+                max_height=max(280, int(self.root.winfo_screenheight()) - 56),
+            )
+        except Exception:
+            pass
+        finally:
+            self._window_fit_active = False
+
+    def _refresh_layout(self):
+        try:
+            self.root.update_idletasks()
+            available_width = max(260, int(self.inner.winfo_width()) - 8)
+        except Exception:
+            available_width = 420
+        title_wrap = max(280, available_width)
+        stage_wrap = max(240, available_width - 24)
+        detail_wrap = max(220, available_width - 36)
+        try:
+            self.title_label.configure(wraplength=title_wrap)
+            self.stage_label.configure(wraplength=stage_wrap)
+            self.detail_label.configure(wraplength=detail_wrap)
+        except Exception:
+            pass
+
+        title_text = str(self.title_label.cget("text") or "")
+        size = self._base_title_font_size
+        while title_text and size > 16:
+            try:
+                self.title_font.configure(size=size)
+                measured = int(self.title_font.measure(title_text))
+            except Exception:
+                break
+            if measured <= title_wrap:
+                break
+            size -= 1
+        try:
+            self.title_font.configure(size=size)
+        except Exception:
+            pass
+
+        stage_text = str(self.stage_label.cget("text") or "")
+        stage_size = self._base_stage_font_size
+        while stage_text and stage_size > 11:
+            try:
+                self.stage_font.configure(size=stage_size)
+                measured = int(self.stage_font.measure(stage_text))
+            except Exception:
+                break
+            if measured <= stage_wrap:
+                break
+            stage_size -= 1
+        try:
+            self.stage_font.configure(size=stage_size)
+        except Exception:
+            pass
+
+    def _eye_open_ratio(self):
+        phase = time.monotonic() % 2.6
+        if phase < 1.9:
+            return 1.0
+        if phase < 2.02:
+            return max(0.08, 1.0 - ((phase - 1.9) / 0.12) * 0.92)
+        if phase < 2.14:
+            return min(1.0, 0.08 + ((phase - 2.02) / 0.12) * 0.92)
+        return 1.0
+
+    def _draw_eye(self):
+        canvas = self.eye_canvas
+        canvas.delete("all")
+        width = int(canvas.cget("width"))
+        height = int(canvas.cget("height"))
+        center_x = width // 2
+        center_y = int(height * 0.48)
+        open_ratio = self._eye_open_ratio()
+        antialias = 4
+        aa_width = width * antialias
+        aa_height = height * antialias
+        image = PIL.Image.new("RGBA", (aa_width, aa_height), (0, 0, 0, 0))
+        draw = PIL.ImageDraw.Draw(image)
+
+        def scale(point):
+            return (int(point[0] * antialias), int(point[1] * antialias))
+
+        def sample_quadratic(start, control, end, steps=28):
+            points = []
+            for index in range(steps + 1):
+                t = float(index) / float(steps)
+                inv = 1.0 - t
+                x = (inv * inv * start[0]) + (2.0 * inv * t * control[0]) + (t * t * end[0])
+                y = (inv * inv * start[1]) + (2.0 * inv * t * control[1]) + (t * t * end[1])
+                points.append(scale((x, y)))
+            return points
+
+        def sample_cubic(start, control_a, control_b, end, steps=64):
+            points = []
+            for index in range(steps + 1):
+                t = float(index) / float(steps)
+                inv = 1.0 - t
+                x = (
+                    (inv ** 3) * start[0]
+                    + (3.0 * (inv ** 2) * t * control_a[0])
+                    + (3.0 * inv * (t ** 2) * control_b[0])
+                    + ((t ** 3) * end[0])
+                )
+                y = (
+                    (inv ** 3) * start[1]
+                    + (3.0 * (inv ** 2) * t * control_a[1])
+                    + (3.0 * inv * (t ** 2) * control_b[1])
+                    + ((t ** 3) * end[1])
+                )
+                points.append(scale((x, y)))
+            return points
+
+        def build_eye_curves():
+            half_width = float(max(64, (width // 2) - 36))
+            lid_height = float(max(7.0, 18.0 * open_ratio))
+            lid_sweep = 5.8 + (open_ratio * 1.8)
+            left_corner = (center_x - half_width, float(center_y))
+            right_corner = (center_x + half_width, float(center_y))
+            top_curve = sample_cubic(
+                left_corner,
+                (center_x - (half_width * 0.58), center_y - lid_height - lid_sweep),
+                (center_x + (half_width * 0.58), center_y - lid_height - lid_sweep),
+                right_corner,
+                steps=72,
+            )
+            mirror_y = int(center_y * antialias)
+            bottom_curve = [(x, (2 * mirror_y) - y) for x, y in top_curve]
+            return top_curve, bottom_curve
+
+        outline = (241, 247, 255, 242)
+        outline_glow = (96, 170, 255, 28)
+        sclera_fill = (247, 250, 255, 20)
+        top_curve, bottom_curve = build_eye_curves()
+        if open_ratio <= 0.16:
+            lid_line = sample_quadratic((34, center_y), (center_x, center_y - 1.6), (width - 34, center_y), steps=36)
+            draw.line(lid_line, fill=outline_glow, width=22)
+            draw.line(lid_line, fill=outline, width=10)
+        else:
+            eye_polygon = top_curve + list(reversed(bottom_curve))
+            mask = PIL.Image.new("L", (aa_width, aa_height), 0)
+            PIL.ImageDraw.Draw(mask).polygon(eye_polygon, fill=255)
+
+            sclera_layer = PIL.Image.new("RGBA", (aa_width, aa_height), (0, 0, 0, 0))
+            sclera_draw = PIL.ImageDraw.Draw(sclera_layer)
+            sclera_draw.polygon(eye_polygon, fill=sclera_fill)
+            sclera_highlight_box = (
+                int((center_x - 46) * antialias),
+                int((center_y - 18) * antialias),
+                int((center_x + 46) * antialias),
+                int((center_y + 16) * antialias),
+            )
+            sclera_draw.ellipse(sclera_highlight_box, fill=(255, 255, 255, 12))
+            image.alpha_composite(sclera_layer)
+
+            iris_shift = int(math.sin(time.monotonic() * 0.9) * 4)
+            iris_radius = max(10, int(11.5 + (open_ratio * 1.5)))
+            pupil_radius = max(4, int(iris_radius * 0.31))
+            iris_x = center_x + iris_shift
+            iris_y = center_y
+            iris_layer = PIL.Image.new("RGBA", (aa_width, aa_height), (0, 0, 0, 0))
+            iris_draw = PIL.ImageDraw.Draw(iris_layer)
+            shadow_box = (
+                int((iris_x - iris_radius - 4) * antialias),
+                int((iris_y - iris_radius - 3) * antialias),
+                int((iris_x + iris_radius + 4) * antialias),
+                int((iris_y + iris_radius + 5) * antialias),
+            )
+            iris_box = (
+                int((iris_x - iris_radius) * antialias),
+                int((iris_y - iris_radius) * antialias),
+                int((iris_x + iris_radius) * antialias),
+                int((iris_y + iris_radius) * antialias),
+            )
+            iris_ring_radius = max(7, int(iris_radius * 0.66))
+            iris_inner_box = (
+                int((iris_x - iris_ring_radius) * antialias),
+                int((iris_y - iris_ring_radius) * antialias),
+                int((iris_x + iris_ring_radius) * antialias),
+                int((iris_y + iris_ring_radius) * antialias),
+            )
+            pupil_box = (
+                int((iris_x - pupil_radius) * antialias),
+                int((iris_y - pupil_radius) * antialias),
+                int((iris_x + pupil_radius) * antialias),
+                int((iris_y + pupil_radius) * antialias),
+            )
+            highlight_box = (
+                int((iris_x - iris_radius + 4.6) * antialias),
+                int((iris_y - iris_radius + 3.6) * antialias),
+                int((iris_x - iris_radius + 9.2) * antialias),
+                int((iris_y - iris_radius + 8.2) * antialias),
+            )
+            iris_draw.ellipse(shadow_box, fill=(6, 18, 34, 34))
+            iris_draw.ellipse(iris_box, fill=(55, 132, 244, 255), outline=(24, 58, 112, 255), width=6)
+            iris_draw.ellipse(iris_inner_box, fill=(176, 221, 255, 176))
+            iris_draw.ellipse(pupil_box, fill=(4, 15, 30, 255))
+            iris_draw.ellipse(highlight_box, fill=(255, 255, 255, 236))
+            image.alpha_composite(PIL.Image.composite(iris_layer, PIL.Image.new("RGBA", (aa_width, aa_height), (0, 0, 0, 0)), mask))
+
+            lid_shadow = PIL.Image.new("RGBA", (aa_width, aa_height), (0, 0, 0, 0))
+            lid_shadow_draw = PIL.ImageDraw.Draw(lid_shadow)
+            shadow_depth = int(max(14, 18 * open_ratio) * antialias)
+            top_shadow_polygon = top_curve + list(reversed([(x, y + shadow_depth) for x, y in top_curve]))
+            lid_shadow_draw.polygon(top_shadow_polygon, fill=(7, 18, 36, 26))
+            image.alpha_composite(PIL.Image.composite(lid_shadow, PIL.Image.new("RGBA", (aa_width, aa_height), (0, 0, 0, 0)), mask))
+
+            draw.line(top_curve, fill=outline_glow, width=14)
+            draw.line(bottom_curve, fill=outline_glow, width=14)
+            draw.line(top_curve, fill=outline, width=8)
+            draw.line(bottom_curve, fill=outline, width=8)
+
+        resampling = getattr(getattr(PIL.Image, "Resampling", PIL.Image), "LANCZOS", PIL.Image.LANCZOS)
+        image = image.resize((width, height), resampling)
+        self._eye_photo = PIL.ImageTk.PhotoImage(image, master=canvas)
+        canvas.create_image(0, 0, image=self._eye_photo, anchor="nw")
+
+    def _animate_eye(self):
+        self.animation_after_id = None
+        try:
+            if not self.root.winfo_exists():
+                return
+            self._draw_eye()
+            self.animation_after_id = self.root.after(42, self._animate_eye)
+        except Exception:
+            self.animation_after_id = None
+
+    def set_stage(self, stage_key):
+        if stage_key not in self.STAGE_ORDER:
+            stage_key = "startup.launching"
+        self.stage_key = stage_key
+        self.title_label.configure(text=tr("startup.title"))
+        self.stage_label.configure(text=tr(stage_key))
+        self.detail_label.configure(text=tr(stage_key.replace("startup.", "startup.detail.")))
+        self._refresh_layout()
+        self._fit_window_to_content()
+        self.refresh()
+
+    def refresh(self):
+        try:
+            self.root.update_idletasks()
+            self.root.update()
+        except Exception:
+            pass
+
+    def hide(self):
+        if self.hidden:
+            return
+        try:
+            self.root.withdraw()
+        except Exception:
+            return
+        self.hidden = True
+
+    def show(self):
+        if not self.hidden:
+            self.refresh()
+            return
+        try:
+            self.root.deiconify()
+            self.root.attributes("-topmost", True)
+            self.hidden = False
+        except Exception:
+            return
+        self.refresh()
+
+    def close(self):
+        if self.animation_after_id is not None:
+            try:
+                self.root.after_cancel(self.animation_after_id)
+            except Exception:
+                pass
+            self.animation_after_id = None
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
+
+
+def build_startup_splash_html():
+        return r"""
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        :root {
+            color-scheme: dark;
+            --brand-eye-width: 188px;
+            --brand-eye-height: 102px;
+            --brand-eye-iris-size: 50px;
+            --brand-eye-pupil-size: 15px;
+            --badge-blink-duration: 6.2s;
+            --badge-bob-duration: 4.6s;
+            --badge-glance-duration: 1.9s;
+            --badge-look-x: 0px;
+            --badge-look-y: 0px;
+            --star-core: rgba(116, 162, 241, 0.96);
+            --star-tail: rgba(116, 162, 241, 0);
+            --star-glow: rgba(179, 209, 255, 0.8);
+            --shell-bg:
+                radial-gradient(circle at 16% 12%, rgba(79, 130, 228, 0.28), transparent 30%),
+                radial-gradient(circle at 84% 10%, rgba(88, 165, 255, 0.16), transparent 24%),
+                linear-gradient(180deg, #101c32 0%, #0b1730 100%);
+            --card-bg: rgba(10, 22, 42, 0.8);
+            --card-border: rgba(145, 179, 235, 0.18);
+            --eye-stage-bg:
+                radial-gradient(circle at 50% 46%, rgba(56, 111, 241, 0.12), transparent 26%),
+                linear-gradient(180deg, rgba(7, 16, 33, 0.26), rgba(12, 31, 61, 0.08));
+            --eye-stage-border: rgba(132, 173, 243, 0.12);
+            --title-color: #eaf2ff;
+            --brand-color: #a5b8da;
+            --stage-bg: rgba(83, 138, 255, 0.14);
+            --stage-border: rgba(148, 186, 255, 0.22);
+            --stage-color: #bfd4ff;
+            --detail-color: #a5b8da;
+        }
+
+        * { box-sizing: border-box; }
+
+        html, body {
+            margin: 0;
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+            font-family: "Segoe UI Variable Text", "Segoe UI", sans-serif;
+            background: var(--shell-bg);
+            color: var(--title-color);
+        }
+
+        body {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 0;
+            position: relative;
+        }
+
+        body.theme-light {
+            color-scheme: light;
+            --star-core: rgba(58, 109, 226, 0.96);
+            --star-tail: rgba(58, 109, 226, 0);
+            --star-glow: rgba(105, 155, 255, 0.92);
+            --shell-bg:
+                radial-gradient(circle at 16% 12%, rgba(114, 179, 255, 0.26), transparent 32%),
+                radial-gradient(circle at 84% 10%, rgba(160, 212, 255, 0.24), transparent 26%),
+                linear-gradient(180deg, #eef4fd 0%, #e3edf9 100%);
+            --card-bg: rgba(255, 255, 255, 0.8);
+            --card-border: rgba(44, 83, 149, 0.12);
+            --eye-stage-bg:
+                radial-gradient(circle at 50% 46%, rgba(56, 111, 241, 0.1), transparent 24%),
+                linear-gradient(180deg, rgba(255, 255, 255, 0.18), rgba(222, 235, 255, 0.08));
+            --eye-stage-border: rgba(90, 134, 214, 0.1);
+            --title-color: #17315d;
+            --brand-color: #5a7094;
+            --stage-bg: rgba(83, 138, 255, 0.12);
+            --stage-border: rgba(83, 138, 255, 0.2);
+            --stage-color: #29518d;
+            --detail-color: #5a7094;
+        }
+
+        .startup-shell {
+            width: min(680px, calc(100vw - 12px));
+            min-height: min(470px, calc(100vh - 12px));
+            position: relative;
+            max-height: calc(100vh - 8px);
+            overflow: auto;
+            border-radius: 34px;
+            border: 1px solid var(--card-border);
+            background:
+                linear-gradient(180deg, rgba(255, 255, 255, 0.06), rgba(255, 255, 255, 0.02)),
+                var(--card-bg);
+            box-shadow:
+                0 30px 80px rgba(1, 7, 18, 0.34),
+                inset 0 1px 0 rgba(255, 255, 255, 0.08);
+            backdrop-filter: blur(22px);
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            gap: 14px;
+            text-align: center;
+            padding: 22px 22px 24px;
+            isolation: isolate;
+        }
+
+        .startup-shell::before {
+            content: "";
+            position: absolute;
+            inset: 0;
+            background:
+                radial-gradient(circle at 50% 0%, rgba(255, 255, 255, 0.14), transparent 28%),
+                radial-gradient(circle at 50% 58%, rgba(43, 92, 195, 0.12), transparent 34%);
+            pointer-events: none;
+            z-index: 0;
+        }
+
+        .startup-shell > * {
+            position: relative;
+            z-index: 1;
+        }
+
+        .brand {
+            margin: 0;
+            font-size: 12px;
+            letter-spacing: 0.13em;
+            text-transform: uppercase;
+            font-weight: 800;
+            color: var(--brand-color);
+        }
+
+        .title {
+            margin: 0;
+            max-width: 520px;
+            font-size: clamp(30px, 4.6vw, 40px);
+            line-height: 1.02;
+            color: var(--title-color);
+            letter-spacing: -0.035em;
+        }
+
+        .stage {
+            margin: 0;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            min-height: 0;
+            padding: 9px 16px;
+            border-radius: 999px;
+            background: var(--stage-bg);
+            border: 1px solid var(--stage-border);
+            color: var(--stage-color);
+            font-size: 15px;
+            font-weight: 800;
+            letter-spacing: 0.01em;
+        }
+
+        .detail {
+            margin: 0;
+            max-width: 470px;
+            min-height: 0;
+            color: var(--detail-color);
+            font-size: 14px;
+            line-height: 1.45;
+        }
+
+        .eye-stage {
+            position: relative;
+            width: min(100%, 520px);
+            min-height: 178px;
+            display: grid;
+            place-items: center;
+            border-radius: 28px;
+            overflow: hidden;
+            background: var(--eye-stage-bg);
+            border: 1px solid var(--eye-stage-border);
+        }
+
+        .startup-starfield {
+            position: absolute;
+            inset: 0;
+            overflow: hidden;
+            pointer-events: none;
+            mask-image: radial-gradient(circle at 50% 50%, rgba(0, 0, 0, 1) 42%, rgba(0, 0, 0, 0.72) 76%, transparent 100%);
+            -webkit-mask-image: radial-gradient(circle at 50% 50%, rgba(0, 0, 0, 1) 42%, rgba(0, 0, 0, 0.72) 76%, transparent 100%);
+        }
+
+        .startup-night {
+            --hero-shoot-time: 3600ms;
+            position: absolute;
+            inset: -40% -18%;
+            opacity: 0.66;
+            transform: rotateZ(34deg);
+        }
+
+        .startup-shooting-star {
+            position: absolute;
+            left: 50%;
+            top: 50%;
+            width: 0;
+            height: 2px;
+            background: linear-gradient(-45deg, var(--star-core), var(--star-tail));
+            border-radius: 999px;
+            filter: drop-shadow(0 0 6px var(--star-glow));
+            animation:
+                hero-tail var(--hero-shoot-time) ease-in-out infinite,
+                hero-shooting var(--hero-shoot-time) ease-in-out infinite;
+        }
+
+        .startup-shooting-star::before,
+        .startup-shooting-star::after {
+            content: "";
+            position: absolute;
+            top: calc(50% - 1px);
+            right: 0;
+            height: 2px;
+            background: linear-gradient(-45deg, var(--star-tail), var(--star-core), var(--star-tail));
+            border-radius: 100%;
+            animation: hero-shining var(--hero-shoot-time) ease-in-out infinite;
+            animation-delay: inherit;
+        }
+
+        .startup-shooting-star::before {
+            transform: translateX(50%) rotateZ(45deg);
+        }
+
+        .startup-shooting-star::after {
+            transform: translateX(50%) rotateZ(-45deg);
+        }
+
+        .startup-shooting-star:nth-child(1) { top: calc(50% - 162px); left: calc(50% - 190px); animation-delay: 0ms; }
+        .startup-shooting-star:nth-child(2) { top: calc(50% - 124px); left: calc(50% - 36px); animation-delay: 340ms; }
+        .startup-shooting-star:nth-child(3) { top: calc(50% - 86px); left: calc(50% + 128px); animation-delay: 760ms; }
+        .startup-shooting-star:nth-child(4) { top: calc(50% - 24px); left: calc(50% - 250px); animation-delay: 1120ms; }
+        .startup-shooting-star:nth-child(5) { top: calc(50% + 18px); left: calc(50% + 182px); animation-delay: 1560ms; }
+        .startup-shooting-star:nth-child(6) { top: calc(50% + 58px); left: calc(50% - 144px); animation-delay: 1940ms; }
+        .startup-shooting-star:nth-child(7) { top: calc(50% + 100px); left: calc(50% + 42px); animation-delay: 2360ms; }
+        .startup-shooting-star:nth-child(8) { top: calc(50% + 138px); left: calc(50% - 222px); animation-delay: 2820ms; }
+        .startup-shooting-star:nth-child(9) { top: calc(50% - 188px); left: calc(50% + 230px); animation-delay: 620ms; }
+        .startup-shooting-star:nth-child(10) { top: calc(50% - 56px); left: calc(50% + 280px); animation-delay: 1280ms; }
+        .startup-shooting-star:nth-child(11) { top: calc(50% + 156px); left: calc(50% + 150px); animation-delay: 1820ms; }
+        .startup-shooting-star:nth-child(12) { top: calc(50% + 182px); left: calc(50% - 20px); animation-delay: 2460ms; }
+
+        .eye-loader {
+            position: relative;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            width: calc(var(--brand-eye-width) + 40px);
+            height: calc(var(--brand-eye-height) + 40px);
+            padding: 18px;
+            border-radius: 999px;
+            background: transparent;
+            user-select: none;
+            isolation: isolate;
+            transform-origin: center;
+            -webkit-tap-highlight-color: transparent;
+        }
+
+        .eye-loader::before {
+            content: "";
+            position: absolute;
+            inset: 0;
+            z-index: 0;
+            border-radius: inherit;
+            background:
+                radial-gradient(circle at 50% 50%, rgba(58, 118, 242, 0.52) 0%, rgba(58, 118, 242, 0.2) 42%, rgba(58, 118, 242, 0) 76%),
+                radial-gradient(circle at 50% 50%, rgba(196, 220, 255, 0.12), transparent 74%);
+            filter: blur(18px);
+            opacity: 0.98;
+        }
+
+        .eye-loader .brand-eye {
+            position: relative;
+            z-index: 1;
+            display: block;
+            width: var(--brand-eye-width);
+            height: var(--brand-eye-height);
+            filter: drop-shadow(0 18px 32px rgba(26, 77, 183, 0.28));
+            animation: dashboardBadgeBob var(--badge-bob-duration) ease-in-out infinite;
+        }
+
+        .eye-loader .brand-eye-shell {
+            position: absolute;
+            inset: 0;
+            overflow: hidden;
+            border-radius: 999px;
+            border: 5px solid #2f6feb;
+            background: linear-gradient(180deg, rgba(121, 164, 255, 0.96), rgba(58, 109, 226, 0.98));
+            box-shadow:
+                0 0 0 1px rgba(235, 243, 255, 0.28) inset,
+                0 18px 30px rgba(14, 54, 128, 0.24),
+                inset 0 -8px 12px rgba(19, 58, 137, 0.24);
+            animation: dashboardBadgeSquish var(--badge-blink-duration) linear infinite;
+        }
+
+        .eye-loader .brand-eye-sclera,
+        .eye-loader .brand-eye-lid {
+            position: absolute;
+            inset: 6px;
+            border-radius: 999px;
+        }
+
+        .eye-loader .brand-eye-sclera {
+            overflow: hidden;
+            background:
+                radial-gradient(circle at 50% 50%, rgba(249, 252, 255, 0.99), rgba(226, 237, 255, 0.98) 62%, rgba(172, 198, 249, 0.96) 100%),
+                linear-gradient(180deg, #fbfdff, #e4efff);
+            box-shadow:
+                inset 0 -3px 8px rgba(96, 136, 221, 0.18),
+                inset 0 1px 0 rgba(255, 255, 255, 0.66);
+        }
+
+        .eye-loader .brand-eye-sclera::before,
+        .eye-loader .brand-eye-sclera::after {
+            content: "";
+            position: absolute;
+            top: 50%;
+            width: 18px;
+            height: 18px;
+            border-radius: 50%;
+            background: radial-gradient(circle at 40% 35%, rgba(236, 243, 255, 0.98), rgba(204, 220, 252, 0.96));
+            transform: translateY(-50%);
+        }
+
+        .eye-loader .brand-eye-sclera::before { left: -8px; }
+        .eye-loader .brand-eye-sclera::after { right: -8px; }
+
+        .eye-loader .brand-eye-iris {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            width: var(--brand-eye-iris-size);
+            height: var(--brand-eye-iris-size);
+            border-radius: 50%;
+            background: radial-gradient(circle at 35% 28%, #8dccff 0%, #5c95ff 28%, #3a63d8 56%, #243c93 78%, #16214e 100%);
+            box-shadow:
+                inset 0 0 0 3px rgba(205, 226, 255, 0.34),
+                0 0 0 1px rgba(34, 64, 149, 0.18),
+                0 0 28px rgba(56, 113, 241, 0.34);
+            transform: translate(calc(-50% + var(--badge-look-x)), calc(-50% + var(--badge-look-y)));
+            transition: transform var(--badge-glance-duration) cubic-bezier(0.25, 0.85, 0.25, 1);
+        }
+
+        .eye-loader .brand-eye-pupil {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            width: var(--brand-eye-pupil-size);
+            height: var(--brand-eye-pupil-size);
+            border-radius: 50%;
+            background: #13204b;
+            transform: translate(-50%, -50%);
+            box-shadow:
+                0 0 0 3px rgba(24, 39, 86, 0.24),
+                inset 0 1px 2px rgba(255, 255, 255, 0.08);
+        }
+
+        .eye-loader .brand-eye-pupil::after {
+            content: "";
+            position: absolute;
+            top: 2px;
+            left: 2px;
+            width: 4px;
+            height: 4px;
+            border-radius: 50%;
+            background: rgba(255, 255, 255, 0.95);
+        }
+
+        .eye-loader .brand-eye-highlight {
+            position: absolute;
+            left: 24%;
+            top: 16%;
+            width: 30%;
+            height: 16%;
+            border-radius: 999px;
+            background: linear-gradient(180deg, rgba(255, 255, 255, 0.88), rgba(255, 255, 255, 0));
+            opacity: 0.82;
+            pointer-events: none;
+        }
+
+        .eye-loader .brand-eye-lid {
+            background: linear-gradient(180deg, rgba(120, 165, 255, 0.98), rgba(79, 118, 215, 0.98) 58%, rgba(201, 221, 255, 0.94) 100%);
+            box-shadow: inset 0 -3px 6px rgba(21, 56, 131, 0.22);
+            transform-origin: center top;
+            transform: translateY(-114%) scaleY(0.92);
+            animation: dashboardBadgeBlink var(--badge-blink-duration) linear infinite;
+        }
+
+        .eye-loader.is-pulsing {
+            animation: brandEyePulse 460ms cubic-bezier(0.22, 0.86, 0.24, 1);
+        }
+
+        @keyframes hero-tail {
+            0% { width: 0; }
+            30% { width: 100px; }
+            100% { width: 0; }
+        }
+
+        @keyframes hero-shining {
+            0% { width: 0; }
+            50% { width: 30px; }
+            100% { width: 0; }
+        }
+
+        @keyframes hero-shooting {
+            0% { transform: translateX(0); }
+            100% { transform: translateX(300px); }
+        }
+
+        @keyframes brandEyePulse {
+            0% { transform: translateY(0) scale(1); }
+            42% { transform: translateY(-5px) scale(1.05); }
+            70% { transform: translateY(1px) scale(0.99); }
+            100% { transform: translateY(0) scale(1); }
+        }
+
+        @keyframes dashboardBadgeBob {
+            0% { transform: translate3d(0, 0, 0) scale(1); }
+            50% { transform: translate3d(0, -1px, 0) scale(1.01); }
+            100% { transform: translate3d(0, 0, 0) scale(1); }
+        }
+
+        @keyframes dashboardBadgeBlink {
+            0%, 43%, 49%, 100% { transform: translateY(-104%) scaleY(1); }
+            45%, 47% { transform: translateY(0) scaleY(1.02); }
+        }
+
+        @keyframes dashboardBadgeSquish {
+            0%, 43%, 49%, 100% { transform: scale(1); }
+            45% { transform: scale(0.95, 0.74); }
+            47% { transform: scale(0.97, 0.86); }
+        }
+
+        @media (max-width: 640px), (max-height: 620px) {
+            .startup-shell {
+                width: min(680px, calc(100vw - 8px));
+                min-height: min(420px, calc(100vh - 8px));
+                max-height: calc(100vh - 6px);
+                padding: 18px 14px 18px;
+                border-radius: 28px;
+            }
+
+            .eye-stage {
+                min-height: 154px;
+                border-radius: 24px;
+            }
+
+            .title {
+                font-size: clamp(26px, 8.4vw, 34px);
+            }
+
+            .detail {
+                font-size: 13px;
+            }
+        }
+
+        @media (max-width: 460px), (max-height: 520px) {
+            .startup-shell {
+                gap: 10px;
+                padding: 14px 10px 14px;
+                border-radius: 22px;
+            }
+
+            .brand {
+                font-size: 11px;
+            }
+
+            .eye-stage {
+                min-height: 132px;
+                border-radius: 18px;
+            }
+
+            .stage {
+                font-size: 13px;
+                padding: 7px 12px;
+            }
+
+            .detail {
+                font-size: 12px;
+                line-height: 1.35;
+            }
+        }
+
+        @media (prefers-reduced-motion: reduce) {
+            .eye-loader,
+            .eye-loader *,
+            .startup-shooting-star,
+            .startup-shooting-star::before,
+            .startup-shooting-star::after {
+                animation: none !important;
+                transition: none !important;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="startup-shell">
+        <div class="brand">EyesAndEars</div>
+        <div class="eye-stage">
+            <div class="startup-starfield" aria-hidden="true">
+                <div class="startup-night">
+                    <span class="startup-shooting-star"></span>
+                    <span class="startup-shooting-star"></span>
+                    <span class="startup-shooting-star"></span>
+                    <span class="startup-shooting-star"></span>
+                    <span class="startup-shooting-star"></span>
+                    <span class="startup-shooting-star"></span>
+                    <span class="startup-shooting-star"></span>
+                    <span class="startup-shooting-star"></span>
+                    <span class="startup-shooting-star"></span>
+                    <span class="startup-shooting-star"></span>
+                    <span class="startup-shooting-star"></span>
+                    <span class="startup-shooting-star"></span>
+                </div>
+            </div>
+            <div class="eye-loader boot-eye-loader" id="boot-eye-loader" data-brand-eye aria-hidden="true">
+                <span class="brand-eye" aria-hidden="true">
+                    <span class="brand-eye-shell">
+                        <span class="brand-eye-sclera">
+                            <span class="brand-eye-iris">
+                                <span class="brand-eye-pupil"></span>
+                            </span>
+                        </span>
+                        <span class="brand-eye-highlight"></span>
+                        <span class="brand-eye-lid"></span>
+                    </span>
+                </span>
+            </div>
+        </div>
+        <h1 class="title" id="startup-title">Starting EyesAndEars</h1>
+        <p class="stage" id="startup-stage">Launching</p>
+        <p class="detail" id="startup-detail">Loading interface</p>
+    </div>
+
+    <script>
+        const setText = (id, value) => {
+            const node = document.getElementById(id);
+            if (node) {
+                node.textContent = String(value || "");
+            }
+        };
+
+        const applyTheme = (theme) => {
+            const dark = String(theme || "").toLowerCase() === "dark";
+            document.body.classList.toggle("theme-dark", dark);
+            document.body.classList.toggle("theme-light", !dark);
+            document.documentElement.style.colorScheme = dark ? "dark" : "light";
+        };
+
+        const initBrandEyes = (signal) => {
+            const eyes = Array.from(document.querySelectorAll("[data-brand-eye]"));
+            if (!eyes.length) {
+                return;
+            }
+
+            const reduceMotion = Boolean(window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches);
+            const moodPool = [
+                { blink: 7.8, bob: 5.6, glance: 3000, lookX: 2, tone: "calm", waitMin: 2800, waitMax: 5200 },
+                { blink: 6.2, bob: 4.6, glance: 2200, lookX: 3, tone: "steady", waitMin: 1900, waitMax: 3400 },
+                { blink: 4.5, bob: 3.2, glance: 1400, lookX: 5, tone: "fast", waitMin: 1100, waitMax: 1900 }
+            ];
+            const lookPool = [
+                { x: 0, y: 0 },
+                { x: -1, y: 0 },
+                { x: 1, y: 0 },
+                { x: -1, y: 1 },
+                { x: 1, y: 1 }
+            ];
+
+            eyes.forEach((eyeRoot) => {
+                let moodTimer = 0;
+                let glanceTimer = 0;
+                let activeMood = moodPool[1];
+
+                const clearTimers = () => {
+                    if (moodTimer) {
+                        window.clearTimeout(moodTimer);
+                        moodTimer = 0;
+                    }
+                    if (glanceTimer) {
+                        window.clearTimeout(glanceTimer);
+                        glanceTimer = 0;
+                    }
+                };
+
+                const setLook = (mood = activeMood) => {
+                    const look = lookPool[Math.floor(Math.random() * lookPool.length)];
+                    eyeRoot.style.setProperty("--badge-look-x", `${look.x * mood.lookX}px`);
+                    eyeRoot.style.setProperty("--badge-look-y", `${look.y * 2}px`);
+                };
+
+                const queueNextLook = (mood = activeMood) => {
+                    if (reduceMotion) {
+                        eyeRoot.style.setProperty("--badge-look-x", "0px");
+                        eyeRoot.style.setProperty("--badge-look-y", "0px");
+                        return;
+                    }
+                    if (glanceTimer) {
+                        window.clearTimeout(glanceTimer);
+                    }
+                    setLook(mood);
+                    const wait = Math.max(650, mood.glance + (Math.random() * 900) - 280);
+                    glanceTimer = window.setTimeout(() => queueNextLook(mood), wait);
+                };
+
+                const applyMood = (mood) => {
+                    activeMood = mood;
+                    eyeRoot.dataset.mood = mood.tone;
+                    eyeRoot.style.setProperty("--badge-blink-duration", `${(mood.blink + Math.random() * 0.45).toFixed(2)}s`);
+                    eyeRoot.style.setProperty("--badge-bob-duration", `${(mood.bob + Math.random() * 0.35).toFixed(2)}s`);
+                    eyeRoot.style.setProperty("--badge-glance-duration", `${Math.max(0.16, mood.glance / 1000).toFixed(2)}s`);
+                    queueNextLook(mood);
+                };
+
+                const queueNextMood = () => {
+                    if (reduceMotion) {
+                        applyMood(moodPool[1]);
+                        return;
+                    }
+                    const mood = moodPool[Math.floor(Math.random() * moodPool.length)];
+                    applyMood(mood);
+                    const wait = mood.waitMin + Math.random() * (mood.waitMax - mood.waitMin);
+                    moodTimer = window.setTimeout(queueNextMood, wait);
+                };
+
+                clearTimers();
+                applyMood(moodPool[1]);
+                queueNextMood();
+
+                signal.addEventListener("abort", () => {
+                    clearTimers();
+                    eyeRoot.classList.remove("is-pulsing");
+                }, { once: true });
+            });
+        };
+
+        const applyState = (state) => {
+            setText("startup-title", state.title || "Starting EyesAndEars");
+            setText("startup-stage", state.stage || "Launching");
+            setText("startup-detail", state.detail || "Loading interface");
+            applyTheme(state.theme || "dark");
+        };
+
+        const startPolling = (signal, api) => {
+            const tick = async () => {
+                try {
+                    const payload = await api.get_state();
+                    applyState(payload || {});
+                    if (payload && payload.close) {
+                        signal.abort();
+                        if (typeof api.close_window === "function") {
+                            await api.close_window();
+                        } else {
+                            window.close();
+                        }
+                        return;
+                    }
+                } catch (_error) {
+                    // Ignore intermittent bridge failures while startup continues.
+                }
+                window.setTimeout(tick, 120);
+            };
+            tick();
+        };
+
+        let startupInitialized = false;
+        const initBridge = () => {
+            if (startupInitialized) {
+                return;
+            }
+            const api = window.pywebview && window.pywebview.api;
+            if (!api) {
+                window.setTimeout(initBridge, 80);
+                return;
+            }
+            startupInitialized = true;
+            const abortController = new AbortController();
+            initBrandEyes(abortController.signal);
+            startPolling(abortController, api);
+            if (typeof api.notify_ready === "function") {
+                Promise.resolve(api.notify_ready()).catch(() => {});
+            }
+        };
+
+        window.addEventListener("pywebviewready", initBridge);
+        if (document.readyState === "loading") {
+            document.addEventListener("DOMContentLoaded", initBridge, { once: true });
+        } else {
+            initBridge();
+        }
+    </script>
+</body>
+</html>
+"""
+
+
+class StartupSplashBridge:
+        def __init__(self, state_path, ready_path=None):
+                self._state_path = Path(state_path)
+                self._ready_path = Path(ready_path) if ready_path else self._state_path.with_name(STARTUP_SPLASH_READY_FILE_NAME)
+                self._window = None
+                self._lock = Lock()
+
+        def bind_window(self, window):
+                with self._lock:
+                        self._window = window
+
+        def get_state(self):
+                state = {
+                        "title": tr("startup.title"),
+                        "stage": tr("startup.launching"),
+                        "detail": tr("startup.detail.launching"),
+                "hidden": False,
+                        "close": False,
+                }
+                try:
+                        loaded = json.loads(self._state_path.read_text(encoding="utf-8"))
+                        if isinstance(loaded, dict):
+                                state.update(loaded)
+                except Exception:
+                        pass
+                return state
+
+        def notify_ready(self):
+                try:
+                        self._ready_path.write_text("ready\n", encoding="utf-8")
+                except Exception:
+                        return False
+                return True
+
+        def close_window(self):
+                with self._lock:
+                        window = self._window
+                if window is None:
+                        return False
+                try:
+                        window.destroy()
+                        return True
+                except Exception:
+                        return False
+
+
+def run_startup_splash_subprocess(state_path):
+    ensure_ui_crisp_mode()
+    hide_console_window()
+    if not has_pywebview_support():
+        return 1
+
+    screen_width = 1920
+    screen_height = 1080
+    if os.name == "nt":
+        try:
+            screen_width = int(ctypes.windll.user32.GetSystemMetrics(0))
+            screen_height = int(ctypes.windll.user32.GetSystemMetrics(1))
+        except Exception:
+            logger.debug("Could not read screen metrics for startup splash sizing.", exc_info=True)
+    left, top, right, bottom = get_active_monitor_work_area(screen_width, screen_height)
+    work_width = max(1, int(right - left))
+    work_height = max(1, int(bottom - top))
+    splash_width = min(700, max(430, work_width - 72))
+    splash_height = min(560, max(400, work_height - 84))
+    splash_width = min(splash_width, work_width)
+    splash_height = min(splash_height, work_height)
+    splash_x = int(left + max(0, ((right - left) - splash_width) // 2))
+    splash_y = int(top + max(0, ((bottom - top) - splash_height) // 2))
+
+    ready_path = Path(state_path).with_name(STARTUP_SPLASH_READY_FILE_NAME)
+    bridge = StartupSplashBridge(state_path, ready_path=ready_path)
+    close_watcher_stop = Event()
+    try:
+        window = webview.create_window(
+            tr("startup.title"),
+            html=build_startup_splash_html(),
+            js_api=bridge,
+            width=splash_width,
+            height=splash_height,
+            x=int(splash_x),
+            y=int(splash_y),
+            min_size=(500, 380),
+            resizable=False,
+            hidden=False,
+            frameless=True,
+            easy_drag=True,
+            shadow=True,
+            focus=True,
+            on_top=False,
+            background_color="#0f1b2f",
+            text_select=False,
+        )
+        if window is None:
+            return 1
+        bridge.bind_window(window)
+
+        def _prepare(window_obj):
+            def _close_watcher():
+                last_hidden = False
+                while not close_watcher_stop.wait(0.14):
+                    try:
+                        if not Path(state_path).exists():
+                            try:
+                                window_obj.destroy()
+                            except Exception:
+                                pass
+                            break
+                        payload = json.loads(Path(state_path).read_text(encoding="utf-8"))
+                        if not isinstance(payload, dict):
+                            continue
+                        hidden = bool(payload.get("hidden"))
+                        if hidden != last_hidden:
+                            last_hidden = hidden
+                            try:
+                                if hidden:
+                                    window_obj.hide()
+                                else:
+                                    window_obj.show()
+                                    place_startup_splash_window(
+                                        window_obj,
+                                        tr("startup.title"),
+                                        splash_x,
+                                        splash_y,
+                                        splash_width,
+                                        splash_height,
+                                        attempts=3,
+                                        delay_seconds=0.04,
+                                    )
+                            except Exception:
+                                pass
+                        if bool(payload.get("close")):
+                            try:
+                                window_obj.destroy()
+                            except Exception:
+                                pass
+                            break
+                    except Exception:
+                        continue
+
+            Thread(target=_close_watcher, daemon=True).start()
+            try:
+                window_obj.show()
+                place_startup_splash_window(
+                    window_obj,
+                    tr("startup.title"),
+                    splash_x,
+                    splash_y,
+                    splash_width,
+                    splash_height,
+                    attempts=5,
+                    delay_seconds=0.05,
+                )
+                bridge.notify_ready()
+            except Exception:
+                bridge.close_window()
+
+        webview.start(
+            _prepare,
+            args=(window,),
+            **resolve_pywebview_start_kwargs(),
+        )
+    except Exception:
+        logger.warning("Startup splash webview failed.", exc_info=True)
+        return 1
+    finally:
+        close_watcher_stop.set()
+    return 0
+
+
+class WebsiteEyeStartupProgressWindow:
+        STAGE_ORDER = StartupProgressWindow.STAGE_ORDER
+
+        def __init__(self):
+                self.stage_key = "startup.launching"
+                self.hidden = False
+                self._state_dir = Path(tempfile.mkdtemp(prefix="eae-startup-splash-"))
+                self._state_path = self._state_dir / "state.json"
+                self._ready_path = self._state_dir / STARTUP_SPLASH_READY_FILE_NAME
+                self._process = None
+                self._closed = False
+                self._hidden = False
+                self._write_state(self.stage_key, close=False)
+                try:
+                        self._spawn_subprocess()
+                        self._wait_until_ready()
+                        self.set_stage(self.stage_key)
+                except Exception:
+                        try:
+                                self.close()
+                        except Exception:
+                                pass
+                        raise
+
+        def _spawn_subprocess(self):
+                command = [sys.executable]
+                if not getattr(sys, "frozen", False):
+                        command.append(os.path.abspath(__file__))
+                command.extend([STARTUP_SPLASH_SUBPROCESS_FLAG, str(self._state_path)])
+                creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                self._process = subprocess.Popen(
+                        command,
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        creationflags=creation_flags,
+                )
+
+        def _wait_until_ready(self):
+            deadline = time.monotonic() + STARTUP_SPLASH_READY_TIMEOUT_SECONDS
+            while time.monotonic() < deadline:
+                if self._ready_path.exists():
+                    return True
+                process = self._process
+                if process is not None:
+                    returncode = process.poll()
+                    if returncode is not None:
+                        raise RuntimeError(f"Startup splash subprocess exited early with code {returncode}.")
+                time.sleep(STARTUP_SPLASH_READY_POLL_SECONDS)
+            # Do not fail over to legacy splash just because JS bridge readiness is late.
+            return False
+
+        def _write_state(self, stage_key, close=None):
+                close_flag = bool(close) if close is not None else False
+                payload = {
+                        "title": tr("startup.title"),
+                        "stage": tr(stage_key),
+                        "detail": tr(stage_key.replace("startup.", "startup.detail.")),
+                    "theme": "dark" if resolve_theme_dark(ui_theme_preference) else "light",
+                    "hidden": bool(self._hidden),
+                        "close": close_flag,
+                }
+                self._state_path.write_text(json.dumps(payload, ensure_ascii=True), encoding="utf-8")
+
+        def set_stage(self, stage_key):
+                if stage_key not in self.STAGE_ORDER:
+                        stage_key = "startup.launching"
+                self.stage_key = stage_key
+                if self._closed:
+                        return
+                try:
+                        self._write_state(stage_key, close=False)
+                except Exception:
+                        pass
+
+        def refresh(self):
+                if self._closed:
+                        return
+                try:
+                        if self._process is not None and self._process.poll() is not None:
+                                self._closed = True
+                except Exception:
+                        pass
+
+        def hide(self):
+            self.hidden = True
+            self._hidden = True
+            if self._closed:
+                return
+            try:
+                self._write_state(self.stage_key, close=False)
+            except Exception:
+                pass
+
+        def show(self):
+            self.hidden = False
+            self._hidden = False
+            if self._closed:
+                return
+            try:
+                self._write_state(self.stage_key, close=False)
+            except Exception:
+                pass
+
+        def close(self):
+                if self._closed:
+                        return
+                self._closed = True
+                try:
+                        self._write_state(self.stage_key, close=True)
+                except Exception:
+                        pass
+
+                process = self._process
+                self._process = None
+                if process is not None:
+                    try:
+                        process.wait(timeout=1.4)
+                    except Exception:
+                        try:
+                            process.terminate()
+                        except Exception:
+                            pass
+                        try:
+                            process.wait(timeout=0.8)
+                        except Exception:
+                            pass
+                        try:
+                            process.kill()
+                            process.wait(timeout=0.6)
+                        except Exception:
+                            pass
+                if process is not None:
+                    try:
+                        if process.poll() is None and os.name == "nt":
+                            subprocess.run(
+                                ["taskkill", "/PID", str(int(process.pid)), "/T", "/F"],
+                                stdin=subprocess.DEVNULL,
+                                stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL,
+                                check=False,
+                            )
+                    except Exception:
+                        pass
+
+                try:
+                        if self._state_path.exists():
+                                self._state_path.unlink()
+                except Exception:
+                        pass
+                try:
+                        if self._ready_path.exists():
+                                self._ready_path.unlink()
+                except Exception:
+                        pass
+                try:
+                        self._state_dir.rmdir()
+                except Exception:
+                        pass
+
+
+def startup_progress_open():
+    global startup_progress_window
+    with startup_progress_lock:
+        if not startup_loading_screen_enabled:
+            return None
+        if startup_progress_window is None:
+            env_theme_raw = os.environ.get("EAE_THEME", "").strip()
+            if env_theme_raw:
+                apply_ui_theme_preference(env_theme_raw)
+            else:
+                try:
+                    startup_record = load_config_record()
+                except Exception:
+                    startup_record = {}
+                saved_theme = normalize_theme_preference(startup_record.get("ui_theme", ui_theme_preference))
+                apply_ui_theme_preference(saved_theme)
+            try:
+                startup_progress_window = WebsiteEyeStartupProgressWindow()
+            except Exception:
+                try:
+                    startup_progress_window = StartupProgressWindow()
+                except Exception:
+                    startup_progress_window = None
+        return startup_progress_window
+
+
+def startup_progress_update(stage_key):
+    window = startup_progress_open()
+    if window:
+        window.set_stage(stage_key)
+
+
+def startup_progress_hide():
+    with startup_progress_lock:
+        window = startup_progress_window
+    if window:
+        window.hide()
+
+
+def startup_progress_show():
+    with startup_progress_lock:
+        window = startup_progress_window
+    if window:
+        window.show()
+
+
+def startup_progress_close():
+    global startup_progress_window
+    with startup_progress_lock:
+        window = startup_progress_window
+        startup_progress_window = None
+    if window:
+        window.close()
+
+
+def startup_progress_wait(duration_seconds, interval_seconds=0.016):
+    deadline = time.monotonic() + max(0.0, float(duration_seconds or 0.0))
+    while True:
+        window = startup_progress_window
+        if window:
+            window.refresh()
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(interval_seconds, remaining))
+
+
+def run_startup_background_task(task, stage_key=None, interval_seconds=0.016):
+    if stage_key:
+        startup_progress_update(stage_key)
+    result = {"value": None, "error": None}
+    completed = Event()
+
+    def _runner():
+        try:
+            result["value"] = task()
+        except Exception as exc:
+            result["error"] = exc
+        finally:
+            completed.set()
+
+    Thread(target=_runner, daemon=True).start()
+    while not completed.wait(interval_seconds):
+        window = startup_progress_window
+        if window:
+            window.refresh()
+
+    window = startup_progress_window
+    if window:
+        window.refresh()
+    if result["error"] is not None:
+        raise result["error"]
+    return result["value"]
+
+
+def show_styled_message(title, message, is_error=False, ask_retry=False, parent=None):
+    result = {"value": False}
+    message_text = str(message or "")
+    base_height = 320 if ask_retry else 290
+    line_count = message_text.count("\n") + 1
+    estimated_height = min(620, base_height + max(0, line_count - 4) * 18 + max(0, len(message_text) - 180) // 15)
+    root, card = make_dialog_shell(title, 640, estimated_height, parent=parent)
+
+    heading = tr("dialog.heading.retry") if ask_retry else (tr("dialog.heading.error") if is_error else tr("dialog.heading.info"))
+    heading_color = UI_DANGER if is_error else UI_TEXT
+
+    header = tk.Frame(card, bg=UI_CARD_BG, bd=0)
+    header.pack(fill="x", padx=30, pady=(26, 12))
+    tk.Label(header, text=heading, bg=UI_CARD_BG, fg=heading_color, font=(UI_FONT, 22, "bold")).pack(anchor="w")
+
+    content = tk.Frame(card, bg=UI_PANEL_BG, highlightbackground=UI_BORDER, highlightthickness=1, bd=0)
+    content.pack(fill="both", expand=True, padx=30, pady=(0, 14))
+
+    badge = tk.Frame(content, bg=UI_GLASS, bd=0)
+    badge.pack(anchor="w", padx=16, pady=(16, 0))
+    badge_label = tk.Label(
+        badge,
+        text=APP_NAME,
+        bg=UI_GLASS,
+        fg="#DCE8FF",
+        font=(UI_FONT, 9, "bold"),
+        padx=10,
+        pady=6,
+    )
+    badge_label.pack()
+    schedule_widget_rounding(badge, radius=14)
+
+    message_label = tk.Label(
+        content,
+        text=message_text,
+        bg=UI_PANEL_BG,
+        fg=UI_TEXT,
+        font=(UI_FONT, 11),
+        justify="left",
+        wraplength=540,
+    )
+    message_label.pack(anchor="w", padx=16, pady=(12, 16))
+
+    button_bar = tk.Frame(card, bg=UI_CARD_BG, bd=0)
+    button_bar.pack(fill="x", padx=30, pady=(0, 24))
+
+    def close_with(value=False):
+        result["value"] = value
+        root.destroy()
+
+    if ask_retry:
+        exit_btn = tk.Button(
+            button_bar,
+            text=tr("dialog.quit"),
+            command=lambda: close_with(False),
+            relief="flat",
+            bd=0,
+            padx=18,
+            pady=10,
+            font=(UI_FONT, 10, "bold"),
+            cursor="hand2",
+        )
+        style_button(exit_btn, primary=False)
+        exit_btn.pack(side="right")
+
+        retry_btn = tk.Button(
+            button_bar,
+            text=tr("dialog.retry_login"),
+            command=lambda: close_with(True),
+            relief="flat",
+            bd=0,
+            padx=18,
+            pady=10,
+            font=(UI_FONT, 10, "bold"),
+            cursor="hand2",
+        )
+        style_button(retry_btn, primary=True)
+        retry_btn.pack(side="right", padx=(0, 10))
+    else:
+        close_btn = tk.Button(
+            button_bar,
+            text=tr("dialog.ok"),
+            command=lambda: close_with(False),
+            relief="flat",
+            bd=0,
+            padx=20,
+            pady=10,
+            font=(UI_FONT, 10, "bold"),
+            cursor="hand2",
+        )
+        style_button(close_btn, primary=True)
+        close_btn.pack(side="right")
+
+    fit_window_to_content(root, min_width=620, min_height=estimated_height, max_width=860, max_height=640)
+    root.minsize(560, 300)
+    root.maxsize(max(660, root.winfo_screenwidth() - 24), max(360, root.winfo_screenheight() - 56))
+
+    def _refresh_wrap(_event=None):
+        wrap = max(340, root.winfo_width() - 110)
+        try:
+            message_label.configure(wraplength=wrap)
+        except Exception:
+            pass
+
+    root.bind("<Configure>", _refresh_wrap, add="+")
+    root.after(30, _refresh_wrap)
+    root.protocol("WM_DELETE_WINDOW", lambda: close_with(False))
+    root.bind("<Escape>", lambda _event: close_with(False))
+    if parent:
+        try:
+            root.grab_set()
+            parent.wait_window(root)
+        except Exception:
+            pass
+    else:
+        root.mainloop()
+    return bool(result["value"])
+
+
+WEBVIEW_RESIZE_HIT_TESTS = {
+    "n": HTTOP,
+    "s": HTBOTTOM,
+    "e": HTRIGHT,
+    "w": HTLEFT,
+    "ne": HTTOPRIGHT,
+    "nw": HTTOPLEFT,
+    "se": HTBOTTOMRIGHT,
+    "sw": HTBOTTOMLEFT,
+}
+
+
+def _coerce_hwnd_value(candidate):
+    if candidate is None:
+        return 0
+    for attr_name in ("ToInt64", "ToInt32"):
+        method = getattr(candidate, attr_name, None)
+        if callable(method):
+            try:
+                value = int(method())
+                if value > 0:
+                    return value
+            except Exception:
+                pass
+    try:
+        value = int(candidate)
+        if value > 0:
+            return value
+    except Exception:
+        pass
+    return 0
+
+
+def is_valid_window_handle(hwnd):
+    if os.name != "nt":
+        return False
+    try:
+        value = int(hwnd or 0)
+        return bool(value and _user32.IsWindow(wintypes.HWND(value)))
+    except Exception:
+        return False
+
+
+def get_window_title(hwnd):
+    if os.name != "nt":
+        return ""
+    try:
+        title_buffer = ctypes.create_unicode_buffer(512)
+        if _user32.GetWindowTextW(wintypes.HWND(int(hwnd)), title_buffer, len(title_buffer)) <= 0:
+            return ""
+        return str(title_buffer.value or "").strip()
+    except Exception:
+        return ""
+
+
+def extract_native_window_handle(obj, max_depth=2):
+    if os.name != "nt" or obj is None:
+        return 0
+    seen = set()
+    queue = [(obj, 0)]
+    follow_attrs = ("Handle", "handle", "hwnd", "Hwnd", "window", "Window", "form", "Form", "native", "Native")
+    while queue:
+        candidate, depth = queue.pop(0)
+        if candidate is None:
+            continue
+        candidate_id = id(candidate)
+        if candidate_id in seen:
+            continue
+        seen.add(candidate_id)
+        hwnd = _coerce_hwnd_value(candidate)
+        if hwnd and is_valid_window_handle(hwnd):
+            return hwnd
+        if depth >= int(max_depth):
+            continue
+        for attr_name in follow_attrs:
+            try:
+                nested = getattr(candidate, attr_name, None)
+            except Exception:
+                nested = None
+            if nested is not None:
+                queue.append((nested, depth + 1))
+    return 0
+
+
+def find_webview_window_hwnd(title, process_id=None):
+    if os.name != "nt":
+        return 0
+    target_title = str(title or "").strip()
+    target_pid = int(process_id or os.getpid())
+    exact_matches = []
+    partial_matches = []
+    try:
+        @WNDENUMPROC
+        def _collect(hwnd, _lparam):
+            try:
+                normalized_hwnd = int(hwnd or 0)
+                if not normalized_hwnd:
+                    return True
+                window_pid = wintypes.DWORD(0)
+                _user32.GetWindowThreadProcessId(wintypes.HWND(normalized_hwnd), ctypes.byref(window_pid))
+                if target_pid and int(window_pid.value or 0) != target_pid:
+                    return True
+                window_title = get_window_title(normalized_hwnd)
+                if target_title:
+                    if window_title == target_title:
+                        exact_matches.append(normalized_hwnd)
+                    elif target_title.lower() in window_title.lower():
+                        partial_matches.append(normalized_hwnd)
+                elif window_title:
+                    partial_matches.append(normalized_hwnd)
+            except Exception:
+                return True
+            return True
+
+        _user32.EnumWindows(_collect, 0)
+    except Exception:
+        logger.debug("Auth window enumeration failed.", exc_info=True)
+    if exact_matches:
+        return int(exact_matches[-1])
+    if partial_matches:
+        return int(partial_matches[-1])
+    try:
+        fallback_hwnd = int(_user32.FindWindowW(None, target_title) or 0)
+        if fallback_hwnd:
+            return fallback_hwnd
+    except Exception:
+        logger.debug("Auth window title lookup failed.", exc_info=True)
+    return 0
+
+
+def resolve_webview_window_hwnd(window, title="", timeout_seconds=0.0):
+    if os.name != "nt":
+        return 0
+    deadline = time.monotonic() + max(0.0, float(timeout_seconds or 0.0))
+    while True:
+        hwnd = extract_native_window_handle(window, max_depth=3)
+        if not hwnd:
+            hwnd = extract_native_window_handle(getattr(window, "native", None), max_depth=4)
+        if not hwnd:
+            hwnd = find_webview_window_hwnd(title or getattr(window, "title", ""), process_id=os.getpid())
+        if hwnd and is_valid_window_handle(hwnd):
+            return int(hwnd)
+        if time.monotonic() >= deadline:
+            return 0
+        time.sleep(0.03)
+
+
+def ensure_window_resize_move_style(hwnd):
+    if os.name != "nt":
+        return False
+    try:
+        normalized_hwnd = int(hwnd or 0)
+        if not normalized_hwnd or not is_valid_window_handle(normalized_hwnd):
+            return False
+        GWL_STYLE = -16
+        WS_THICKFRAME = 0x00040000
+        WS_MAXIMIZEBOX = 0x00010000
+        WS_MINIMIZEBOX = 0x00020000
+        WS_SYSMENU = 0x00080000
+        SWP_NOSIZE = 0x0001
+        SWP_NOMOVE = 0x0002
+        SWP_NOZORDER = 0x0004
+        SWP_NOACTIVATE = 0x0010
+        SWP_FRAMECHANGED = 0x0020
+
+        style = int(_user32.GetWindowLongW(wintypes.HWND(normalized_hwnd), GWL_STYLE) or 0)
+        desired = style | WS_THICKFRAME | WS_MAXIMIZEBOX | WS_MINIMIZEBOX | WS_SYSMENU
+        if desired != style:
+            _user32.SetWindowLongW(wintypes.HWND(normalized_hwnd), GWL_STYLE, desired)
+            _user32.SetWindowPos(
+                wintypes.HWND(normalized_hwnd),
+                wintypes.HWND(0),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOSIZE | SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+            )
+        return True
+    except Exception:
+        logger.debug("Could not enforce resize/move style for frameless window.", exc_info=True)
+        return False
+
+
+def position_native_window(hwnd, x, y, width, height, *, on_top=False):
+    if os.name != "nt":
+        return False
+    try:
+        normalized_hwnd = int(hwnd or 0)
+        if not normalized_hwnd or not is_valid_window_handle(normalized_hwnd):
+            return False
+        left = int(x)
+        top = int(y)
+        target_width = max(320, int(width))
+        target_height = max(240, int(height))
+        insert_after = wintypes.HWND(HWND_TOPMOST if on_top else 0)
+        flags = SWP_NOACTIVATE | SWP_SHOWWINDOW
+        applied = bool(
+            _user32.SetWindowPos(
+                wintypes.HWND(normalized_hwnd),
+                insert_after,
+                left,
+                top,
+                target_width,
+                target_height,
+                flags,
+            )
+        )
+        if not applied:
+            applied = bool(
+                _user32.MoveWindow(
+                    wintypes.HWND(normalized_hwnd),
+                    left,
+                    top,
+                    target_width,
+                    target_height,
+                    True,
+                )
+            )
+        return applied
+    except Exception:
+        logger.debug("Native window positioning failed.", exc_info=True)
+        return False
+
+
+def place_startup_splash_window(window, title, x, y, width, height, attempts=5, delay_seconds=0.05):
+    applied = False
+    normalized_title = str(title or "").strip()
+    for _attempt in range(max(1, int(attempts or 1))):
+        hwnd = resolve_webview_window_hwnd(window, title=normalized_title, timeout_seconds=0.75 if not applied else 0.18)
+        if hwnd:
+            applied = position_native_window(hwnd, x, y, width, height, on_top=True) or applied
+        if not applied:
+            try:
+                if hasattr(window, "resize"):
+                    window.resize(int(width), int(height))
+                if hasattr(window, "move"):
+                    window.move(int(x), int(y))
+            except Exception:
+                pass
+        time.sleep(max(0.0, float(delay_seconds or 0.0)))
+    return applied
+
+
+class AuthShellBridge:
+    def __init__(self):
+        self._window = None
+        self._result = None
+        self._done = Event()
+        self._manual_maximized = False
+        self._normal_bounds = None
+        self._hwnd_cache = 0
+        self._initial_state = {}
+        self._import_preview = None
+
+    def bind_window(self, window):
+        self._window = window
+        try:
+            if self._window is not None:
+                self._window.events.closed += self._on_closed
+        except Exception:
+            pass
+
+    @property
+    def result(self):
+        return self._result
+
+    def wait(self, timeout=None):
+        self._done.wait(timeout)
+        return self._result
+
+    def _on_closed(self, *args, **kwargs):
+        self._done.set()
+
+    def _get_hwnd(self):
+        cached = get_top_level_window_handle(self._hwnd_cache)
+        if cached:
+            self._hwnd_cache = int(cached)
+            return int(cached)
+        hwnd = extract_native_window_handle(self._window, max_depth=2)
+        if not hwnd:
+            hwnd = extract_native_window_handle(getattr(self._window, "native", None), max_depth=3)
+        if not hwnd:
+            hwnd = find_webview_window_hwnd(getattr(self._window, "title", ""), process_id=os.getpid())
+        if not hwnd:
+            hwnd = resolve_webview_window_hwnd(
+                self._window,
+                title=getattr(self._window, "title", ""),
+                timeout_seconds=0.35,
+            )
+        hwnd = get_top_level_window_handle(hwnd)
+        if hwnd:
+            self._hwnd_cache = int(hwnd)
+            return int(hwnd)
+        logger.warning("Could not resolve auth window handle for resize operations.")
+        return 0
+
+    def prime_window_handle(self, timeout_seconds=2.0):
+        if self._window is None:
+            return 0
+        hwnd = resolve_webview_window_hwnd(
+            self._window,
+            title=getattr(self._window, "title", ""),
+            timeout_seconds=timeout_seconds,
+        )
+        if hwnd:
+            self._hwnd_cache = int(hwnd)
+            ensure_window_resize_move_style(hwnd)
+        return int(hwnd or 0)
+
+    def ensure_capture_privacy(self):
+        if not is_capture_privacy_active():
+            return True
+        hwnd = self._get_hwnd()
+        if not hwnd:
+            return False
+        return bool(set_window_capture_excluded(hwnd, enabled=True))
+
+    def submit(self, payload):
+        if not isinstance(payload, dict):
+            return {"ok": False, "error": "Invalid setup payload."}
+        hotkeys, hotkey_mode, hotkeys_customized = resolve_command_hotkey_state(
+            payload.get("hotkeys"),
+            payload.get("hotkey_mode", command_key_mode),
+        )
+        normalized = {
+            "mode": "account",
+            "language": normalize_language(payload.get("language", ui_language)),
+            "theme": normalize_theme_preference(payload.get("theme", ui_theme_preference)),
+            "blob_size": normalize_indicator_blob_size(payload.get("blob_size", indicator_blob_size_key)),
+            "indicator_position": normalize_indicator_position(payload.get("indicator_position", indicator_position_key)),
+            "show_startup_screen": normalize_startup_loading_screen_enabled(payload.get("show_startup_screen", startup_loading_screen_enabled)),
+            "preferred_model": normalize_pro_model(payload.get("preferred_model", payload.get("pro_model", selected_pro_model_key))),
+            "hotkeys": hotkeys,
+            "hotkey_mode": hotkey_mode,
+            "hotkeys_customized": bool(hotkeys_customized),
+            "email": normalize_account_email(payload.get("email", "")),
+            "password": str(payload.get("password", "") or ""),
+            "remember_me": normalize_remember_me_preference(payload.get("remember_me", False)),
+        }
+        normalized["pro_model"] = normalized["preferred_model"]
+        preview_snapshot = None
+        if isinstance(self._import_preview, dict):
+            preview_snapshot = self._import_preview.get("auth_snapshot")
+        if isinstance(preview_snapshot, dict):
+            if (
+                normalize_account_email(preview_snapshot.get("email", "")) == normalized["email"]
+                and str(preview_snapshot.get("password", "") or "") == normalized["password"]
+            ):
+                normalized["auth_snapshot"] = preview_snapshot
+        self._result = normalized
+        self.close()
+        return {"ok": True}
+
+    def import_settings(self, payload):
+        if not isinstance(payload, dict):
+            return {"ok": False, "error": "Invalid setup payload."}
+        ok, result = request_account_preferences_preview(
+            payload.get("email", ""),
+            password_value=str(payload.get("password", "") or ""),
+            live_session_token=self._initial_state.get("live_session_token", ""),
+            live_session_email=self._initial_state.get("live_session_email", ""),
+        )
+        if not ok:
+            return {"ok": False, "error": str(result or "Could not import the synced settings.")}
+        self._import_preview = result if isinstance(result, dict) else None
+        return {
+            "ok": True,
+            "preferences": dict((result or {}).get("preferences") or {}),
+        }
+
+    def close(self):
+        try:
+            if self._window is not None:
+                self._window.destroy()
+        except Exception:
+            pass
+        self._done.set()
+        return True
+
+    def exit_app(self):
+        if AUTH_SHELL_SUBPROCESS_FLAG in sys.argv:
+            self.close()
+            return True
+        self.close()
+        exit_program(trigger_uninstall=False)
+        return True
+
+    def minimize(self):
+        try:
+            hwnd = self._get_hwnd()
+            if hwnd:
+                _user32.ShowWindow(wintypes.HWND(int(hwnd)), SW_MINIMIZE)
+            elif self._window is not None:
+                self._window.minimize()
+        except Exception:
+            return False
+        return True
+
+    def toggle_maximize(self):
+        try:
+            if self._window is None:
+                return False
+            hwnd = self._get_hwnd()
+            if hwnd:
+                normalized_hwnd = wintypes.HWND(int(hwnd))
+                if self._manual_maximized:
+                    if self._normal_bounds:
+                        x, y, width, height = self._normal_bounds
+                        position_native_window(int(hwnd), int(x), int(y), int(width), int(height), on_top=False)
+                    else:
+                        _user32.ShowWindow(normalized_hwnd, SW_RESTORE)
+                    self._manual_maximized = False
+                    return False
+
+                if not self._normal_bounds:
+                    rect = wintypes.RECT()
+                    if _user32.GetWindowRect(normalized_hwnd, ctypes.byref(rect)):
+                        self._normal_bounds = (
+                            int(rect.left),
+                            int(rect.top),
+                            int(max(320, rect.right - rect.left)),
+                            int(max(240, rect.bottom - rect.top)),
+                        )
+
+                left = 0
+                top = 0
+                right = 0
+                bottom = 0
+                try:
+                    class MONITORINFO(ctypes.Structure):
+                        _fields_ = [
+                            ("cbSize", wintypes.DWORD),
+                            ("rcMonitor", wintypes.RECT),
+                            ("rcWork", wintypes.RECT),
+                            ("dwFlags", wintypes.DWORD),
+                        ]
+
+                    monitor = ctypes.windll.user32.MonitorFromWindow(normalized_hwnd, 2)
+                    monitor_info = MONITORINFO()
+                    monitor_info.cbSize = ctypes.sizeof(MONITORINFO)
+                    if monitor and ctypes.windll.user32.GetMonitorInfoW(monitor, ctypes.byref(monitor_info)):
+                        rect = monitor_info.rcWork
+                        left = int(rect.left)
+                        top = int(rect.top)
+                        right = int(rect.right)
+                        bottom = int(rect.bottom)
+                except Exception:
+                    left = top = right = bottom = 0
+
+                if right <= left or bottom <= top:
+                    screen_width = 1920
+                    screen_height = 1080
+                    if os.name == "nt":
+                        try:
+                            screen_width = int(ctypes.windll.user32.GetSystemMetrics(0))
+                            screen_height = int(ctypes.windll.user32.GetSystemMetrics(1))
+                        except Exception:
+                            pass
+                    left, top, right, bottom = get_active_monitor_work_area(screen_width, screen_height)
+
+                target_width = int(max(320, right - left))
+                target_height = int(max(240, bottom - top))
+                position_native_window(int(hwnd), int(left), int(top), target_width, target_height, on_top=False)
+                self._manual_maximized = True
+                return True
+            if self._manual_maximized and self._normal_bounds:
+                x, y, width, height = self._normal_bounds
+                self._window.resize(int(width), int(height))
+                self._window.move(int(x), int(y))
+                self._manual_maximized = False
+                return False
+
+            self._normal_bounds = (
+                int(self._window.x),
+                int(self._window.y),
+                int(self._window.width),
+                int(self._window.height),
+            )
+            screen_width = 0
+            screen_height = 0
+            try:
+                screen_width = int(getattr(getattr(self._window, "screen", None), "width", 0) or 0)
+                screen_height = int(getattr(getattr(self._window, "screen", None), "height", 0) or 0)
+            except Exception:
+                screen_width = 0
+                screen_height = 0
+            if screen_width <= 0 or screen_height <= 0:
+                screen_width = 1920
+                screen_height = 1080
+                if os.name == "nt":
+                    try:
+                        screen_width = int(ctypes.windll.user32.GetSystemMetrics(0))
+                        screen_height = int(ctypes.windll.user32.GetSystemMetrics(1))
+                    except Exception:
+                        pass
+            left, top, right, bottom = get_work_area_bounds(screen_width, screen_height)
+            self._window.move(int(left), int(top))
+            self._window.resize(int(max(320, right - left)), int(max(240, bottom - top)))
+            self._manual_maximized = True
+            return True
+        except Exception:
+            logger.exception("Auth window maximize toggle failed.")
+            return False
+
+    def start_move(self):
+        if self._window is None:
+            return False
+        hwnd = self._get_hwnd()
+        if not hwnd:
+            return False
+        try:
+            normalized_hwnd = wintypes.HWND(int(hwnd))
+            if self._manual_maximized and self._normal_bounds:
+                x, y, width, height = self._normal_bounds
+                position_native_window(int(hwnd), int(x), int(y), int(width), int(height), on_top=False)
+                self._manual_maximized = False
+            _user32.SetForegroundWindow(normalized_hwnd)
+            _user32.ReleaseCapture()
+            _user32.SendMessageW(normalized_hwnd, WM_NCLBUTTONDOWN, HTCAPTION, 0)
+        except Exception:
+            logger.exception("Auth window move dispatch failed.")
+            return False
+        return True
+
+    def start_resize(self, edge):
+        direction = str(edge or "").strip().lower()
+        hit_test = WEBVIEW_RESIZE_HIT_TESTS.get(direction)
+        if not hit_test or self._window is None:
+            return False
+        if self._manual_maximized and self._normal_bounds:
+            try:
+                x, y, width, height = self._normal_bounds
+                self._window.resize(int(width), int(height))
+                self._window.move(int(x), int(y))
+                self._manual_maximized = False
+            except Exception:
+                logger.exception("Auth window restore before resize failed.")
+                return False
+        hwnd = self._get_hwnd()
+        if not hwnd:
+            return False
+        try:
+            normalized_hwnd = wintypes.HWND(int(hwnd))
+            _user32.SetForegroundWindow(normalized_hwnd)
+            _user32.ReleaseCapture()
+            _user32.SendMessageW(normalized_hwnd, WM_NCLBUTTONDOWN, int(hit_test), 0)
+        except Exception:
+            logger.exception("Auth window resize dispatch failed for edge '%s'.", direction)
+            return False
+        return True
+
+    def read_clipboard(self):
+        try:
+            return str(pyperclip.paste() or "")
+        except Exception:
+            return ""
+
+    def open_external(self, url):
+        target = str(url or "").strip()
+        if not target:
+            return False
+        try:
+            parsed = urlparse(target)
+        except Exception:
+            return False
+        if parsed.scheme not in {"http", "https"}:
+            logger.warning("open_external blocked non-http(s) URL scheme: %s", parsed.scheme)
+            return False
+        try:
+            return bool(webbrowser.open(target, new=2))
+        except Exception:
+            return False
+
+
+def build_auth_shell_html(initial_state):
+    bootstrap = {
+        "translations": TRANSLATIONS,
+        "initialState": dict(initial_state),
+        "hotkeyActionIds": list(HOTKEY_ACTION_ORDER),
+        "allowedHotkeys": dict(ALLOWED_HOTKEY_BINDINGS),
+        "defaultNumpadHotkeys": get_default_command_hotkeys("numpad"),
+        "sizeIds": list(INDICATOR_BLOB_SIZES.keys()),
+        "positionIds": list(INDICATOR_POSITIONS.keys()),
+        "positionPoints": dict(INDICATOR_PREVIEW_POINTS),
+        "proModels": list(PRO_MODEL_OPTIONS),
+        "websiteUrl": DEFAULT_WEBSITE_URL,
+        "dashboardUrl": f"{str(DEFAULT_WEBSITE_URL).rstrip('/')}/dashboard.php#dashboard-app-access",
+        "forgotPasswordUrl": f"{str(DEFAULT_WEBSITE_URL).rstrip('/')}/forgot-password.php",
+        "themeDark": bool(system_dark_theme_enabled),
+    }
+    template = r"""
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    :root {
+      --bg0: #081321;
+      --bg1: #0e2444;
+      --glass: rgba(255,255,255,0.09);
+      --glass-strong: rgba(255,255,255,0.14);
+      --border: rgba(255,255,255,0.12);
+      --text: #f6fbff;
+      --muted: #b5c7df;
+      --primary: #3b8cff;
+      --danger: #ff9898;
+      --radius-xl: 28px;
+      --radius-lg: 22px;
+      --radius-md: 16px;
+      --font: "Segoe UI Variable Text", "Segoe UI", sans-serif;
+    }
+    body.theme-light {
+      --bg0: #e7eef8;
+      --bg1: #d8e5f8;
+      --glass: rgba(255,255,255,0.74);
+      --glass-strong: rgba(255,255,255,0.86);
+      --border: rgba(16,42,86,0.12);
+      --text: #102a56;
+      --muted: #4c6082;
+      --primary: #1459d9;
+      --danger: #ba1a1a;
+    }
+    * { box-sizing: border-box; }
+    html, body {
+      margin: 0;
+      min-height: 100%;
+      font-family: var(--font);
+      color: var(--text);
+      background:
+        radial-gradient(circle at 12% 16%, rgba(107,174,255,0.34), transparent 26%),
+        radial-gradient(circle at 86% 12%, rgba(109,239,197,0.18), transparent 24%),
+        linear-gradient(160deg, var(--bg0), var(--bg1));
+    }
+    body {
+      padding: 16px;
+      overflow: auto;
+      display: flex;
+      justify-content: center;
+    }
+    .window-shell {
+      width: min(100%, 1360px);
+      height: min(920px, calc(100vh - 32px));
+      min-height: 0;
+      background: linear-gradient(180deg, rgba(255,255,255,0.08), rgba(255,255,255,0.03));
+      border: 1px solid var(--border);
+      box-shadow: 0 30px 90px rgba(0,0,0,0.35);
+      backdrop-filter: blur(24px);
+      border-radius: 32px;
+      overflow: hidden;
+      position: relative;
+      display: flex;
+      flex-direction: column;
+    }
+        .window-drag-strip {
+            position: absolute;
+            top: 0;
+            left: 18px;
+            right: 18px;
+            height: 14px;
+            z-index: 40;
+            cursor: move;
+            background: transparent;
+            border-radius: 999px;
+            pointer-events: auto;
+        }
+    .window-bar {
+      display: flex;
+      align-items: center;
+      flex-wrap: wrap;
+      justify-content: space-between;
+      gap: 16px;
+      min-height: 72px;
+      padding: 14px 18px;
+      border-bottom: 1px solid rgba(255,255,255,0.08);
+      background: linear-gradient(180deg, rgba(255,255,255,0.08), rgba(255,255,255,0.03));
+    }
+    .window-drag-zone {
+      min-width: 0;
+      flex: 1 1 auto;
+      display: flex;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 16px;
+            cursor: move;
+    }
+    .window-brand {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      min-width: 0;
+    }
+    .window-brand-link,
+    .hero-title-link {
+      padding: 0;
+      border: none;
+      background: transparent;
+      color: inherit;
+      font: inherit;
+      text-align: left;
+      cursor: pointer;
+      transition: color 180ms ease, transform 180ms ease, text-shadow 180ms ease;
+    }
+    .window-brand-link {
+      display: inline-flex;
+      align-items: center;
+      gap: 12px;
+      min-width: 0;
+      max-width: 100%;
+      border-radius: 14px;
+    }
+    .window-brand-link:hover,
+    .window-brand-link:focus-visible,
+    .hero-title-link:hover,
+    .hero-title-link:focus-visible {
+      color: #7fb6ff;
+      text-shadow: 0 0 18px rgba(91, 162, 255, 0.26);
+      transform: translateY(-1px);
+      outline: none;
+    }
+    .window-drag-fill {
+            min-width: 120px;
+      flex: 1 1 auto;
+      align-self: stretch;
+            cursor: move;
+    }
+    .window-brand-mark {
+      width: 18px;
+      height: 18px;
+      border-radius: 7px;
+      border: 2px solid #22D05D;
+      background: rgba(0,0,0,0.92);
+      box-shadow: 0 0 22px rgba(34,208,93,0.22);
+      flex: 0 0 auto;
+    }
+    .window-caption {
+      font-size: 15px;
+      font-weight: 700;
+      overflow-wrap: anywhere;
+    }
+    .window-status {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 0;
+      flex: 1 1 220px;
+      max-width: 100%;
+      padding: 10px 16px;
+      border-radius: 999px;
+      background: rgba(255,255,255,0.08);
+      border: 1px solid var(--border);
+      color: var(--muted);
+      font-size: 12px;
+      text-align: center;
+      overflow-wrap: anywhere;
+    }
+    .window-controls {
+      display: flex;
+      align-items: center;
+      justify-content: flex-end;
+      flex-wrap: wrap;
+      gap: 10px;
+      flex: 0 0 auto;
+      max-width: 100%;
+    }
+    .chrome-control {
+      width: 40px;
+      height: 40px;
+      border-radius: 14px;
+      border: 1px solid var(--border);
+      background: rgba(255,255,255,0.06);
+      color: var(--text);
+      cursor: pointer;
+      font-size: 16px;
+      transition: 180ms ease;
+    }
+    .chrome-control:hover {
+      background: rgba(255,255,255,0.14);
+      transform: translateY(-1px);
+    }
+    .chrome-control.close:hover {
+      background: rgba(255,108,108,0.18);
+      border-color: rgba(255,108,108,0.34);
+    }
+    .chrome-control.active {
+      background: rgba(59,140,255,0.18);
+      border-color: rgba(120,183,255,0.48);
+    }
+    .app {
+      min-height: 0;
+      flex: 1 1 auto;
+      display: grid;
+      grid-template-columns: minmax(340px, 1.03fr) minmax(320px, 0.97fr);
+      overflow: hidden;
+      align-items: stretch;
+    }
+    .hero, .panel { min-height: 0; min-width: 0; padding: 26px 30px; }
+    .hero {
+      border-right: 1px solid rgba(255,255,255,0.08);
+      display: flex;
+      flex-direction: column;
+      gap: 18px;
+      justify-content: center;
+      overflow: auto;
+    }
+    .hero-copy {
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+    }
+    h1 {
+      margin: 0;
+      font-size: clamp(32px, 5vw, 52px);
+      line-height: 1;
+      letter-spacing: -0.04em;
+    }
+    .hero-title-link {
+      width: fit-content;
+      max-width: 100%;
+      font-size: clamp(32px, 5vw, 52px);
+      line-height: 1;
+      letter-spacing: -0.04em;
+      font-weight: 700;
+    }
+    .hero-title-link #title {
+      display: block;
+    }
+    .subtitle { color: var(--muted); max-width: 540px; line-height: 1.55; }
+    .subtitle,
+    .hero-copy,
+    .settings-summary,
+    .main-card {
+      min-width: 0;
+    }
+    .card {
+      background: var(--glass);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-lg);
+      padding: 18px;
+    }
+    .settings-summary {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+    }
+    .settings-summary .selection-value {
+      font-size: 14px;
+      line-height: 1.45;
+      color: var(--muted);
+      font-weight: 600;
+      letter-spacing: 0;
+    }
+    .settings-open-button {
+      flex: 0 0 auto;
+      min-width: 118px;
+    }
+    .modes { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+    .mode {
+      cursor: pointer;
+      transition: 180ms ease;
+    }
+    .mode.active {
+      border-color: rgba(120,183,255,0.52);
+      background: linear-gradient(180deg, rgba(59,140,255,0.22), var(--glass));
+      transform: translateY(-1px);
+      box-shadow: 0 16px 36px rgba(14,34,66,0.24);
+    }
+    .mode h3, .section { margin: 0 0 6px; font-size: 15px; }
+    .mode p, .helper, .hint { margin: 0; color: var(--muted); font-size: 13px; line-height: 1.5; }
+    .section { font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em; color: #d5e2f7; }
+    .panel { display: flex; flex-direction: column; gap: 16px; justify-content: center; overflow: auto; padding-bottom: 18px; }
+    .main-card {
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+    }
+    .auth-panel {
+      display: flex;
+      flex-direction: column;
+      gap: 0;
+    }
+    .label { display: block; margin-bottom: 8px; font-weight: 700; font-size: 13px; }
+    .segment-wrap, .sizes {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+    }
+    .segment-wrap {
+      padding: 8px;
+      border-radius: 999px;
+      background: var(--glass);
+      border: 1px solid var(--border);
+      width: fit-content;
+    }
+    button, select, input {
+      font: inherit;
+      color: inherit;
+    }
+    input, textarea, select {
+      -webkit-user-select: text;
+      user-select: text;
+      cursor: text;
+    }
+    .segment, .pill, .ghost, .primary {
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      background: transparent;
+      color: var(--text);
+      padding: 10px 14px;
+      cursor: pointer;
+      transition: 180ms ease;
+    }
+    .segment.active, .pill.active {
+      background: rgba(59,140,255,0.18);
+      border-color: rgba(120,183,255,0.56);
+      box-shadow: 0 12px 26px rgba(14,34,66,0.26);
+    }
+    .ghost { background: rgba(255,255,255,0.06); }
+    .primary {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 10px;
+      background: linear-gradient(180deg, #54a2ff, #1d6deb);
+      border-color: rgba(120,183,255,0.56);
+      box-shadow: 0 18px 36px rgba(26,92,205,0.35);
+    }
+    .primary:disabled,
+    .ghost:disabled,
+    .segment:disabled,
+    .pill:disabled {
+      cursor: default;
+      opacity: 0.78;
+      transform: none !important;
+    }
+    .primary.loading {
+      box-shadow: 0 18px 36px rgba(26,92,205,0.28);
+    }
+    .button-spinner {
+      width: 16px;
+      height: 16px;
+      display: none;
+      border-radius: 999px;
+      border: 2px solid rgba(255,255,255,0.28);
+      border-top-color: rgba(255,255,255,0.96);
+      animation: authSpin 820ms linear infinite;
+      flex: 0 0 auto;
+    }
+    .primary.loading .button-spinner {
+      display: inline-block;
+    }
+    @keyframes authSpin {
+      from { transform: rotate(0deg); }
+      to { transform: rotate(360deg); }
+    }
+    .field {
+      min-width: 0;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 12px 14px;
+      border-radius: var(--radius-md);
+      background: rgba(255,255,255,0.08);
+      border: 1px solid var(--border);
+    }
+    .field input, .field select {
+      width: 100%;
+      min-width: 0;
+      border: none;
+      background: transparent;
+      outline: none;
+    }
+    .field.icon-field {
+      position: relative;
+      padding-right: 86px;
+    }
+    .field-actions {
+      position: absolute;
+      top: 50%;
+      right: 8px;
+      display: flex;
+      gap: 6px;
+      transform: translateY(-50%);
+    }
+    .icon-button {
+      width: 34px;
+      height: 34px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      border-radius: 999px;
+      border: 1px solid rgba(255,255,255,0.08);
+      background: rgba(255,255,255,0.06);
+      color: var(--text);
+      cursor: pointer;
+      transition: 180ms ease;
+    }
+    .icon-button:hover {
+      background: rgba(255,255,255,0.14);
+      transform: translateY(-1px);
+    }
+    .icon-button svg,
+    .chrome-control svg {
+      width: 18px;
+      height: 18px;
+      stroke: currentColor;
+      fill: none;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+      pointer-events: none;
+    }
+    .field select option { color: #081321; }
+    .selection-value {
+      font-size: 17px;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+    }
+    .preview {
+      min-height: 268px;
+      position: relative;
+      border-radius: 24px;
+      background:
+        radial-gradient(circle at 24% 18%, rgba(109,239,197,0.14), transparent 26%),
+        linear-gradient(160deg, rgba(14,32,61,0.96), rgba(8,19,33,0.96));
+      border: 1px solid var(--border);
+      overflow: hidden;
+    }
+    .preview::before {
+      content: "";
+      position: absolute;
+      inset: 18px;
+      border-radius: 24px;
+      border: 1px solid rgba(255,255,255,0.06);
+      background:
+        linear-gradient(180deg, rgba(255,255,255,0.02), transparent),
+        radial-gradient(circle at 50% 50%, rgba(255,255,255,0.03), transparent 60%);
+    }
+    .preview-grid {
+      position: absolute;
+      inset: 18px;
+      border-radius: 24px;
+      background-image:
+        linear-gradient(to right, rgba(255,255,255,0.05) 1px, transparent 1px),
+        linear-gradient(to bottom, rgba(255,255,255,0.05) 1px, transparent 1px);
+      background-size: calc(100% / 6) calc(100% / 4);
+      opacity: 0.26;
+      pointer-events: none;
+    }
+    .preview-hotspots {
+      position: absolute;
+      inset: 22px;
+    }
+    .hotspot {
+      position: absolute;
+      width: 26px;
+      height: 26px;
+      border-radius: 999px;
+      border: 1px solid rgba(189,211,243,0.52);
+      background: rgba(255,255,255,0.02);
+      box-shadow: inset 0 0 0 5px rgba(0,0,0,0.18);
+      cursor: pointer;
+      transform: translate(-50%, -50%);
+      transition: 180ms ease;
+    }
+    .hotspot:hover {
+      border-color: rgba(255,255,255,0.82);
+      transform: translate(-50%, -50%) scale(1.06);
+    }
+    .hotspot.active {
+      border-color: rgba(34,208,93,0.84);
+      background: rgba(34,208,93,0.12);
+      box-shadow:
+        inset 0 0 0 6px rgba(0,0,0,0.28),
+        0 0 22px rgba(34,208,93,0.22);
+    }
+    .preview-chip {
+      position: absolute;
+      width: 24px;
+      height: 24px;
+      border-radius: 8px;
+      background: rgba(99,106,116,0.98);
+      border: 1px solid rgba(152,160,171,0.92);
+      box-shadow: 0 6px 14px rgba(0,0,0,0.22);
+      transition: all 220ms ease;
+      z-index: 2;
+    }
+    .input-link-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px 14px;
+      margin-top: 10px;
+    }
+    .text-link {
+      padding: 0;
+      border: none;
+      background: transparent;
+      color: var(--muted);
+      cursor: pointer;
+      text-decoration: underline;
+      text-underline-offset: 3px;
+    }
+    .text-link:hover {
+      color: var(--text);
+    }
+    .inline-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-top: 12px;
+    }
+    .inline-actions .ghost {
+      min-width: 0;
+      padding: 10px 16px;
+      border-radius: 16px;
+      font-weight: 700;
+    }
+    .remember-toggle.active {
+      background: rgba(59,140,255,0.18);
+      border-color: rgba(120,183,255,0.56);
+      box-shadow: 0 12px 26px rgba(14,34,66,0.18);
+    }
+    .model-options {
+      display: grid;
+      gap: 10px;
+      margin-top: 14px;
+    }
+    .model-option {
+      width: 100%;
+      display: grid;
+      gap: 4px;
+      text-align: left;
+      padding: 14px 16px;
+      border-radius: 18px;
+      border: 1px solid var(--border);
+      background: rgba(255,255,255,0.05);
+      color: var(--text);
+      cursor: pointer;
+      transition: 180ms ease;
+    }
+    .model-option:hover {
+      transform: translateY(-1px);
+      background: rgba(255,255,255,0.08);
+    }
+    .model-option.active {
+      background: linear-gradient(180deg, rgba(59,140,255,0.22), rgba(20,39,69,0.92));
+      border-color: rgba(120,183,255,0.58);
+      box-shadow: 0 16px 30px rgba(14,34,66,0.24);
+    }
+    .model-option-title {
+      font-size: 14px;
+      font-weight: 700;
+      letter-spacing: -0.01em;
+    }
+    .model-option-copy {
+      font-size: 12px;
+      color: var(--muted);
+      line-height: 1.45;
+    }
+    .hotkey-list {
+      display: grid;
+      gap: 10px;
+      margin-top: 14px;
+    }
+    .hotkey-row {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 12px;
+      align-items: center;
+      padding: 12px 14px;
+      border-radius: 18px;
+      background: rgba(255,255,255,0.05);
+      border: 1px solid var(--border);
+    }
+    .hotkey-row-label {
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--text);
+    }
+    .hotkey-button {
+      min-width: 88px;
+      padding: 9px 14px;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      background: rgba(255,255,255,0.08);
+      color: var(--text);
+      font-weight: 700;
+      cursor: pointer;
+      transition: 180ms ease;
+    }
+    .hotkey-button:hover,
+    .hotkey-button.waiting {
+      background: rgba(59,140,255,0.18);
+      border-color: rgba(120,183,255,0.56);
+      box-shadow: 0 12px 26px rgba(14,34,66,0.26);
+    }
+    .hotkey-feedback {
+      min-height: 20px;
+    }
+    .actions {
+      display: flex;
+      justify-content: flex-end;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-left: auto;
+      width: 100%;
+      padding-top: 4px;
+    }
+    .actions .ghost,
+    .actions .primary {
+      min-width: 148px;
+      padding: 13px 22px;
+      border-radius: 18px;
+      font-weight: 700;
+    }
+    .actions .ghost {
+      background: rgba(255,255,255,0.04);
+    }
+    .actions .ghost:hover {
+      background: rgba(255,255,255,0.11);
+    }
+    .error {
+      min-height: 20px;
+      color: var(--danger);
+      font-weight: 600;
+      font-size: 13px;
+    }
+    .settings-backdrop {
+      position: absolute;
+      inset: 0;
+      background: rgba(2, 8, 18, 0.46);
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 180ms ease;
+      z-index: 15;
+    }
+    .settings-backdrop.open {
+      opacity: 1;
+      pointer-events: auto;
+    }
+    .settings-drawer {
+      position: absolute;
+      top: 92px;
+      right: 18px;
+      bottom: 18px;
+      width: min(420px, calc(100% - 36px));
+      padding: 18px;
+      border-radius: 28px;
+      border: 1px solid var(--border);
+      background: linear-gradient(180deg, rgba(8,19,33,0.96), rgba(14,32,61,0.94));
+      box-shadow: 0 28px 72px rgba(0,0,0,0.36);
+      backdrop-filter: blur(22px);
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+      transform: translateX(calc(100% + 24px));
+      opacity: 0;
+      pointer-events: none;
+      transition: transform 220ms ease, opacity 220ms ease;
+      z-index: 20;
+    }
+    body.theme-light .settings-drawer {
+      background: linear-gradient(180deg, rgba(248,252,255,0.97), rgba(227,238,248,0.95));
+    }
+    .settings-drawer.open {
+      transform: translateX(0);
+      opacity: 1;
+      pointer-events: auto;
+    }
+    .settings-head {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 14px;
+    }
+    .settings-body {
+      min-height: 0;
+      overflow: auto;
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+      padding-right: 2px;
+    }
+    .resize-handle {
+      position: absolute;
+      z-index: 35;
+      background: transparent;
+    }
+    .resize-handle.n,
+    .resize-handle.s {
+      left: 14px;
+      right: 14px;
+      height: 10px;
+      cursor: ns-resize;
+    }
+    .resize-handle.n { top: 0; }
+    .resize-handle.s { bottom: 0; }
+    .resize-handle.e,
+    .resize-handle.w {
+      top: 14px;
+      bottom: 14px;
+      width: 10px;
+      cursor: ew-resize;
+    }
+    .resize-handle.e { right: 0; }
+    .resize-handle.w { left: 0; }
+    .resize-handle.ne,
+    .resize-handle.nw,
+    .resize-handle.se,
+    .resize-handle.sw {
+      width: 16px;
+      height: 16px;
+    }
+    .resize-handle.ne {
+      top: 0;
+      right: 0;
+      cursor: nesw-resize;
+    }
+    .resize-handle.nw {
+      top: 0;
+      left: 0;
+      cursor: nwse-resize;
+    }
+    .resize-handle.se {
+      right: 0;
+      bottom: 0;
+      cursor: nwse-resize;
+    }
+    .resize-handle.sw {
+      left: 0;
+      bottom: 0;
+      cursor: nesw-resize;
+    }
+    .hidden { display: none !important; }
+    @media (max-width: 1180px), (max-height: 780px) {
+      body { padding: 14px; }
+      .window-shell { height: calc(100vh - 28px); }
+      .window-bar {
+        flex-wrap: wrap;
+        justify-content: flex-start;
+      }
+      .window-status {
+        order: 3;
+        width: 100%;
+      }
+      .window-controls {
+        margin-left: auto;
+      }
+      .app { grid-template-columns: 1fr; }
+      .hero { border-right: none; border-bottom: 1px solid rgba(255,255,255,0.08); }
+      .modes { grid-template-columns: 1fr; }
+      .preview { min-height: 224px; }
+      .actions .ghost,
+      .actions .primary {
+        flex: 1 1 180px;
+      }
+      .settings-summary {
+        flex-direction: column;
+        align-items: stretch;
+      }
+      .settings-open-button {
+        width: 100%;
+      }
+      .settings-drawer {
+        top: 84px;
+        left: 14px;
+        right: 14px;
+        bottom: 14px;
+        width: auto;
+      }
+    }
+    @media (max-width: 760px), (max-height: 640px) {
+      body { padding: 10px; }
+      .window-shell {
+        width: 100%;
+        height: calc(100vh - 20px);
+        border-radius: 24px;
+      }
+            .window-drag-strip {
+                left: 12px;
+                right: 12px;
+                height: 12px;
+            }
+      .window-bar {
+        gap: 12px;
+        min-height: 0;
+        padding: 12px 14px;
+      }
+      .window-controls {
+        width: 100%;
+      }
+      .chrome-control {
+        width: 36px;
+        height: 36px;
+        border-radius: 12px;
+      }
+      .hero,
+      .panel {
+        padding: 18px 18px 16px;
+      }
+      .window-status {
+        padding: 8px 12px;
+        font-size: 11px;
+      }
+      .preview {
+        min-height: 190px;
+      }
+      .hotkey-row {
+        grid-template-columns: 1fr;
+      }
+      .hotkey-button {
+        width: 100%;
+      }
+      .actions {
+        margin-left: 0;
+      }
+      .actions .ghost,
+      .actions .primary {
+        flex: 1 1 100%;
+        min-width: 0;
+      }
+      .inline-actions .ghost {
+        flex: 1 1 100%;
+      }
+      .text-link {
+        max-width: 100%;
+        text-align: left;
+      }
+      .settings-drawer {
+        top: 112px;
+        left: 10px;
+        right: 10px;
+        bottom: 10px;
+        padding: 14px;
+        border-radius: 24px;
+      }
+    }
+  </style>
+</head>
+<body class="theme-dark">
+  <div class="window-shell">
+        <div class="window-drag-strip pywebview-drag-region" id="windowDragStrip"></div>
+    <header class="window-bar">
+      <div class="window-drag-zone" id="windowDragZone">
+        <button class="window-brand-link" id="windowBrandLink" type="button">
+          <div class="window-brand-mark"></div>
+          <div class="window-caption" id="windowCaption"></div>
+        </button>
+        <div class="window-status" id="windowStatus"></div>
+        <div class="window-drag-fill pywebview-drag-region"></div>
+      </div>
+      <div class="window-controls">
+        <button class="chrome-control" id="settingsToggleButton" type="button" aria-label="Settings"></button>
+        <button class="chrome-control" id="minimizeButton" type="button" aria-label="Minimize"></button>
+        <button class="chrome-control" id="maximizeButton" type="button" aria-label="Maximize"></button>
+        <button class="chrome-control close" id="closeChromeButton" type="button" aria-label="Close"></button>
+      </div>
+    </header>
+    <main class="app">
+      <section class="hero">
+        <div class="hero-copy">
+          <button class="hero-title-link" id="titleButton" type="button"><span id="title"></span></button>
+          <p class="subtitle" id="subtitle"></p>
+        </div>
+        <div class="modes">
+          <article class="card mode active"><h3 id="modeAccountTitle"></h3><p id="modeAccountHelp"></p></article>
+        </div>
+        <div class="card settings-summary">
+          <div>
+            <div class="section" id="settingsSummaryTitle"></div>
+            <div class="selection-value" id="settingsSummaryValue"></div>
+          </div>
+          <button class="ghost settings-open-button" id="openSettingsButton" type="button"></button>
+        </div>
+      </section>
+      <section class="panel">
+        <div class="card main-card">
+          <div class="section" id="accountTitle"></div>
+          <p class="helper" id="accountCopy"></p>
+          <div class="auth-panel" id="accountPanel">
+          <label class="label" id="emailLabel"></label>
+          <div class="field">
+            <input id="emailInput" type="email" autocomplete="username email" spellcheck="false">
+          </div>
+          <label class="label" id="passwordLabel" style="margin-top: 14px;"></label>
+          <div class="field icon-field">
+            <input id="passwordInput" type="password" autocomplete="current-password" spellcheck="false">
+            <div class="field-actions">
+              <button class="icon-button" id="showButton" type="button"></button>
+            </div>
+          </div>
+          <div class="inline-actions">
+            <button class="ghost" id="importSettingsButton" type="button"></button>
+            <button class="ghost remember-toggle" id="rememberMeButton" type="button"></button>
+          </div>
+          <div class="input-link-row">
+            <button class="text-link" id="resetPasswordButton" type="button"></button>
+          </div>
+          </div>
+        </div>
+        <div class="error" id="errorText"></div>
+        <div class="actions">
+          <button class="ghost" id="cancelButton" type="button"></button>
+          <button class="primary" id="continueButton" type="button">
+            <span class="button-spinner" id="continueSpinner"></span>
+            <span id="continueButtonLabel"></span>
+          </button>
+        </div>
+      </section>
+    </main>
+    <div class="settings-backdrop" id="settingsBackdrop"></div>
+    <aside class="settings-drawer" id="settingsDrawer" aria-hidden="true">
+      <div class="settings-head">
+        <div>
+          <div class="section" id="settingsPanelTitle"></div>
+          <p class="helper" id="settingsPanelCopy" style="margin-top: 6px;"></p>
+        </div>
+        <button class="ghost" id="settingsDoneButton" type="button"></button>
+      </div>
+      <div class="settings-body">
+        <div class="card">
+          <div class="section" id="languageTitle"></div>
+          <div class="segment-wrap" id="languageButtons"></div>
+        </div>
+        <div class="card">
+          <div class="section" id="startupSectionTitle"></div>
+          <label class="label" id="startupScreenLabel"></label>
+          <p class="helper" id="startupScreenCopy" style="margin-bottom: 12px;"></p>
+          <button class="pill" id="startupScreenToggle" type="button"></button>
+        </div>
+        <div class="card">
+          <div class="section" id="previewTitle"></div>
+          <div class="selection-value" id="positionValue" style="margin: 4px 0 14px;"></div>
+          <div class="preview" id="previewSurface">
+            <div class="preview-grid"></div>
+            <div class="preview-hotspots" id="positionButtons"></div>
+            <div class="preview-chip" id="previewChip"></div>
+          </div>
+          <p class="hint" id="previewCopy" style="margin-top: 12px;"></p>
+        </div>
+        <div class="card">
+          <div class="section" id="appearanceTitle"></div>
+          <label class="label" id="themeTitle"></label>
+          <div class="segment-wrap" id="themeButtons"></div>
+          <p class="helper" id="themeCopy" style="margin: 12px 0 14px;"></p>
+          <label class="label" id="sizeTitle"></label>
+          <div class="sizes" id="sizeButtons"></div>
+        </div>
+        <div class="card">
+          <div class="section" id="hotkeysTitle"></div>
+          <p class="helper" id="hotkeysCopy"></p>
+          <div class="actions" style="justify-content: flex-start; margin: 12px 0 0; padding-top: 0;">
+            <button class="ghost" id="hotkeysResetButton" type="button" style="min-width: 0; padding: 10px 16px;"></button>
+          </div>
+          <div class="hotkey-list" id="hotkeyList"></div>
+          <p class="helper hotkey-feedback" id="hotkeysFeedback" style="margin-top: 12px;"></p>
+          <p class="helper" id="securityCopy" style="margin-top: 12px;"></p>
+        </div>
+        <div class="card" id="modelSettingsCard">
+          <div class="section" id="proSectionTitle"></div>
+          <label class="label" id="modelLabel"></label>
+          <input id="modelSelect" type="hidden" value="">
+          <div class="model-options" id="modelOptions"></div>
+          <p class="helper" id="modelNote" style="margin-top: 12px;"></p>
+        </div>
+      </div>
+    </aside>
+    <div class="resize-handle n" data-edge="n"></div>
+    <div class="resize-handle s" data-edge="s"></div>
+    <div class="resize-handle e" data-edge="e"></div>
+    <div class="resize-handle w" data-edge="w"></div>
+    <div class="resize-handle ne" data-edge="ne"></div>
+    <div class="resize-handle nw" data-edge="nw"></div>
+    <div class="resize-handle se" data-edge="se"></div>
+    <div class="resize-handle sw" data-edge="sw"></div>
+  </div>
+  <script>
+    /*__BOOTSTRAP__*/
+    const bootstrap = window.AUTH_BOOTSTRAP || {};
+    const copy = bootstrap.translations || {};
+    const state = Object.assign({
+      language: 'en',
+      theme: 'system',
+      blob_size: 'medium',
+      indicator_position: 'bottom_right',
+      show_startup_screen: true,
+      hotkeys: {},
+      hotkey_mode: 'numpad',
+      preferred_model: '',
+      pro_model: '',
+      email: '',
+      password: '',
+      remember_me: false,
+      live_session_email: '',
+      live_session_token: '',
+      error_message: ''
+    }, bootstrap.initialState || {});
+    const hotkeyActionIds = bootstrap.hotkeyActionIds || [];
+    const allowedHotkeys = bootstrap.allowedHotkeys || {};
+    const defaultNumpadHotkeys = bootstrap.defaultNumpadHotkeys || {};
+    const sizeIds = bootstrap.sizeIds || [];
+    const positionIds = bootstrap.positionIds || [];
+    const positionPoints = bootstrap.positionPoints || {};
+    const proModels = bootstrap.proModels || [];
+    const websiteUrl = bootstrap.websiteUrl || '';
+    const dashboardUrl = bootstrap.dashboardUrl || websiteUrl;
+    const forgotPasswordUrl = bootstrap.forgotPasswordUrl || websiteUrl;
+    let themeDark = !!bootstrap.themeDark;
+    let closePending = false;
+    let settingsOpen = false;
+    let awaitingHotkeyAction = '';
+    let hotkeyFeedbackKey = 'auth.hotkeys.copy';
+    let windowMaximized = false;
+    let isSubmitting = false;
+    const themeMedia = window.matchMedia ? window.matchMedia('(prefers-color-scheme: dark)') : null;
+
+    function t(key, vars) {
+      let text = (((copy[state.language] || {})[key]) || ((copy.en || {})[key]) || key);
+      if (vars) Object.keys(vars).forEach((name) => { text = text.replaceAll(`{${name}}`, String(vars[name])); });
+      return text;
+    }
+
+    function setText(id, value) {
+      const node = document.getElementById(id);
+      if (node) node.textContent = value;
+    }
+
+    function nextPaint() {
+      return new Promise((resolve) => {
+        if (typeof window.requestAnimationFrame === 'function') {
+          window.requestAnimationFrame(() => resolve());
+          return;
+        }
+        window.setTimeout(resolve, 0);
+      });
+    }
+
+    function renderSubmitButton() {
+      const button = document.getElementById('continueButton');
+      if (!button) return;
+      button.classList.toggle('loading', isSubmitting);
+      button.disabled = !!isSubmitting;
+      button.setAttribute('aria-busy', isSubmitting ? 'true' : 'false');
+      setText('continueButtonLabel', isSubmitting ? t('auth.continue.loading') : t('auth.continue'));
+    }
+
+    function iconSvg(name) {
+      if (name === 'settings') {
+        return '<svg viewBox="0 0 512 512" aria-hidden="true"><path d="M262.29 192.31a64 64 0 1 0 57.4 57.4 64.13 64.13 0 0 0-57.4-57.4M416.39 256a154 154 0 0 1-1.53 20.79l45.21 35.46a10.81 10.81 0 0 1 2.45 13.75l-42.77 74a10.81 10.81 0 0 1-13.14 4.59l-44.9-18.08a16.11 16.11 0 0 0-15.17 1.75A164.5 164.5 0 0 1 325 400.8a15.94 15.94 0 0 0-8.82 12.14l-6.73 47.89a11.08 11.08 0 0 1-10.68 9.17h-85.54a11.11 11.11 0 0 1-10.69-8.87l-6.72-47.82a16.07 16.07 0 0 0-9-12.22 155 155 0 0 1-21.46-12.57 16 16 0 0 0-15.11-1.71l-44.89 18.07a10.81 10.81 0 0 1-13.14-4.58l-42.77-74a10.8 10.8 0 0 1 2.45-13.75l38.21-30a16.05 16.05 0 0 0 6-14.08c-.36-4.17-.58-8.33-.58-12.5s.21-8.27.58-12.35a16 16 0 0 0-6.07-13.94l-38.19-30A10.81 10.81 0 0 1 49.48 186l42.77-74a10.81 10.81 0 0 1 13.14-4.59l44.9 18.08a16.11 16.11 0 0 0 15.17-1.75A164.5 164.5 0 0 1 187 111.2a15.94 15.94 0 0 0 8.82-12.14l6.73-47.89A11.08 11.08 0 0 1 213.23 42h85.54a11.11 11.11 0 0 1 10.69 8.87l6.72 47.82a16.07 16.07 0 0 0 9 12.22 155 155 0 0 1 21.46 12.57 16 16 0 0 0 15.11 1.71l44.89-18.07a10.81 10.81 0 0 1 13.14 4.58l42.77 74a10.8 10.8 0 0 1-2.45 13.75l-38.21 30a16.05 16.05 0 0 0-6.05 14.08c.33 4.14.55 8.3.55 12.47" stroke="currentColor" stroke-width="32"></path></svg>';
+      }
+      if (name === 'paste') {
+        return '<svg viewBox="0 0 512 512" aria-hidden="true"><path d="M336 64h32a48 48 0 0 1 48 48v320a48 48 0 0 1-48 48H144a48 48 0 0 1-48-48V112a48 48 0 0 1 48-48h32" stroke="currentColor" stroke-width="32"></path><rect width="160" height="64" x="176" y="32" rx="26.13" ry="26.13" stroke="currentColor" stroke-width="32"></rect></svg>';
+      }
+      if (name === 'remove') {
+        return '<svg viewBox="0 0 512 512" aria-hidden="true"><path d="M400 256H112" stroke="currentColor" stroke-width="32"></path></svg>';
+      }
+      if (name === 'square') {
+        return '<svg viewBox="0 0 512 512" aria-hidden="true"><path d="M416 448H96a32.09 32.09 0 0 1-32-32V96a32.09 32.09 0 0 1 32-32h320a32.09 32.09 0 0 1 32 32v320a32.09 32.09 0 0 1-32 32" stroke="currentColor" stroke-width="32"></path></svg>';
+      }
+      if (name === 'contract') {
+        return '<svg viewBox="0 0 512 512" aria-hidden="true"><path d="M304 416V304h112M314.2 314.23 432 432M208 96v112H96M197.8 197.77 80 80M416 208H304V96M314.23 197.8 432 80M96 304h112v112M197.77 314.2 80 432" stroke="currentColor" stroke-width="32"></path></svg>';
+      }
+      if (name === 'eye-off') {
+        return '<svg viewBox="0 0 512 512" aria-hidden="true"><path d="M432 448a15.92 15.92 0 0 1-11.31-4.69l-352-352a16 16 0 0 1 22.62-22.62l352 352A16 16 0 0 1 432 448M255.66 384c-41.49 0-81.5-12.28-118.92-36.5-34.07-22-64.74-53.51-88.7-91v-.08c19.94-28.57 41.78-52.73 65.24-72.21a2 2 0 0 0 .14-2.94L93.5 161.38a2 2 0 0 0-2.71-.12c-24.92 21-48.05 46.76-69.08 76.92a31.92 31.92 0 0 0-.64 35.54c26.41 41.33 60.4 76.14 98.28 100.65C162 402 207.9 416 255.66 416a239.1 239.1 0 0 0 75.8-12.58 2 2 0 0 0 .77-3.31l-21.58-21.58a4 4 0 0 0-3.83-1 204.8 204.8 0 0 1-51.16 6.47M490.84 238.6c-26.46-40.92-60.79-75.68-99.27-100.53C349 110.55 302 96 255.66 96a227.3 227.3 0 0 0-74.89 12.83 2 2 0 0 0-.75 3.31l21.55 21.55a4 4 0 0 0 3.88 1 192.8 192.8 0 0 1 50.21-6.69c40.69 0 80.58 12.43 118.55 37 34.71 22.4 65.74 53.88 89.76 91a.13.13 0 0 1 0 .16 310.7 310.7 0 0 1-64.12 72.73 2 2 0 0 0-.15 2.95l19.9 19.89a2 2 0 0 0 2.7.13 343.5 343.5 0 0 0 68.64-78.48 32.2 32.2 0 0 0-.1-34.78M256 160a96 96 0 0 0-21.37 2.4 2 2 0 0 0-1 3.38l112.59 112.56a2 2 0 0 0 3.38-1A96 96 0 0 0 256 160M165.78 233.66a2 2 0 0 0-3.38 1 96 96 0 0 0 115 115 2 2 0 0 0 1-3.38Z" fill="currentColor" stroke="none"></path></svg>';
+      }
+      if (name === 'close') {
+        return '<svg viewBox="0 0 512 512" aria-hidden="true"><path d="M368 368 144 144M368 144 144 368" stroke="currentColor" stroke-width="32"></path></svg>';
+      }
+      return '<svg viewBox="0 0 512 512" aria-hidden="true"><path d="M255.66 112c-77.94 0-157.89 45.11-220.83 135.33a16 16 0 0 0-.27 17.77C82.92 340.8 161.8 400 255.66 400c92.84 0 173.34-59.38 221.79-135.25a16.14 16.14 0 0 0 0-17.47C428.89 172.28 347.8 112 255.66 112" stroke="currentColor" stroke-width="32"></path><circle cx="256" cy="256" r="80" stroke="currentColor" stroke-width="32"></circle></svg>';
+    }
+
+    function setIconButton(id, iconName, label) {
+      const node = document.getElementById(id);
+      if (!node) return;
+      node.title = label;
+      node.setAttribute('aria-label', label);
+      node.innerHTML = iconSvg(iconName);
+    }
+
+    function currentStatus() {
+      return t('auth.status.account');
+    }
+
+    function resolveThemeDarkJs() {
+      if (state.theme === 'dark') return true;
+      if (state.theme === 'light') return false;
+      if (themeMedia && typeof themeMedia.matches === 'boolean') return !!themeMedia.matches;
+      return !!bootstrap.themeDark;
+    }
+
+    function settingsSummaryText() {
+      return `${t(`lang.${state.language}`)} / ${t(`theme.${state.theme}`)} / ${t(`position.${state.indicator_position}`)} / ${t(`size.${state.blob_size}`)}`;
+    }
+
+    function hotkeyBindingLabelJs(bindingKey) {
+      return ((allowedHotkeys[bindingKey] || {}).label) || '?';
+    }
+
+    function inferHotkeyModeJs() {
+      const keypadFlags = hotkeyActionIds.map((action) => ((allowedHotkeys[state.hotkeys[action]] || {}).keypad));
+      if (keypadFlags.length && keypadFlags.every((flag) => flag === true)) return 'numpad';
+      if (keypadFlags.length && keypadFlags.every((flag) => flag === false)) return 'toprow';
+      return state.hotkey_mode || 'numpad';
+    }
+
+    function normalizeHotkeyEvent(event) {
+      const code = String(event.code || '');
+      const map = {
+        Escape: 'escape',
+        Tab: 'tab',
+        Space: 'space',
+        Digit1: 'digit1',
+        Digit2: 'digit2',
+        Digit3: 'digit3',
+        Digit4: 'digit4',
+        Digit5: 'digit5',
+        Digit6: 'digit6',
+        Digit7: 'digit7',
+        Digit8: 'digit8',
+        Digit9: 'digit9',
+        Digit0: 'digit0',
+        F1: 'f1',
+        F2: 'f2',
+        F3: 'f3',
+        F4: 'f4',
+        F5: 'f5',
+        F6: 'f6',
+        F7: 'f7',
+        F8: 'f8',
+        F9: 'f9',
+        F10: 'f10',
+        F11: 'f11',
+        F12: 'f12',
+        Home: 'home',
+        ArrowUp: 'arrowup',
+        PageUp: 'pageup',
+        Numpad9: 'numpad9',
+        NumpadSubtract: 'numpadsubtract',
+        ArrowLeft: 'arrowleft',
+        Numpad4: 'numpad4',
+        Numpad5: 'numpad5',
+        ArrowRight: 'arrowright',
+        Numpad6: 'numpad6',
+        NumpadAdd: 'numpadadd',
+        Numpad7: 'numpad7',
+        Numpad8: 'numpad8',
+        End: 'end',
+        Numpad1: 'numpad1',
+        ArrowDown: 'arrowdown',
+        Numpad2: 'numpad2',
+        PageDown: 'pagedown',
+        Numpad3: 'numpad3',
+        Insert: 'insert',
+        Numpad0: 'numpad0',
+        Delete: 'delete',
+        NumpadDecimal: 'numpaddecimal',
+        NumpadEnter: 'numpadenter',
+        NumpadMultiply: 'numpadmultiply',
+        NumpadDivide: 'numpaddivide',
+      };
+      if (/^Key[A-Z]$/.test(code)) return '';
+      return allowedHotkeys[map[code]] ? map[code] : '';
+    }
+
+    function renderHotkeys() {
+      const mount = document.getElementById('hotkeyList');
+      if (!mount) return;
+      mount.innerHTML = '';
+      hotkeyActionIds.forEach((action) => {
+        const row = document.createElement('div');
+        row.className = 'hotkey-row';
+        const label = document.createElement('div');
+        label.className = 'hotkey-row-label';
+        label.textContent = t(`auth.hotkey.${action}`);
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'hotkey-button' + (awaitingHotkeyAction === action ? ' waiting' : '');
+        button.textContent = awaitingHotkeyAction === action ? t('auth.hotkeys.waiting') : hotkeyBindingLabelJs(state.hotkeys[action]);
+        button.onclick = () => {
+          awaitingHotkeyAction = awaitingHotkeyAction === action ? '' : action;
+          hotkeyFeedbackKey = awaitingHotkeyAction ? 'auth.hotkeys.waiting' : 'auth.hotkeys.copy';
+          setText('hotkeysFeedback', t(hotkeyFeedbackKey));
+          renderHotkeys();
+        };
+        row.appendChild(label);
+        row.appendChild(button);
+        mount.appendChild(row);
+      });
+    }
+
+    function captureHotkey(event) {
+      if (!awaitingHotkeyAction) return false;
+      event.preventDefault();
+      event.stopPropagation();
+      if (event.ctrlKey || event.altKey || event.metaKey) {
+        hotkeyFeedbackKey = 'auth.hotkeys.invalid';
+        setText('hotkeysFeedback', t(hotkeyFeedbackKey));
+        return true;
+      }
+      const bindingKey = normalizeHotkeyEvent(event);
+      if (!bindingKey) {
+        hotkeyFeedbackKey = 'auth.hotkeys.invalid';
+        setText('hotkeysFeedback', t(hotkeyFeedbackKey));
+        return true;
+      }
+      const duplicateAction = hotkeyActionIds.find((action) => action !== awaitingHotkeyAction && state.hotkeys[action] === bindingKey);
+      if (duplicateAction) {
+        hotkeyFeedbackKey = 'auth.hotkeys.duplicate';
+        setText('hotkeysFeedback', t(hotkeyFeedbackKey));
+        return true;
+      }
+      state.hotkeys[awaitingHotkeyAction] = bindingKey;
+      state.hotkey_mode = inferHotkeyModeJs();
+      awaitingHotkeyAction = '';
+      hotkeyFeedbackKey = 'auth.hotkeys.copy';
+      setText('hotkeysFeedback', t(hotkeyFeedbackKey));
+      renderHotkeys();
+      return true;
+    }
+
+    function resetHotkeysToDefault() {
+      state.hotkeys = Object.assign({}, defaultNumpadHotkeys);
+      state.hotkey_mode = 'numpad';
+      awaitingHotkeyAction = '';
+      hotkeyFeedbackKey = 'auth.hotkeys.reset_done';
+      renderHotkeys();
+      setText('hotkeysFeedback', t(hotkeyFeedbackKey));
+    }
+
+    function positionPoint(positionId) {
+      return positionPoints[positionId] || positionPoints.bottom_right || { x: 0.88, y: 0.83 };
+    }
+
+    function chipCornerRadius(sizePx) {
+      return Math.max(4, Math.min(Math.round(sizePx * 0.32), Math.max(4, Math.floor(sizePx / 2) - 2)));
+    }
+
+    function applyPositionStyles(node, positionId) {
+      const point = positionPoint(positionId);
+      node.style.left = `${Math.round(point.x * 100)}%`;
+      node.style.top = `${Math.round(point.y * 100)}%`;
+    }
+
+    function renderLanguageButtons() {
+      const mount = document.getElementById('languageButtons');
+      mount.innerHTML = '';
+      ['en', 'fr'].forEach((lang) => {
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'segment' + (state.language === lang ? ' active' : '');
+        btn.textContent = t(`lang.${lang}`);
+        btn.onclick = () => { state.language = lang; render(); };
+        mount.appendChild(btn);
+      });
+    }
+
+    function renderThemeButtons() {
+      const mount = document.getElementById('themeButtons');
+      mount.innerHTML = '';
+      ['system', 'dark', 'light'].forEach((themeId) => {
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'segment' + (state.theme === themeId ? ' active' : '');
+        btn.textContent = t(`theme.${themeId}`);
+        btn.onclick = () => {
+          state.theme = themeId;
+          render();
+        };
+        mount.appendChild(btn);
+      });
+    }
+
+    function renderSizeButtons() {
+      const mount = document.getElementById('sizeButtons');
+      mount.innerHTML = '';
+      sizeIds.forEach((sizeId) => {
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'pill' + (state.blob_size === sizeId ? ' active' : '');
+        btn.textContent = t(`size.${sizeId}`);
+        btn.onclick = () => { state.blob_size = sizeId; renderPreview(); renderSizeButtons(); };
+        mount.appendChild(btn);
+      });
+    }
+
+    function renderPositionButtons() {
+      const mount = document.getElementById('positionButtons');
+      mount.innerHTML = '';
+      positionIds.forEach((positionId) => {
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'hotspot' + (state.indicator_position === positionId ? ' active' : '');
+        btn.title = t(`position.${positionId}`);
+        btn.setAttribute('aria-label', t(`position.${positionId}`));
+        applyPositionStyles(btn, positionId);
+        btn.onclick = () => {
+          state.indicator_position = positionId;
+          renderPreview();
+          renderPositionButtons();
+        };
+        mount.appendChild(btn);
+      });
+    }
+
+    function renderModels() {
+      const hiddenInput = document.getElementById('modelSelect');
+      const mount = document.getElementById('modelOptions');
+      if (!hiddenInput || !mount) return;
+      mount.innerHTML = '';
+      const nextValue = state.preferred_model || state.pro_model || (proModels[0] ? proModels[0].id : '');
+      state.preferred_model = nextValue;
+      state.pro_model = nextValue;
+      hiddenInput.value = nextValue;
+      proModels.forEach((item) => {
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'model-option' + (item.id === state.preferred_model ? ' active' : '');
+        button.title = item.description || item.label || item.id;
+        button.setAttribute('aria-pressed', item.id === state.preferred_model ? 'true' : 'false');
+        button.onclick = () => {
+          state.preferred_model = item.id;
+          state.pro_model = item.id;
+          hiddenInput.value = item.id;
+          renderModels();
+        };
+        const title = document.createElement('div');
+        title.className = 'model-option-title';
+        title.textContent = item.label || item.id;
+        const copy = document.createElement('div');
+        copy.className = 'model-option-copy';
+        copy.textContent = item.description || item.id;
+        button.appendChild(title);
+        button.appendChild(copy);
+        mount.appendChild(button);
+      });
+    }
+
+    function renderPreview() {
+      const chip = document.getElementById('previewChip');
+      const preview = document.getElementById('previewSurface');
+      const sizeMap = { very_small: 16, small: 20, medium: 24, large: 30 };
+      const sizePx = sizeMap[state.blob_size] || 24;
+      const inset = 22;
+      const point = positionPoint(state.indicator_position);
+      const usableWidth = Math.max(1, preview.clientWidth - (inset * 2));
+      const usableHeight = Math.max(1, preview.clientHeight - (inset * 2));
+      const chipX = Math.round(inset + (usableWidth * point.x));
+      const chipY = Math.round(inset + (usableHeight * point.y));
+      chip.style.width = `${sizePx}px`;
+      chip.style.height = `${sizePx}px`;
+      chip.style.borderRadius = `${chipCornerRadius(sizePx)}px`;
+      chip.style.left = `${chipX}px`;
+      chip.style.top = `${chipY}px`;
+      chip.style.transform = 'translate(-50%, -50%)';
+      setText('positionValue', t(`position.${state.indicator_position}`));
+    }
+
+    function syncSettingsState() {
+      const drawer = document.getElementById('settingsDrawer');
+      const backdrop = document.getElementById('settingsBackdrop');
+      const toggle = document.getElementById('settingsToggleButton');
+      drawer.classList.toggle('open', settingsOpen);
+      drawer.setAttribute('aria-hidden', settingsOpen ? 'false' : 'true');
+      backdrop.classList.toggle('open', settingsOpen);
+      toggle.classList.toggle('active', settingsOpen);
+    }
+
+    function toggleSettings(forceOpen) {
+      settingsOpen = typeof forceOpen === 'boolean' ? forceOpen : !settingsOpen;
+      if (!settingsOpen) awaitingHotkeyAction = '';
+      syncSettingsState();
+    }
+
+    function render() {
+      themeDark = resolveThemeDarkJs();
+      document.body.classList.toggle('theme-dark', themeDark);
+      document.body.classList.toggle('theme-light', !themeDark);
+      document.documentElement.lang = state.language;
+      setText('windowCaption', t('auth.window_caption'));
+      setText('windowStatus', currentStatus());
+      setText('title', t('auth.title'));
+      setText('subtitle', t('auth.subtitle'));
+      const brandOpenLabel = t('auth.open_site');
+      document.getElementById('windowBrandLink').setAttribute('aria-label', brandOpenLabel);
+      document.getElementById('windowBrandLink').title = brandOpenLabel;
+      document.getElementById('titleButton').setAttribute('aria-label', brandOpenLabel);
+      document.getElementById('titleButton').title = brandOpenLabel;
+      setText('settingsSummaryTitle', t('auth.settings'));
+      setText('settingsSummaryValue', settingsSummaryText());
+      setText('openSettingsButton', t('auth.settings'));
+      setText('settingsPanelTitle', t('auth.settings'));
+      setText('settingsPanelCopy', t('auth.settings.copy'));
+      setText('settingsDoneButton', t('auth.settings.done'));
+      setText('startupSectionTitle', t('auth.section.startup'));
+      setText('startupScreenLabel', t('auth.startup_screen.label'));
+      setText('startupScreenCopy', t('auth.startup_screen.copy'));
+      setText('modeAccountTitle', t('auth.account.title'));
+      setText('modeAccountHelp', t('auth.account.copy'));
+      setText('previewTitle', t('auth.preview.title'));
+      setText('previewCopy', t('auth.preview.copy'));
+      setText('languageTitle', t('auth.language'));
+      setText('appearanceTitle', t('auth.section.appearance'));
+      setText('themeTitle', t('auth.section.theme'));
+      setText('themeCopy', t('auth.theme.copy'));
+      setText('sizeTitle', t('auth.section.indicator_size'));
+      setText('proSectionTitle', t('auth.section.pro'));
+      setText('accountTitle', t('auth.account.title'));
+      setText('accountCopy', t('auth.account.copy'));
+      setText('emailLabel', t('auth.account.email'));
+      setText('passwordLabel', t('auth.account.password'));
+      setText('importSettingsButton', t('auth.account.import'));
+      setText('rememberMeButton', t('auth.account.remember'));
+      setText('resetPasswordButton', t('auth.account.reset'));
+      setText('modelLabel', t('auth.pro.model'));
+      setText('modelNote', t('auth.pro.model.note'));
+      setText('hotkeysTitle', t('auth.section.hotkeys'));
+      setText('hotkeysCopy', t('auth.hotkeys.copy'));
+      setText('hotkeysResetButton', t('auth.hotkeys.reset'));
+      setText('hotkeysFeedback', t(awaitingHotkeyAction ? 'auth.hotkeys.waiting' : hotkeyFeedbackKey));
+      setText('securityCopy', t('auth.security'));
+      setText('cancelButton', t('auth.cancel'));
+      document.getElementById('emailInput').placeholder = t('auth.account.email.placeholder');
+      document.getElementById('passwordInput').placeholder = t('auth.account.password.placeholder');
+      setIconButton('settingsToggleButton', 'settings', t('auth.settings'));
+      setIconButton('minimizeButton', 'remove', t('auth.window.minimize'));
+      setIconButton('maximizeButton', windowMaximized ? 'contract' : 'square', windowMaximized ? t('auth.window.restore') : t('auth.window.maximize'));
+      setIconButton('closeChromeButton', 'close', t('auth.window.close'));
+      setIconButton('showButton', document.getElementById('passwordInput').type === 'password' ? 'eye' : 'eye-off', document.getElementById('passwordInput').type === 'password' ? t('auth.api.show') : t('auth.api.hide'));
+      const rememberButton = document.getElementById('rememberMeButton');
+      if (rememberButton) {
+        rememberButton.classList.toggle('active', !!state.remember_me);
+        rememberButton.setAttribute('aria-pressed', state.remember_me ? 'true' : 'false');
+      }
+      const startupToggle = document.getElementById('startupScreenToggle');
+      if (startupToggle) {
+        startupToggle.textContent = state.show_startup_screen ? t('auth.startup_screen.enabled') : t('auth.startup_screen.disabled');
+        startupToggle.className = 'pill' + (state.show_startup_screen ? ' active' : '');
+        startupToggle.setAttribute('aria-pressed', state.show_startup_screen ? 'true' : 'false');
+      }
+      renderLanguageButtons();
+      renderThemeButtons();
+      renderSizeButtons();
+      renderPositionButtons();
+      renderHotkeys();
+      renderModels();
+      renderPreview();
+      renderSubmitButton();
+      syncSettingsState();
+    }
+
+    function validate() {
+      const emailValue = String(document.getElementById('emailInput').value || '').trim().toLowerCase();
+      const passwordValue = String(document.getElementById('passwordInput').value || '');
+      state.email = emailValue;
+      state.password = passwordValue;
+      if (!emailValue) return 'auth.validation.account.email.empty';
+      if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(emailValue)) return 'auth.validation.account.email.invalid';
+      return '';
+    }
+
+    async function importSettings() {
+      const errorKey = validate();
+      setText('errorText', errorKey ? t(errorKey) : '');
+      if (errorKey) return;
+      if (!state.password && !state.live_session_token) {
+        setText('errorText', t('auth.validation.account.password.empty'));
+        return;
+      }
+      if (!(window.pywebview && window.pywebview.api && window.pywebview.api.import_settings)) return;
+      const button = document.getElementById('importSettingsButton');
+      const previousLabel = button ? button.textContent : '';
+      if (button) {
+        button.disabled = true;
+        button.textContent = t('auth.account.import.loading');
+      }
+      try {
+        const result = await window.pywebview.api.import_settings({
+          email: state.email,
+          password: state.password
+        });
+        if (!result || result.ok === false) {
+          setText('errorText', String((result && result.error) || t('error.auth_denied')));
+          return;
+        }
+        const imported = result.preferences || {};
+        state.language = imported.language || state.language;
+        state.blob_size = imported.indicator_blob_size || state.blob_size;
+        state.indicator_position = imported.indicator_position || state.indicator_position;
+        state.show_startup_screen = typeof imported.show_startup_screen === 'boolean' ? imported.show_startup_screen : state.show_startup_screen;
+        state.preferred_model = imported.preferred_model || state.preferred_model;
+        state.pro_model = imported.pro_model || state.pro_model;
+        state.hotkeys = imported.hotkeys || state.hotkeys;
+        state.hotkey_mode = imported.hotkey_mode || state.hotkey_mode;
+        setText('errorText', '');
+        render();
+      } catch (error) {
+        setText('errorText', String((error && error.message) || t('error.auth_denied')));
+      } finally {
+        if (button) {
+          button.disabled = false;
+          button.textContent = previousLabel || t('auth.account.import');
+        }
+      }
+    }
+
+    async function submit() {
+      if (isSubmitting) return;
+      const errorKey = validate();
+      setText('errorText', errorKey ? t(errorKey) : '');
+      if (errorKey) return;
+      state.error_message = '';
+      const payload = {
+        language: state.language,
+        theme: state.theme,
+        blob_size: state.blob_size,
+        indicator_position: state.indicator_position,
+        show_startup_screen: !!state.show_startup_screen,
+        hotkeys: state.hotkeys,
+        hotkey_mode: state.hotkey_mode,
+        preferred_model: state.preferred_model || state.pro_model,
+        pro_model: state.preferred_model || state.pro_model,
+        email: state.email,
+        password: state.password,
+        remember_me: !!state.remember_me
+      };
+      if (window.pywebview && window.pywebview.api && window.pywebview.api.submit) {
+        isSubmitting = true;
+        renderSubmitButton();
+        await nextPaint();
+        try {
+          const result = await window.pywebview.api.submit(payload);
+          if (result && result.error) {
+            state.error_message = String(result.error || '');
+            setText('errorText', state.error_message);
+            return;
+          }
+        } catch (error) {
+          state.error_message = String((error && error.message) || t('error.auth_denied'));
+          setText('errorText', state.error_message);
+          return;
+        } finally {
+          isSubmitting = false;
+          renderSubmitButton();
+        }
+      }
+    }
+
+    async function closeWindow() {
+      if (closePending) return;
+      closePending = true;
+      try {
+        if (window.pywebview && window.pywebview.api && window.pywebview.api.close) {
+          const closed = await window.pywebview.api.close();
+          if (closed) return;
+        }
+      } catch (error) {}
+      try {
+        window.close();
+      } catch (error) {}
+    }
+
+    async function exitApp() {
+      if (window.pywebview && window.pywebview.api && window.pywebview.api.exit_app) {
+        await window.pywebview.api.exit_app();
+        return;
+      }
+      await closeWindow();
+    }
+
+    async function minimizeWindow() {
+      if (window.pywebview && window.pywebview.api && window.pywebview.api.minimize) {
+        await window.pywebview.api.minimize();
+      }
+    }
+
+    async function toggleMaximize() {
+      if (window.pywebview && window.pywebview.api && window.pywebview.api.toggle_maximize) {
+        const nextState = await window.pywebview.api.toggle_maximize();
+        if (typeof nextState === 'boolean') {
+          windowMaximized = nextState;
+          render();
+        }
+      }
+    }
+
+    async function startWindowMove() {
+      if (window.pywebview && window.pywebview.api && window.pywebview.api.start_move) {
+        await window.pywebview.api.start_move();
+      }
+    }
+
+    async function openDashboardLink() {
+      if (!dashboardUrl) return;
+      if (window.pywebview && window.pywebview.api && window.pywebview.api.open_external) {
+        await window.pywebview.api.open_external(dashboardUrl);
+        return;
+      }
+      window.open(dashboardUrl, '_blank');
+    }
+
+    async function openResetPasswordLink() {
+      if (!forgotPasswordUrl) return;
+      if (window.pywebview && window.pywebview.api && window.pywebview.api.open_external) {
+        await window.pywebview.api.open_external(forgotPasswordUrl);
+        return;
+      }
+      window.open(forgotPasswordUrl, '_blank');
+    }
+
+    async function openWebsiteLink() {
+      if (!websiteUrl) return;
+      if (window.pywebview && window.pywebview.api && window.pywebview.api.open_external) {
+        await window.pywebview.api.open_external(websiteUrl);
+        return;
+      }
+      window.open(websiteUrl, '_blank');
+    }
+
+    window.addEventListener('DOMContentLoaded', () => {
+      hotkeyActionIds.forEach((action) => {
+        if (!allowedHotkeys[state.hotkeys[action]]) {
+          state.hotkeys[action] = '';
+        }
+      });
+      state.hotkey_mode = inferHotkeyModeJs();
+      document.getElementById('emailInput').value = state.email || '';
+      document.getElementById('passwordInput').value = state.password || '';
+      document.getElementById('showButton').onclick = () => {
+        const input = document.getElementById('passwordInput');
+        input.type = input.type === 'password' ? 'text' : 'password';
+        render();
+      };
+      document.getElementById('importSettingsButton').onclick = importSettings;
+      document.getElementById('rememberMeButton').onclick = () => {
+        state.remember_me = !state.remember_me;
+        render();
+      };
+      document.getElementById('settingsToggleButton').onclick = () => toggleSettings();
+      document.getElementById('openSettingsButton').onclick = () => toggleSettings(true);
+      document.getElementById('settingsDoneButton').onclick = () => toggleSettings(false);
+      document.getElementById('settingsBackdrop').onclick = () => toggleSettings(false);
+      document.getElementById('hotkeysResetButton').onclick = resetHotkeysToDefault;
+      document.getElementById('startupScreenToggle').onclick = () => {
+        state.show_startup_screen = !state.show_startup_screen;
+        render();
+      };
+      document.querySelectorAll('.resize-handle').forEach((handle) => {
+        handle.addEventListener('mousedown', async (event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          windowMaximized = false;
+          render();
+          if (window.pywebview && window.pywebview.api && window.pywebview.api.start_resize) {
+            await window.pywebview.api.start_resize(handle.dataset.edge || '');
+          }
+        });
+      });
+      document.getElementById('resetPasswordButton').onclick = openResetPasswordLink;
+      document.getElementById('windowBrandLink').onclick = openWebsiteLink;
+      document.getElementById('titleButton').onclick = openWebsiteLink;
+      document.getElementById('minimizeButton').onclick = minimizeWindow;
+      document.getElementById('maximizeButton').onclick = toggleMaximize;
+      document.getElementById('closeChromeButton').onclick = exitApp;
+      document.getElementById('cancelButton').onclick = closeWindow;
+      document.getElementById('continueButton').onclick = submit;
+      document.getElementById('windowDragZone').addEventListener('mousedown', async (event) => {
+        if (event.button !== 0) return;
+        if (event.target.closest('button, input, select, textarea, label')) return;
+        await startWindowMove();
+      });
+            document.getElementById('windowDragStrip').addEventListener('mousedown', async (event) => {
+                if (event.button !== 0) return;
+                await startWindowMove();
+            });
+      document.getElementById('emailInput').addEventListener('input', () => { state.error_message = ''; setText('errorText', ''); });
+      document.getElementById('passwordInput').addEventListener('input', () => { state.error_message = ''; setText('errorText', ''); });
+      document.addEventListener('keydown', (event) => {
+        if (captureHotkey(event)) return;
+        if (event.key === 'Escape') {
+          if (settingsOpen) toggleSettings(false);
+          else closeWindow();
+        }
+        if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) submit();
+      });
+      if (themeMedia) {
+        const applyThemeChange = (event) => {
+          if (state.theme === 'system') {
+            themeDark = !!event.matches;
+            render();
+          }
+        };
+        if (themeMedia.addEventListener) themeMedia.addEventListener('change', applyThemeChange);
+        else if (themeMedia.addListener) themeMedia.addListener(applyThemeChange);
+      }
+      window.addEventListener('resize', renderPreview);
+      render();
+      if (state.error_message) {
+        setText('errorText', state.error_message);
+      }
+    });
+  </script>
+</body>
+</html>
+"""
+    return template.replace(
+        "/*__BOOTSTRAP__*/",
+        "window.AUTH_BOOTSTRAP = " + json.dumps(bootstrap, ensure_ascii=True) + ";",
+    )
+
+
+def prompt_account_auth_dialog_tk(initial_email="", initial_password="", initial_blob_size="medium", initial_error=""):
+    result = {"value": None}
+    root, card = make_dialog_shell(tr("auth.window_title"), 860, 760)
+    root.minsize(720, 620)
+    center_window(root, 860, 760)
+    remembered_password = ""
+    if not str(initial_password or "") and remember_me_enabled:
+        remembered_password = load_saved_secret(load_config_record(), "remembered_password", "remembered_password_dpapi")
+
+    language_var = tk.StringVar(value=normalize_language(ui_language))
+    theme_var = tk.StringVar(value=normalize_theme_preference(ui_theme_preference))
+    blob_size_var = tk.StringVar(value=normalize_indicator_blob_size(initial_blob_size))
+    position_var = tk.StringVar(value=normalize_indicator_position(indicator_position_key))
+    startup_screen_var = tk.BooleanVar(value=bool(startup_loading_screen_enabled))
+    email_var = tk.StringVar(value=normalize_account_email(initial_email))
+    password_var = tk.StringVar(value=str(initial_password or remembered_password or ""))
+    show_password_var = tk.BooleanVar(value=False)
+    remember_me_var = tk.BooleanVar(value=bool(remember_me_enabled))
+    model_var = tk.StringVar(value=normalize_pro_model(selected_pro_model_key))
+    error_var = tk.StringVar(value=str(initial_error or ""))
+    import_preview = {"auth_snapshot": None}
+
+    wrap_labels = []
+
+    header = tk.Frame(card, bg=UI_CARD_BG, bd=0)
+    header.pack(fill="x", padx=28, pady=(24, 10))
+    title_label = tk.Label(header, text=APP_NAME, bg=UI_CARD_BG, fg=UI_TEXT, font=(UI_FONT, 30, "bold"))
+    title_label.pack(anchor="w")
+    subtitle_label = tk.Label(
+        header,
+        text="",
+        bg=UI_CARD_BG,
+        fg=UI_MUTED,
+        font=(UI_FONT, 11),
+        justify="left",
+    )
+    subtitle_label.pack(anchor="w", pady=(4, 0))
+    wrap_labels.append(subtitle_label)
+
+    lang_theme_row = tk.Frame(card, bg=UI_CARD_BG, bd=0)
+    lang_theme_row.pack(fill="x", padx=28, pady=(0, 12))
+
+    language_shell = tk.Frame(lang_theme_row, bg=UI_CARD_BG, bd=0)
+    language_shell.pack(side="left")
+    language_title = tk.Label(language_shell, text="", bg=UI_CARD_BG, fg=UI_MUTED, font=(UI_FONT, 9, "bold"))
+    language_title.pack(anchor="w", pady=(0, 6))
+    language_buttons = {}
+    for lang_key in ("en", "fr"):
+        btn = tk.Button(
+            language_shell,
+            text=lang_key.upper(),
+            relief="flat",
+            bd=0,
+            padx=10,
+            pady=6,
+            font=(UI_FONT, 9, "bold"),
+            cursor="hand2",
+            command=lambda value=lang_key: (language_var.set(value), refresh_copy()),
+        )
+        btn.pack(side="left", padx=(0, 6))
+        language_buttons[lang_key] = btn
+
+    theme_shell = tk.Frame(lang_theme_row, bg=UI_CARD_BG, bd=0)
+    theme_shell.pack(side="right")
+    theme_title = tk.Label(theme_shell, text="", bg=UI_CARD_BG, fg=UI_MUTED, font=(UI_FONT, 9, "bold"))
+    theme_title.pack(anchor="e", pady=(0, 6))
+    theme_buttons = {}
+    theme_labels = {"light": "Light", "dark": "Dark", "system": "Auto"}
+    for theme_key in ("light", "dark", "system"):
+        btn = tk.Button(
+            theme_shell,
+            text=theme_labels[theme_key],
+            relief="flat",
+            bd=0,
+            padx=12,
+            pady=6,
+            font=(UI_FONT, 9, "bold"),
+            cursor="hand2",
+            command=lambda value=theme_key: (theme_var.set(value), refresh_copy()),
+        )
+        btn.pack(side="left", padx=(6 if theme_key != "light" else 0, 0))
+        theme_buttons[theme_key] = btn
+
+    body = tk.Frame(card, bg=UI_CARD_BG, bd=0)
+    body.pack(fill="both", expand=True, padx=28, pady=(0, 10))
+
+    account_card = tk.Frame(body, bg=UI_PANEL_BG, highlightbackground=UI_BORDER, highlightthickness=1, bd=0)
+    account_card.pack(fill="x", pady=(0, 12))
+    account_inner = tk.Frame(account_card, bg=UI_PANEL_BG, bd=0)
+    account_inner.pack(fill="both", expand=True, padx=18, pady=16)
+
+    account_title = tk.Label(account_inner, text="", bg=UI_PANEL_BG, fg=UI_TEXT, font=(UI_FONT, 12, "bold"))
+    account_title.pack(anchor="w")
+    account_copy = tk.Label(account_inner, text="", bg=UI_PANEL_BG, fg=UI_MUTED, font=(UI_FONT, 9), justify="left")
+    account_copy.pack(anchor="w", pady=(4, 10))
+    wrap_labels.append(account_copy)
+
+    email_label = tk.Label(account_inner, text="", bg=UI_PANEL_BG, fg=UI_TEXT, font=(UI_FONT, 10, "bold"))
+    email_label.pack(anchor="w", pady=(0, 6))
+    email_field = tk.Frame(account_inner, bg=UI_FIELD_BG, highlightbackground=UI_BORDER, highlightthickness=1, bd=0)
+    email_field.pack(fill="x")
+    email_entry = tk.Entry(
+        email_field,
+        textvariable=email_var,
+        bg=UI_FIELD_BG,
+        fg=UI_TEXT,
+        relief="flat",
+        bd=0,
+        insertbackground=UI_TEXT,
+        font=(UI_FONT, 11),
+    )
+    email_entry.pack(fill="x", padx=12, pady=10)
+
+    password_row = tk.Frame(account_inner, bg=UI_PANEL_BG, bd=0)
+    password_row.pack(fill="x", pady=(12, 0))
+    password_label = tk.Label(password_row, text="", bg=UI_PANEL_BG, fg=UI_TEXT, font=(UI_FONT, 10, "bold"))
+    password_label.pack(anchor="w", pady=(0, 6))
+    password_field = tk.Frame(account_inner, bg=UI_FIELD_BG, highlightbackground=UI_BORDER, highlightthickness=1, bd=0)
+    password_field.pack(fill="x")
+    password_entry = tk.Entry(
+        password_field,
+        textvariable=password_var,
+        show="*",
+        bg=UI_FIELD_BG,
+        fg=UI_TEXT,
+        relief="flat",
+        bd=0,
+        insertbackground=UI_TEXT,
+        font=(UI_FONT, 11),
+    )
+    password_entry.pack(side="left", fill="x", expand=True, padx=(12, 0), pady=10)
+    password_toggle = tk.Button(
+        password_field,
+        text="",
+        relief="flat",
+        bd=0,
+        padx=12,
+        pady=6,
+        font=(UI_FONT, 9, "bold"),
+        cursor="hand2",
+    )
+    password_toggle.pack(side="right", padx=8)
+
+    account_inline_actions = tk.Frame(account_inner, bg=UI_PANEL_BG, bd=0)
+    account_inline_actions.pack(fill="x", pady=(10, 0))
+    import_btn = tk.Button(
+        account_inline_actions,
+        text="Import user settings",
+        relief="flat",
+        bd=0,
+        padx=12,
+        pady=7,
+        font=(UI_FONT, 9, "bold"),
+        cursor="hand2",
+    )
+    import_btn.pack(side="left")
+    remember_btn = tk.Button(
+        account_inline_actions,
+        text="Remember me",
+        relief="flat",
+        bd=0,
+        padx=12,
+        pady=7,
+        font=(UI_FONT, 9, "bold"),
+        cursor="hand2",
+        command=lambda: (remember_me_var.set(not remember_me_var.get()), refresh_copy()),
+    )
+    remember_btn.pack(side="left", padx=(8, 0))
+
+    account_actions = tk.Frame(account_inner, bg=UI_PANEL_BG, bd=0)
+    account_actions.pack(fill="x", pady=(10, 0))
+    dashboard_btn = tk.Button(
+        account_actions,
+        text="Dashboard",
+        command=lambda: open_dashboard_page("dashboard-app-access"),
+        relief="flat",
+        bd=0,
+        padx=12,
+        pady=7,
+        font=(UI_FONT, 9, "bold"),
+        cursor="hand2",
+    )
+    style_button(dashboard_btn, primary=False)
+    dashboard_btn.pack(side="left")
+    reset_btn = tk.Button(
+        account_actions,
+        text="Reset password",
+        command=lambda: webbrowser.open(f"{str(DEFAULT_WEBSITE_URL).rstrip('/')}/forgot-password.php", new=2),
+        relief="flat",
+        bd=0,
+        padx=12,
+        pady=7,
+        font=(UI_FONT, 9, "bold"),
+        cursor="hand2",
+    )
+    style_button(reset_btn, primary=False)
+    reset_btn.pack(side="left", padx=(8, 0))
+
+    settings_card = tk.Frame(body, bg=UI_PANEL_BG, highlightbackground=UI_BORDER, highlightthickness=1, bd=0)
+    settings_card.pack(fill="both", expand=True)
+    settings_inner = tk.Frame(settings_card, bg=UI_PANEL_BG, bd=0)
+    settings_inner.pack(fill="both", expand=True, padx=18, pady=16)
+
+    model_label = tk.Label(settings_inner, text="", bg=UI_PANEL_BG, fg=UI_TEXT, font=(UI_FONT, 10, "bold"))
+    model_label.pack(anchor="w")
+    model_menu = tk.OptionMenu(settings_inner, model_var, *(item["id"] for item in PRO_MODEL_OPTIONS))
+    model_menu.configure(
+        relief="flat",
+        bd=0,
+        bg=UI_GHOST_BG,
+        fg=UI_TEXT,
+        activebackground=UI_GHOST_ACTIVE,
+        activeforeground=UI_TEXT,
+        highlightthickness=0,
+        font=(UI_FONT, 10),
+    )
+    model_menu.pack(fill="x", pady=(6, 0))
+    model_menu["menu"].delete(0, "end")
+    model_labels = {item["id"]: item["label"] for item in PRO_MODEL_OPTIONS}
+    for model_option in PRO_MODEL_OPTIONS:
+        model_menu["menu"].add_command(
+            label=model_option["label"],
+            command=lambda value=model_option["id"]: model_var.set(value),
+        )
+    model_note = tk.Label(settings_inner, text="", bg=UI_PANEL_BG, fg=UI_MUTED, font=(UI_FONT, 9), justify="left")
+    model_note.pack(anchor="w", pady=(6, 12))
+    wrap_labels.append(model_note)
+
+    blob_title = tk.Label(settings_inner, text="", bg=UI_PANEL_BG, fg=UI_TEXT, font=(UI_FONT, 10, "bold"))
+    blob_title.pack(anchor="w")
+    blob_button_row = tk.Frame(settings_inner, bg=UI_PANEL_BG, bd=0)
+    blob_button_row.pack(fill="x", pady=(6, 12))
+    blob_buttons = {}
+    for size_key in ("very_small", "small", "medium", "large"):
+        btn = tk.Button(
+            blob_button_row,
+            text=INDICATOR_BLOB_SIZE_LABELS[size_key],
+            relief="flat",
+            bd=0,
+            padx=12,
+            pady=8,
+            font=(UI_FONT, 9, "bold"),
+            cursor="hand2",
+            command=lambda value=size_key: (blob_size_var.set(value), refresh_copy()),
+        )
+        btn.pack(side="left", padx=(0, 8))
+        blob_buttons[size_key] = btn
+
+    position_label = tk.Label(settings_inner, text="", bg=UI_PANEL_BG, fg=UI_TEXT, font=(UI_FONT, 10, "bold"))
+    position_label.pack(anchor="w")
+    position_labels = {key: key for key in INDICATOR_POSITIONS}
+    position_menu = tk.OptionMenu(settings_inner, position_var, *INDICATOR_POSITIONS)
+    position_menu.configure(
+        relief="flat",
+        bd=0,
+        bg=UI_GHOST_BG,
+        fg=UI_TEXT,
+        activebackground=UI_GHOST_ACTIVE,
+        activeforeground=UI_TEXT,
+        highlightthickness=0,
+        font=(UI_FONT, 10),
+    )
+    position_menu.pack(fill="x", pady=(6, 12))
+
+    startup_label = tk.Label(settings_inner, text="", bg=UI_PANEL_BG, fg=UI_TEXT, font=(UI_FONT, 10, "bold"))
+    startup_label.pack(anchor="w")
+    startup_toggle_btn = tk.Button(
+        settings_inner,
+        text="",
+        command=lambda: (startup_screen_var.set(not startup_screen_var.get()), refresh_copy()),
+        relief="flat",
+        bd=0,
+        padx=12,
+        pady=8,
+        font=(UI_FONT, 9, "bold"),
+        cursor="hand2",
+    )
+    startup_toggle_btn.pack(anchor="w", pady=(6, 0))
+    startup_copy = tk.Label(settings_inner, text="", bg=UI_PANEL_BG, fg=UI_MUTED, font=(UI_FONT, 9), justify="left")
+    startup_copy.pack(anchor="w", pady=(8, 0))
+    wrap_labels.append(startup_copy)
+
+    security_copy = tk.Label(card, text="", bg=UI_CARD_BG, fg=UI_MUTED, font=(UI_FONT, 9), justify="left")
+    security_copy.pack(fill="x", padx=28, pady=(10, 4))
+    wrap_labels.append(security_copy)
+
+    error_label = tk.Label(card, textvariable=error_var, bg=UI_CARD_BG, fg=UI_DANGER, font=(UI_FONT, 10, "bold"))
+    error_label.pack(fill="x", padx=28, pady=(0, 6))
+
+    button_bar = tk.Frame(card, bg=UI_CARD_BG, bd=0)
+    button_bar.pack(fill="x", padx=28, pady=(0, 22))
+
+    def sync_wraps():
+        wrap = max(280, int(root.winfo_width()) - 110)
+        for label in wrap_labels:
+            try:
+                label.configure(wraplength=wrap)
+            except Exception:
+                pass
+
+    def toggle_password():
+        visible = not show_password_var.get()
+        show_password_var.set(visible)
+        password_entry.configure(show="" if visible else "*")
+        refresh_copy()
+
+    def close_with(value):
+        result["value"] = value
+        root.destroy()
+
+    def on_continue():
+        error_var.set("")
+        email_value = normalize_account_email(email_var.get())
+        password_value = str(password_var.get() or "")
+        if email_value and not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email_value):
+            error_var.set("Enter a valid email address.")
+            email_entry.focus_set()
+            return
+        if not email_value:
+            error_var.set("Enter your account email.")
+            email_entry.focus_set()
+            return
+        close_with({
+            "mode": "account",
+            "email": email_value,
+            "password": password_value,
+            "remember_me": bool(remember_me_var.get()),
+            "blob_size": normalize_indicator_blob_size(blob_size_var.get()),
+            "language": normalize_language(language_var.get()),
+            "theme": normalize_theme_preference(theme_var.get()),
+            "indicator_position": normalize_indicator_position(position_var.get()),
+            "show_startup_screen": bool(startup_screen_var.get()),
+            "preferred_model": normalize_pro_model(model_var.get()),
+            "pro_model": normalize_pro_model(model_var.get()),
+            "hotkeys": dict(command_hotkeys),
+            "hotkey_mode": command_key_mode,
+            "auth_snapshot": import_preview.get("auth_snapshot"),
+        })
+
+    def on_import_settings():
+        error_var.set("")
+        email_value = normalize_account_email(email_var.get())
+        password_value = str(password_var.get() or "")
+        if email_value and not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email_value):
+            error_var.set(tr("auth.validation.account.email.invalid", language=normalize_language(language_var.get())))
+            email_entry.focus_set()
+            return
+        if not email_value:
+            error_var.set(tr("auth.validation.account.email.empty", language=normalize_language(language_var.get())))
+            email_entry.focus_set()
+            return
+        live_session_token = ""
+        live_session_email = ""
+        with session_lock:
+            if session_active:
+                live_session_token = str(session_token or "").strip()
+                live_session_email = normalize_account_email(user_email)
+        if not password_value and not (live_session_token and email_value == live_session_email):
+            error_var.set(tr("auth.validation.account.password.empty", language=normalize_language(language_var.get())))
+            password_entry.focus_set()
+            return
+        import_btn.configure(text=tr("auth.account.import.loading", language=normalize_language(language_var.get())), state="disabled")
+        root.update_idletasks()
+        try:
+            ok, payload = request_account_preferences_preview(
+                email_value,
+                password_value=password_value,
+                live_session_token=live_session_token,
+                live_session_email=live_session_email,
+            )
+        except Exception as exc:
+            ok, payload = False, str(exc)
+        finally:
+            import_btn.configure(text=tr("auth.account.import", language=normalize_language(language_var.get())), state="normal")
+        if not ok:
+            error_var.set(str(payload or "Could not import the synced settings."))
+            return
+        preview = dict((payload or {}).get("preferences") or {})
+        if preview:
+            language_var.set(normalize_language(preview.get("language", language_var.get())))
+            blob_size_var.set(normalize_indicator_blob_size(preview.get("indicator_blob_size", blob_size_var.get())))
+            position_var.set(normalize_indicator_position(preview.get("indicator_position", position_var.get())))
+            startup_screen_var.set(
+                normalize_startup_loading_screen_enabled(preview.get("show_startup_screen", startup_screen_var.get()))
+            )
+            model_var.set(normalize_pro_model(preview.get("preferred_model", preview.get("pro_model", model_var.get()))))
+        import_preview["auth_snapshot"] = (payload or {}).get("auth_snapshot")
+        refresh_copy()
+
+    def refresh_copy():
+        lang = normalize_language(language_var.get())
+        subtitle_label.configure(
+            text=(
+                "Sign in with your website email and password. Your Gemini API key stays encrypted on the website "
+                "and is only decrypted locally on this device."
+                if lang != "fr" else
+                "Connectez-vous avec l'email et le mot de passe du site. Votre cle Gemini reste chiffree sur le site "
+                "et n'est dechiffree que localement sur cet appareil."
+            )
+        )
+        language_title.configure(text=tr("auth.language", language=lang))
+        for key, button in language_buttons.items():
+            button.configure(text=tr(f"lang.{key}", language=lang))
+            style_button(button, primary=(language_var.get() == key))
+        theme_title.configure(text="Theme" if lang != "fr" else "Theme")
+        for key, button in theme_buttons.items():
+            button.configure(text=theme_labels[key])
+            style_button(button, primary=(theme_var.get() == key))
+        account_title.configure(text="Account sign-in" if lang != "fr" else "Connexion du compte")
+        account_copy.configure(
+            text=(
+                "Use the same account as the dashboard. Add or replace your Gemini API key from the dashboard whenever needed."
+                if lang != "fr" else
+                "Utilisez le meme compte que le tableau de bord. Ajoutez ou remplacez votre cle Gemini depuis le tableau de bord si besoin."
+            )
+        )
+        email_label.configure(text="Email" if lang != "fr" else "Email")
+        password_label.configure(text="Password" if lang != "fr" else "Mot de passe")
+        password_toggle.configure(
+            text=("Hide" if show_password_var.get() else "Show") if lang != "fr" else ("Masquer" if show_password_var.get() else "Afficher"),
+            command=toggle_password,
+        )
+        import_btn.configure(text=tr("auth.account.import", language=lang), command=on_import_settings)
+        remember_btn.configure(text=tr("auth.account.remember", language=lang))
+        style_button(import_btn, primary=False)
+        style_button(remember_btn, primary=bool(remember_me_var.get()), active=not bool(remember_me_var.get()))
+        dashboard_btn.configure(text="Open dashboard" if lang != "fr" else "Ouvrir le tableau de bord")
+        reset_btn.configure(text="Reset password" if lang != "fr" else "Reinitialiser le mot de passe")
+        model_label.configure(text="Preferred model" if lang != "fr" else "Modele prefere")
+        model_note.configure(
+            text=(
+                "The selected Gemini model is used for local screenshot analysis after sign-in."
+                if lang != "fr" else
+                "Le modele Gemini choisi est utilise localement pour l'analyse des captures apres connexion."
+            )
+        )
+        position_label.configure(text=tr("auth.section.indicator_position", language=lang))
+        position_menu["menu"].delete(0, "end")
+        for position_key in INDICATOR_POSITIONS:
+            position_labels[position_key] = tr(f"position.{position_key}", language=lang)
+            position_menu["menu"].add_command(
+                label=position_labels[position_key],
+                command=lambda value=position_key: position_var.set(value),
+            )
+        blob_title.configure(text=tr("auth.section.indicator_size", language=lang))
+        for size_key, button in blob_buttons.items():
+            button.configure(text=tr(f"size.{size_key}", language=lang))
+            style_button(button, primary=(blob_size_var.get() == size_key))
+        startup_label.configure(text=tr("auth.startup_screen.label", language=lang))
+        startup_copy.configure(text=tr("auth.startup_screen.copy", language=lang))
+        startup_toggle_btn.configure(
+            text=tr("auth.startup_screen.enabled", language=lang)
+            if startup_screen_var.get() else tr("auth.startup_screen.disabled", language=lang)
+        )
+        style_button(startup_toggle_btn, primary=bool(startup_screen_var.get()), active=not bool(startup_screen_var.get()))
+        security_copy.configure(text=tr("auth.security", language=lang))
+        cancel_btn.configure(text=tr("auth.cancel", language=lang))
+        continue_btn.configure(text=("Sign in" if lang != "fr" else "Se connecter"))
+        sync_wraps()
+
+    cancel_btn = tk.Button(
+        button_bar,
+        text="Cancel",
+        command=lambda: close_with(None),
+        relief="flat",
+        bd=0,
+        padx=20,
+        pady=10,
+        font=(UI_FONT, 10, "bold"),
+        cursor="hand2",
+    )
+    style_button(cancel_btn, primary=False)
+    cancel_btn.pack(side="right")
+
+    continue_btn = tk.Button(
+        button_bar,
+        text="Sign in",
+        command=on_continue,
+        relief="flat",
+        bd=0,
+        padx=22,
+        pady=10,
+        font=(UI_FONT, 10, "bold"),
+        cursor="hand2",
+    )
+    style_button(continue_btn, primary=True)
+    continue_btn.pack(side="right", padx=(0, 10))
+
+    root.bind("<Escape>", lambda _event: close_with(None))
+    root.bind("<Return>", lambda _event: (on_continue(), "break")[1])
+    root.bind("<Configure>", lambda _event: sync_wraps(), add="+")
+    refresh_copy()
+    email_entry.focus_set()
+    root.mainloop()
+    return result["value"]
+
+
+def build_account_auth_shell_state(initial_email="", initial_password="", initial_blob_size="medium", initial_error=""):
+    record = load_config_record()
+    preferred_model = normalize_pro_model(selected_pro_model_key)
+    remembered = normalize_remember_me_preference(record.get("remember_me", remember_me_enabled))
+    remembered_password = ""
+    if remembered and not str(initial_password or ""):
+        remembered_password = load_saved_secret(record, "remembered_password", "remembered_password_dpapi")
+    live_session_email = ""
+    live_session_token = ""
+    with session_lock:
+        if session_active:
+            live_session_email = normalize_account_email(user_email)
+            live_session_token = str(session_token or "").strip()
+    return {
+        "language": normalize_language(ui_language),
+        "theme": normalize_theme_preference(ui_theme_preference),
+        "blob_size": normalize_indicator_blob_size(initial_blob_size),
+        "indicator_position": normalize_indicator_position(indicator_position_key),
+        "show_startup_screen": normalize_startup_loading_screen_enabled(startup_loading_screen_enabled),
+        "preferred_model": preferred_model,
+        "pro_model": preferred_model,
+        "hotkeys": dict(command_hotkeys),
+        "hotkey_mode": command_key_mode,
+        "email": normalize_account_email(initial_email),
+        "password": str(initial_password or remembered_password or ""),
+        "remember_me": bool(remembered),
+        "live_session_email": live_session_email,
+        "live_session_token": live_session_token,
+        "error_message": str(initial_error or ""),
+    }
+
+
+def auth_shell_window_geometry():
+    screen_width = 1920
+    screen_height = 1080
+    if os.name == "nt":
+        try:
+            screen_width = int(ctypes.windll.user32.GetSystemMetrics(0))
+            screen_height = int(ctypes.windll.user32.GetSystemMetrics(1))
+        except Exception:
+            logger.debug("Could not read work-area metrics for auth shell sizing.", exc_info=True)
+    left, top, right, bottom = get_work_area_bounds(screen_width, screen_height)
+    available_width = max(620, int(right - left))
+    available_height = max(460, int(bottom - top))
+    width = min(1280, max(760, available_width - 36))
+    height = min(900, max(560, available_height - 36))
+    width = min(width, max(520, available_width - 10))
+    height = min(height, max(420, available_height - 10))
+    min_width = min(width, max(500, min(760, available_width - 40)))
+    min_height = min(height, max(420, min(620, available_height - 40)))
+    return {
+        "width": int(width),
+        "height": int(height),
+        "min_size": (int(min_width), int(min_height)),
+    }
+
+
+def run_auth_shell_webview(initial_state):
+    if not has_pywebview_support():
+        return {"__fallback__": "tk", "__reason__": "missing_webview"}
+
+    bridge = AuthShellBridge()
+    bridge._initial_state = dict(initial_state or {})
+    title = tr("auth.window_title", language=normalize_language(initial_state.get("language", ui_language)))
+    geometry = auth_shell_window_geometry()
+    try:
+        window = webview.create_window(
+            title,
+            html=build_auth_shell_html(initial_state),
+            js_api=bridge,
+            width=geometry["width"],
+            height=geometry["height"],
+            min_size=geometry["min_size"],
+            resizable=True,
+            hidden=True,
+            frameless=True,
+            easy_drag=True,
+            shadow=True,
+            focus=True,
+            background_color="#081321",
+            text_select=False,
+        )
+        if window is None:
+            return {"__fallback__": "tk", "__reason__": "window_init"}
+        bridge.bind_window(window)
+
+        def _prepare(window_obj, bridge_obj):
+            try:
+                window_obj.show()
+                bridge_obj.prime_window_handle(timeout_seconds=2.2)
+            except Exception:
+                logger.warning("Could not show auth webview window.", exc_info=True)
+                bridge_obj._result = {"__fallback__": "tk", "__reason__": "show_failed"}
+                bridge_obj.close()
+                return
+
+            if is_capture_privacy_active():
+                deadline = time.time() + 3.0
+                while time.time() < deadline:
+                    if bridge_obj.ensure_capture_privacy():
+                        break
+                    time.sleep(0.08)
+                else:
+                    logger.warning("Could not apply capture privacy to auth webview window; continuing without it.")
+
+        webview.start(
+            _prepare,
+            args=(window, bridge),
+            **resolve_pywebview_start_kwargs(),
+        )
+    except Exception:
+        logger.warning("Webview auth shell failed.", exc_info=True)
+        return {"__fallback__": "tk", "__reason__": "webview_error"}
+
+    return bridge.result
+
+
+def run_auth_shell_subprocess(request_path, response_path):
+    ensure_ui_crisp_mode()
+    hide_console_window()
+    payload = {}
+    try:
+        payload = json.loads(Path(request_path).read_text(encoding="utf-8"))
+    except Exception:
+        payload = {}
+
+    result = run_auth_shell_webview(payload if isinstance(payload, dict) else {})
+    try:
+        Path(response_path).write_text(
+            json.dumps({"result": result}, ensure_ascii=True),
+            encoding="utf-8",
+        )
+    except Exception:
+        logger.warning("Could not write auth shell response payload.", exc_info=True)
+        return 1
+    return 0
+
+
+def prompt_account_auth_dialog(initial_email="", initial_password="", initial_blob_size="medium", initial_error=""):
+    initial_state = build_account_auth_shell_state(
+        initial_email=initial_email,
+        initial_password=initial_password,
+        initial_blob_size=initial_blob_size,
+        initial_error=initial_error,
+    )
+    if not has_pywebview_support():
+        return prompt_account_auth_dialog_tk(
+            initial_email=initial_email,
+            initial_password=initial_password,
+            initial_blob_size=initial_blob_size,
+            initial_error=initial_error,
+        )
+
+    with tempfile.TemporaryDirectory(prefix="eae-auth-") as temp_dir:
+        request_path = Path(temp_dir) / "request.json"
+        response_path = Path(temp_dir) / "response.json"
+        request_path.write_text(json.dumps(initial_state, ensure_ascii=True), encoding="utf-8")
+
+        command = [sys.executable]
+        if not getattr(sys, "frozen", False):
+            command.append(os.path.abspath(__file__))
+        command.extend([AUTH_SHELL_SUBPROCESS_FLAG, str(request_path), str(response_path)])
+
+        creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        try:
+            completed = subprocess.run(
+                command,
+                check=False,
+                timeout=None,
+                creationflags=creation_flags,
+            )
+        except Exception:
+            logger.warning("Auth shell subprocess failed to start.", exc_info=True)
+            completed = None
+
+        if completed is None or completed.returncode != 0 or not response_path.exists():
+            return prompt_account_auth_dialog_tk(
+                initial_email=initial_email,
+                initial_password=initial_password,
+                initial_blob_size=initial_blob_size,
+                initial_error=initial_error,
+            )
+
+        try:
+            payload = json.loads(response_path.read_text(encoding="utf-8"))
+        except Exception:
+            logger.warning("Auth shell subprocess returned invalid JSON.", exc_info=True)
+            payload = {}
+
+    result = payload.get("result") if isinstance(payload, dict) else None
+    if isinstance(result, dict) and result.get("__fallback__") == "tk":
+        return prompt_account_auth_dialog_tk(
+            initial_email=initial_email,
+            initial_password=initial_password,
+            initial_blob_size=initial_blob_size,
+            initial_error=initial_error,
+        )
+    return result
+
+
+def prompt_startup_auth(
+    initial_email,
+    initial_password,
+    initial_blob_size="medium",
+    initial_error="",
+):
+    startup_progress_hide()
+    result = prompt_account_auth_dialog(
+        initial_email=initial_email,
+        initial_password=initial_password,
+        initial_blob_size=initial_blob_size,
+        initial_error=initial_error,
+    )
+    if result:
+        result.setdefault("language", normalize_language(ui_language))
+        result.setdefault("theme", normalize_theme_preference(ui_theme_preference))
+        result.setdefault("indicator_position", normalize_indicator_position(indicator_position_key))
+        result.setdefault("show_startup_screen", bool(startup_loading_screen_enabled))
+        result.setdefault("preferred_model", normalize_pro_model(selected_pro_model_key))
+        result.setdefault("pro_model", normalize_pro_model(selected_pro_model_key))
+        result.setdefault("hotkeys", dict(command_hotkeys))
+        result.setdefault("hotkey_mode", command_key_mode)
+        result.setdefault("remember_me", bool(remember_me_enabled))
+    startup_progress_show()
+    return result
+
+
+def indicator_refresh_preferences():
+    indicator_call(lambda obj: obj.refresh_preferences() if hasattr(obj, "refresh_preferences") else None)
+
+
+def open_settings_menu(hide_indicator_temporarily=False):
+    global settings_window_open, command_hotkeys, command_hotkeys_customized, command_key_mode
+    global startup_loading_screen_enabled, auth_mode, api_key, user_email
+    global local_model, local_chat_session, api_backend_name, ui_theme_preference
+    with settings_window_lock:
+        if settings_window_open:
+            return
+        settings_window_open = True
+    restore_indicator_after_close = False
+    try:
+        if hide_indicator_temporarily and indicator and not indicator.hidden:
+            restore_indicator_after_close = True
+            indicator_hide()
+        selected = prompt_startup_auth(
+            initial_email=user_email,
+            initial_password="",
+            initial_blob_size=indicator_blob_size_key,
+        )
+        if not selected:
+            return
+
+        selected_email = normalize_account_email(selected.get("email", user_email))
+        selected_password = str(selected.get("password", "") or "")
+        current_email = normalize_account_email(user_email)
+        auth_changed = bool(selected_password) or (selected_email != "" and selected_email != current_email)
+        if selected_email != current_email and not selected_password:
+            show_styled_message(APP_NAME, "Enter the password for the new account email.", is_error=True, parent=None)
+            return
+
+        previous_model = normalize_pro_model(selected_pro_model_key)
+        if auth_changed:
+            try:
+                ok, message = authenticate_account_session(
+                    selected_email or current_email,
+                    selected_password,
+                    remember_me=bool(selected.get("remember_me", remember_me_enabled)),
+                    auth_snapshot=selected.get("auth_snapshot"),
+                )
+            except Exception as exc:
+                ok, message = False, str(exc)
+            if not ok:
+                show_styled_message(APP_NAME, message, is_error=True, parent=None)
+                return
+            apply_auth_dialog_selection(selected, persist=True)
+            if not ensure_api_mode_ready():
+                return
+        else:
+            apply_auth_dialog_selection(selected, persist=True)
+            sync_remember_me_preference(bool(selected.get("remember_me", remember_me_enabled)), selected_password)
+            if normalize_pro_model(selected_pro_model_key) != previous_model and api_key:
+                if not ensure_api_mode_ready():
+                    return
+            push_remote_preferences()
+
+        update_tray_menu()
+        indicator_refresh_preferences()
+    finally:
+        if restore_indicator_after_close and not indicator_manual_hidden and not privacy_forced_hidden:
+            indicator_show()
+        with settings_window_lock:
+            settings_window_open = False
+
+
+def gui_show_error(message):
+    parent = indicator.root if indicator and indicator.root.winfo_exists() else None
+    splash = startup_progress_window
+    splash_was_visible = False
+    if parent is None and splash is not None:
+        # During startup the loading screen is always-on-top.  Hide it so the
+        # error dialog is visible, then restore it after the user dismisses.
+        try:
+            if splash.root.winfo_exists() and not splash.hidden:
+                splash_was_visible = True
+                splash.hide()
+                parent = splash.root
+        except Exception:
+            pass
+    show_styled_message(APP_NAME, message, is_error=True, parent=parent)
+    if splash_was_visible:
+        startup_progress_show()
+
+
+def set_session_status(text, active=None):
+    global session_status_text, session_active
+    with session_lock:
+        session_status_text = text
+        if active is not None:
+            session_active = bool(active)
+    update_tray_menu()
+
+
+def update_tray_menu():
+    global tray_icon
+    try:
+        if tray_icon:
+            tray_icon.update_menu()
+    except Exception:
+        pass
+
+
+def refresh_runtime_capture_privacy():
+    global indicator_capture_protected, privacy_forced_hidden
+    active = is_capture_privacy_active()
+    indicator_capture_protected = False
+    indicator_call(lambda obj: obj.refresh_capture_privacy() if hasattr(obj, "refresh_capture_privacy") else None)
+    try:
+        window = getattr(startup_progress_window, "root", None)
+        if window is not None:
+            apply_capture_privacy_to_window(window, enabled=active)
+    except Exception:
+        pass
+    if not active:
+        privacy_forced_hidden = False
+        if not indicator_manual_hidden:
+            indicator_show()
+    update_tray_menu()
+
+
+def set_capture_privacy_enabled(enabled):
+    global capture_privacy_enabled
+    capture_privacy_enabled = bool(enabled)
+    refresh_runtime_capture_privacy()
+
+
+def toggle_capture_privacy():
+    set_capture_privacy_enabled(not is_capture_privacy_active())
+
+
+def resolve_auth_settings():
+    global auth_mode, server_url, api_key, device_id, indicator_blob_size_key
+    global ui_language, indicator_position_key, selected_pro_model_key, session_status_text
+    global command_hotkeys, command_hotkeys_customized, command_key_mode, startup_loading_screen_enabled
+    global ui_theme_preference, user_email, session_id, session_token, session_active, model_name
+    global remember_me_enabled
+    record = load_config_record()
+    env_language_raw = os.environ.get("EAE_LANGUAGE", "").strip()
+    env_theme_raw = os.environ.get("EAE_THEME", "").strip()
+    env_blob_size_raw = os.environ.get("EAE_BLOB_SIZE", "").strip()
+    env_position_raw = os.environ.get("EAE_INDICATOR_POSITION", "").strip()
+    env_startup_screen_raw = os.environ.get("EAE_SHOW_STARTUP_SCREEN", "").strip()
+    env_blob_size = normalize_indicator_blob_size(env_blob_size_raw) if env_blob_size_raw else ""
+    remember_me_enabled = normalize_remember_me_preference(record.get("remember_me", False))
+    if not remember_me_enabled and (
+        str(record.get("session_token_dpapi", "") or "").strip()
+        or str(record.get("api_key_dpapi", "") or "").strip()
+        or str(record.get("remembered_password_dpapi", "") or "").strip()
+    ):
+        record = clear_persisted_account_auth(record, clear_email=False)
+    saved_api_key = load_saved_secret(record, "api_key", "api_key_dpapi") if remember_me_enabled else ""
+    saved_session_token = load_saved_secret(record, "session_token", "session_token_dpapi") if remember_me_enabled else ""
+    saved_blob_size = normalize_indicator_blob_size(record.get("indicator_blob_size", ""))
+    saved_language = normalize_language(record.get("ui_language", ui_language))
+    saved_theme = normalize_theme_preference(record.get("ui_theme", ui_theme_preference))
+    saved_position = normalize_indicator_position(record.get("indicator_position", indicator_position_key))
+    saved_startup_screen = normalize_startup_loading_screen_enabled(record.get("show_startup_screen", startup_loading_screen_enabled))
+    saved_pro_model = normalize_pro_model(record.get("preferred_model", record.get("pro_model", selected_pro_model_key)))
+    saved_hotkey_mode = "toprow" if str(record.get("command_key_mode", "")).strip().lower() == "toprow" else detect_initial_command_key_mode()
+    saved_hotkeys, saved_hotkey_mode, saved_hotkeys_customized = resolve_command_hotkey_state(
+        record.get("command_hotkeys"),
+        saved_hotkey_mode,
+    )
+    saved_device_id = str(record.get("device_id", "")).strip()
+    if not saved_device_id:
+        saved_device_id = secrets.token_hex(16)
+        record["device_id"] = saved_device_id
+    device_id = saved_device_id
+    record["auth_mode"] = "account"
+    record["server_url"] = DEFAULT_SERVER_URL
+    record["preferred_model"] = saved_pro_model
+    record["pro_model"] = saved_pro_model
+    record["remember_me"] = bool(remember_me_enabled)
+    record.pop("license_code", None)
+    record.pop("license_code_dpapi", None)
+    save_config_record(record)
+
+    ui_language = normalize_language(env_language_raw or saved_language or ui_language)
+    ui_theme_preference = normalize_theme_preference(env_theme_raw or saved_theme or ui_theme_preference)
+    apply_ui_theme_preference(ui_theme_preference)
+    indicator_position_key = normalize_indicator_position(env_position_raw or saved_position or indicator_position_key)
+    startup_loading_screen_enabled = normalize_startup_loading_screen_enabled(env_startup_screen_raw) if env_startup_screen_raw else saved_startup_screen
+    selected_pro_model_key = normalize_pro_model(saved_pro_model)
+    model_name = normalize_pro_model(selected_pro_model_key) or DEFAULT_MODEL_NAME
+    command_hotkeys = dict(saved_hotkeys)
+    command_hotkeys_customized = bool(saved_hotkeys_customized)
+    command_key_mode = saved_hotkey_mode
+    session_status_text = tr("status.not_authenticated")
+    auth_mode = "account"
+    server_url = DEFAULT_SERVER_URL
+    api_key = saved_api_key
+    user_email = normalize_account_email(record.get("user_email", ""))
+    with session_lock:
+        session_id = str(record.get("session_id", "") or "").strip()
+        session_token = str(saved_session_token or "").strip()
+        session_active = False
+
+    indicator_blob_size_key = env_blob_size or saved_blob_size or indicator_blob_size_key
+    return True
+
+
+def request_json(method, path, token="", json_payload=None, files=None, timeout=30):
+    normalized_server = normalize_server_url(server_url or DEFAULT_SERVER_URL)
+    if not normalized_server:
+        logger.warning("Blocked request with invalid server URL configuration.")
+        raise RuntimeError("Server URL must use HTTPS unless it targets localhost.")
+    normalized_path = str(path or "").strip()
+    if not normalized_path.startswith("/"):
+        logger.warning("Blocked request with invalid API path: %s", normalized_path)
+        raise ValueError("API paths must start with '/'.")
+    url = f"{normalized_server}{normalized_path}"
+    headers = {"Accept": "application/json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    try:
+        return HTTP_SESSION.request(
+            method=method,
+            url=url,
+            headers=headers,
+            json=json_payload,
+            files=files,
+            timeout=timeout,
+            allow_redirects=False,
+        )
+    except requests.RequestException:
+        logger.warning("HTTP request failed for %s %s.", str(method or "").upper(), normalized_path, exc_info=True)
+        raise
+    except Exception:
+        logger.exception("Unexpected error while sending %s %s.", str(method or "").upper(), normalized_path)
+        raise
+
+
+def build_remote_preferences_payload():
+    return {
+        "language": normalize_language(ui_language),
+        "indicator_position": normalize_indicator_position(indicator_position_key),
+        "indicator_blob_size": normalize_indicator_blob_size(indicator_blob_size_key),
+        "show_startup_screen": bool(startup_loading_screen_enabled),
+        "preferred_model": normalize_pro_model(selected_pro_model_key),
+        "hotkey_mode": command_key_mode,
+        "hotkeys": dict(command_hotkeys),
+    }
+
+
+def persist_runtime_preferences():
+    record = load_config_record()
+    record["auth_mode"] = "account"
+    record["server_url"] = DEFAULT_SERVER_URL
+    record["ui_language"] = normalize_language(ui_language)
+    record["ui_theme"] = normalize_theme_preference(ui_theme_preference)
+    record["indicator_blob_size"] = normalize_indicator_blob_size(indicator_blob_size_key)
+    record["indicator_position"] = normalize_indicator_position(indicator_position_key)
+    record["show_startup_screen"] = normalize_startup_loading_screen_enabled(startup_loading_screen_enabled)
+    record["preferred_model"] = normalize_pro_model(selected_pro_model_key)
+    record["pro_model"] = normalize_pro_model(selected_pro_model_key)
+    record["command_hotkeys"] = dict(command_hotkeys)
+    record["command_key_mode"] = command_key_mode
+    record["command_hotkeys_customized"] = bool(command_hotkeys_customized)
+    record["user_email"] = normalize_account_email(user_email)
+    if device_id:
+        record["device_id"] = device_id
+    save_config_record(record)
+
+
+def normalize_remote_preferences_payload(payload):
+    if not isinstance(payload, dict):
+        return {}
+    normalized_hotkeys, normalized_hotkey_mode, normalized_hotkeys_customized = resolve_command_hotkey_state(
+        payload.get("hotkeys"),
+        payload.get("hotkey_mode", command_key_mode),
+    )
+    return {
+        "language": normalize_language(payload.get("language", ui_language)),
+        "indicator_position": normalize_indicator_position(payload.get("indicator_position", indicator_position_key)),
+        "indicator_blob_size": normalize_indicator_blob_size(payload.get("indicator_blob_size", indicator_blob_size_key)),
+        "show_startup_screen": normalize_startup_loading_screen_enabled(
+            payload.get("show_startup_screen", startup_loading_screen_enabled)
+        ),
+        "preferred_model": normalize_pro_model(
+            payload.get("preferred_model", payload.get("pro_model", selected_pro_model_key))
+        ),
+        "pro_model": normalize_pro_model(
+            payload.get("preferred_model", payload.get("pro_model", selected_pro_model_key))
+        ),
+        "hotkeys": dict(normalized_hotkeys),
+        "hotkey_mode": normalized_hotkey_mode,
+        "hotkeys_customized": bool(normalized_hotkeys_customized),
+    }
+
+
+def apply_remote_preferences_payload(payload):
+    global ui_language, indicator_position_key, indicator_blob_size_key, model_name
+    global selected_pro_model_key, startup_loading_screen_enabled
+    global command_hotkeys, command_hotkeys_customized, command_key_mode
+    normalized = normalize_remote_preferences_payload(payload)
+    if not normalized:
+        return False
+    ui_language = normalized["language"]
+    indicator_position_key = normalized["indicator_position"]
+    indicator_blob_size_key = normalized["indicator_blob_size"]
+    startup_loading_screen_enabled = normalized["show_startup_screen"]
+    selected_pro_model_key = normalized["preferred_model"]
+    model_name = normalize_pro_model(selected_pro_model_key) or DEFAULT_MODEL_NAME
+    command_hotkeys = dict(normalized["hotkeys"])
+    command_key_mode = normalized["hotkey_mode"]
+    command_hotkeys_customized = bool(normalized["hotkeys_customized"])
+    persist_runtime_preferences()
+    try:
+        set_command_key_mode(command_key_mode)
+    except Exception:
+        pass
+    return True
+
+
+def apply_auth_dialog_selection(selected, persist=True):
+    global ui_language, ui_theme_preference, indicator_blob_size_key, indicator_position_key
+    global selected_pro_model_key, startup_loading_screen_enabled, command_hotkeys
+    global command_key_mode, command_hotkeys_customized, model_name
+    if not isinstance(selected, dict):
+        return
+
+    ui_language = normalize_language(selected.get("language", ui_language))
+    ui_theme_preference = normalize_theme_preference(selected.get("theme", ui_theme_preference))
+    indicator_blob_size_key = normalize_indicator_blob_size(selected.get("blob_size", indicator_blob_size_key))
+    indicator_position_key = normalize_indicator_position(selected.get("indicator_position", indicator_position_key))
+    startup_loading_screen_enabled = normalize_startup_loading_screen_enabled(
+        selected.get("show_startup_screen", startup_loading_screen_enabled)
+    )
+    selected_pro_model_key = normalize_pro_model(
+        selected.get("preferred_model", selected.get("pro_model", selected_pro_model_key))
+    )
+    model_name = normalize_pro_model(selected_pro_model_key) or DEFAULT_MODEL_NAME
+    selected_hotkeys, selected_hotkey_mode, selected_hotkeys_customized = resolve_command_hotkey_state(
+        selected.get("hotkeys"),
+        selected.get("hotkey_mode", command_key_mode),
+    )
+    command_hotkeys = dict(selected_hotkeys)
+    command_key_mode = selected_hotkey_mode
+    command_hotkeys_customized = bool(selected_hotkeys_customized)
+    apply_ui_theme_preference(ui_theme_preference)
+    try:
+        set_command_key_mode(command_key_mode)
+    except Exception:
+        pass
+    if persist:
+        persist_runtime_preferences()
+
+
+def clear_account_session_state(clear_cached_api_key=False):
+    global session_id, session_token, session_active, api_key, auth_mode, remember_me_enabled
+    with session_lock:
+        session_id = ""
+        session_token = ""
+        session_active = False
+    auth_mode = "account"
+    remember_me_enabled = normalize_remember_me_preference(load_config_record().get("remember_me", False))
+    if clear_cached_api_key:
+        api_key = ""
+    record = load_config_record()
+    record["auth_mode"] = "account"
+    record["server_url"] = DEFAULT_SERVER_URL
+    record["session_id"] = ""
+    clear_saved_secret(record, "session_token", "session_token_dpapi")
+    if clear_cached_api_key:
+        record = load_config_record()
+        clear_saved_secret(record, "api_key", "api_key_dpapi")
+
+
+def persist_account_session_state(email_value, session_id_value, session_token_value, api_key_value, password_value="", remember_me=False):
+    record = load_config_record()
+    record["auth_mode"] = "account"
+    record["server_url"] = DEFAULT_SERVER_URL
+    record["user_email"] = normalize_account_email(email_value)
+    record["session_id"] = str(session_id_value or "").strip()
+    record["remember_me"] = bool(remember_me)
+    record["preferred_model"] = normalize_pro_model(selected_pro_model_key)
+    record["pro_model"] = normalize_pro_model(selected_pro_model_key)
+    if device_id:
+        record["device_id"] = device_id
+    record.pop("license_code", None)
+    record.pop("license_code_dpapi", None)
+    if not remember_me:
+        record["session_id"] = ""
+        record.pop("session_token", None)
+        record.pop("session_token_dpapi", None)
+        record.pop("api_key", None)
+        record.pop("api_key_dpapi", None)
+        record.pop("remembered_password", None)
+        record.pop("remembered_password_dpapi", None)
+        save_config_record(record)
+        return True
+    if not save_secret(record, "session_token", "session_token_dpapi", str(session_token_value or "").strip()):
+        return False
+    record = load_config_record()
+    record["remember_me"] = True
+    if not save_secret(record, "api_key", "api_key_dpapi", str(api_key_value or "").strip()):
+        return False
+    record = load_config_record()
+    record["remember_me"] = True
+    if not save_secret(record, "remembered_password", "remembered_password_dpapi", str(password_value or "").strip()):
+        return False
+    return True
+
+
+def app_device_name():
+    value = str(os.environ.get("COMPUTERNAME", "") or "").strip()
+    if value:
+        return value
+    value = str(os.environ.get("HOSTNAME", "") or "").strip()
+    return value or "Windows PC"
+
+
+def push_remote_preferences():
+    with session_lock:
+        local_token = str(session_token or "")
+        local_active = bool(session_active)
+    if not local_token or not local_active:
+        return False
+
+    try:
+        response = request_json(
+            "POST",
+            "/api/v1/client/preferences",
+            token=local_token,
+            json_payload={"preferences": build_remote_preferences_payload()},
+            timeout=15,
+        )
+        return bool(response.ok)
+    except Exception:
+        logger.debug("Remote preference push failed.", exc_info=True)
+        return False
+
+
+def pull_remote_preferences_with_token(local_token):
+    token_value = str(local_token or "").strip()
+    if not token_value:
+        return None, ""
+    try:
+        response = request_json("GET", "/api/v1/client/preferences", token=token_value, timeout=15)
+        if not response.ok:
+            return None, ""
+        data = decode_json_response(response, "Remote preferences")
+    except Exception:
+        logger.debug("Remote preference pull failed.", exc_info=True)
+        return None, ""
+    if not isinstance(data, dict):
+        return None, ""
+    return data.get("preferences"), str(data.get("preferences_updated_at", "") or "")
+
+
+def pull_remote_preferences():
+    with session_lock:
+        local_token = str(session_token or "")
+    return pull_remote_preferences_with_token(local_token)
+
+
+def sync_remote_preferences_after_auth(auth_data):
+    remote_payload = auth_data.get("preferences") if isinstance(auth_data, dict) else None
+    remote_updated_at = str(auth_data.get("preferences_updated_at", "") or "") if isinstance(auth_data, dict) else ""
+    if remote_payload is None:
+        remote_payload, remote_updated_at = pull_remote_preferences()
+    if isinstance(remote_payload, dict) and remote_updated_at:
+        apply_remote_preferences_payload(remote_payload)
+        return True
+    return push_remote_preferences()
+
+
+def request_account_login_snapshot(email_value, password_value):
+    normalized_email = normalize_account_email(email_value)
+    password_text = str(password_value or "")
+    if not normalized_email:
+        return False, tr("auth.validation.account.email.empty")
+    if not password_text:
+        return False, tr("auth.validation.account.password.empty")
+
+    response = request_json(
+        "POST",
+        "/api/v1/client/login",
+        json_payload={
+            "email": normalized_email,
+            "password": password_text,
+            "device_id": device_id,
+            "device_name": app_device_name(),
+            "app_version": APP_VERSION,
+        },
+        timeout=20,
+    )
+    payload = decode_json_response(response, "App login")
+    if not isinstance(payload, dict):
+        return False, tr("error.server_non_json", status_code=getattr(response, "status_code", "?"))
+    if not response.ok or not bool(payload.get("success")):
+        message = str(payload.get("message", "") or f"Sign-in failed ({getattr(response, 'status_code', '?')}).").strip()
+        if payload.get("password_setup_required"):
+            open_dashboard_page("dashboard-security")
+        return False, message
+    if payload.get("password_setup_required"):
+        open_dashboard_page("dashboard-security")
+        return False, "Finish creating a password on the website before using the desktop app."
+    if payload.get("api_key_required") or not isinstance(payload.get("api_key_bundle"), dict):
+        open_dashboard_page("dashboard-app-access")
+        return False, "Add your Gemini API key in the dashboard before using the desktop app."
+    try:
+        decrypted_api_key = decode_account_api_key_bundle(payload.get("api_key_bundle"), password_text)
+    except Exception as exc:
+        open_dashboard_page("dashboard-app-access")
+        return False, str(exc)
+    next_session_id = str(payload.get("session_id", "") or "").strip()
+    next_session_token = str(payload.get("session_token", "") or "").strip()
+    if not next_session_token:
+        return False, "The website did not return a valid desktop session."
+    return True, {
+        "email": normalized_email,
+        "password": password_text,
+        "session_id": next_session_id,
+        "session_token": next_session_token,
+        "api_key": decrypted_api_key,
+        "message": str(payload.get("message", "") or "Signed in."),
+        "payload": payload,
+    }
+
+
+def request_account_preferences_preview(email_value, password_value="", live_session_token="", live_session_email=""):
+    normalized_email = normalize_account_email(email_value)
+    if not normalized_email:
+        return False, tr("auth.validation.account.email.empty")
+    preview_snapshot = None
+    remote_payload = None
+    remote_updated_at = ""
+    live_token = str(live_session_token or "").strip()
+    if live_token and normalized_email == normalize_account_email(live_session_email):
+        remote_payload, remote_updated_at = pull_remote_preferences_with_token(live_token)
+    if remote_payload is None:
+        ok, snapshot_or_message = request_account_login_snapshot(normalized_email, password_value)
+        if not ok:
+            return False, snapshot_or_message
+        preview_snapshot = snapshot_or_message
+        payload = preview_snapshot.get("payload") if isinstance(preview_snapshot, dict) else {}
+        remote_payload = payload.get("preferences") if isinstance(payload, dict) else None
+        remote_updated_at = str(payload.get("preferences_updated_at", "") or "") if isinstance(payload, dict) else ""
+        if remote_payload is None:
+            remote_payload, remote_updated_at = pull_remote_preferences_with_token(preview_snapshot.get("session_token"))
+    normalized_preferences = normalize_remote_preferences_payload(remote_payload)
+    if not normalized_preferences:
+        return False, "Could not import the synced settings from your account."
+    return True, {
+        "preferences": normalized_preferences,
+        "preferences_updated_at": remote_updated_at,
+        "auth_snapshot": preview_snapshot,
+    }
+
+
+def apply_authenticated_account_snapshot(snapshot, remember_me=False, password_value=""):
+    global auth_mode, server_url, api_key, user_email
+    global session_id, session_token, session_active, remember_me_enabled
+    if not isinstance(snapshot, dict):
+        return False, "Invalid account session."
+    normalized_email = normalize_account_email(snapshot.get("email", ""))
+    next_session_id = str(snapshot.get("session_id", "") or "").strip()
+    next_session_token = str(snapshot.get("session_token", "") or "").strip()
+    decrypted_api_key = str(snapshot.get("api_key", "") or "").strip()
+    if not normalized_email or not next_session_token or not decrypted_api_key:
+        return False, "The website did not return a valid desktop session."
+    auth_mode = "account"
+    server_url = DEFAULT_SERVER_URL
+    user_email = normalized_email
+    api_key = decrypted_api_key
+    remember_me_enabled = bool(remember_me)
+    with session_lock:
+        session_id = next_session_id
+        session_token = next_session_token
+        session_active = True
+    if not persist_account_session_state(
+        normalized_email,
+        next_session_id,
+        next_session_token,
+        decrypted_api_key,
+        password_value=password_value or snapshot.get("password", ""),
+        remember_me=remember_me_enabled,
+    ):
+        clear_account_session_state(clear_cached_api_key=True)
+        return False, "Could not securely store the account session on this machine."
+    sync_remote_preferences_after_auth(snapshot.get("payload"))
+    set_session_status(tr("status.code_active"), active=True)
+    return True, str(snapshot.get("message", "") or "Signed in.")
+
+
+def restore_cached_account_session():
+    global auth_mode, api_key, user_email, server_url, remember_me_enabled
+    global session_id, session_token, session_active
+    record = load_config_record()
+    remember_me_enabled = normalize_remember_me_preference(record.get("remember_me", False))
+    if not remember_me_enabled:
+        return False
+    cached_email = normalize_account_email(record.get("user_email", ""))
+    cached_api_key = load_saved_secret(record, "api_key", "api_key_dpapi")
+    cached_session_token = load_saved_secret(record, "session_token", "session_token_dpapi")
+    cached_session_id = str(record.get("session_id", "") or "").strip()
+    cached_password = load_saved_secret(record, "remembered_password", "remembered_password_dpapi")
+    if not cached_email:
+        return False
+    auth_mode = "account"
+    server_url = DEFAULT_SERVER_URL
+    if cached_api_key and cached_session_token:
+        user_email = cached_email
+        api_key = cached_api_key
+        with session_lock:
+            session_id = cached_session_id
+            session_token = cached_session_token
+            session_active = True
+        try:
+            response = request_json("GET", "/api/v1/client/preferences", token=cached_session_token, timeout=12)
+            if int(getattr(response, "status_code", 0) or 0) == 401:
+                if cached_password:
+                    ok, snapshot_or_message = request_account_login_snapshot(cached_email, cached_password)
+                    if ok:
+                        return bool(apply_authenticated_account_snapshot(snapshot_or_message, remember_me=True, password_value=cached_password)[0])
+                clear_persisted_account_auth(record, clear_email=False)
+                return False
+            if response.ok:
+                payload = decode_json_response(response, "Remote preferences")
+                if isinstance(payload, dict):
+                    apply_remote_preferences_payload(payload.get("preferences"))
+            set_session_status(tr("status.code_active"), active=True)
+            return True
+        except Exception:
+            logger.debug("Using cached local API key because preference sync could not be refreshed.", exc_info=True)
+            set_session_status(tr("status.code_active"), active=True)
+            return True
+    if cached_password:
+        ok, snapshot_or_message = request_account_login_snapshot(cached_email, cached_password)
+        if ok:
+            success, _message = apply_authenticated_account_snapshot(snapshot_or_message, remember_me=True, password_value=cached_password)
+            return bool(success)
+    clear_persisted_account_auth(record, clear_email=False)
+    return False
+
+
+def authenticate_account_session(email_value, password_value, remember_me=False, auth_snapshot=None):
+    normalized_email = normalize_account_email(email_value)
+    snapshot = auth_snapshot if isinstance(auth_snapshot, dict) else None
+    if not snapshot or normalize_account_email(snapshot.get("email", "")) != normalized_email:
+        ok, snapshot_or_message = request_account_login_snapshot(normalized_email, password_value)
+        if not ok:
+            return False, snapshot_or_message
+        snapshot = snapshot_or_message
+    return apply_authenticated_account_snapshot(snapshot, remember_me=remember_me, password_value=password_value)
+
+
+def sync_remember_me_preference(remember_me, password_value=""):
+    global remember_me_enabled
+    remember_me_enabled = bool(remember_me)
+    local_email = normalize_account_email(user_email)
+    local_api_key = str(api_key or "").strip()
+    local_session_id = ""
+    local_session_token = ""
+    local_active = False
+    with session_lock:
+        local_session_id = str(session_id or "").strip()
+        local_session_token = str(session_token or "").strip()
+        local_active = bool(session_active)
+    if not remember_me_enabled:
+        clear_persisted_account_auth(clear_email=False)
+        return True
+    if not local_email or not local_api_key or not local_session_token or not local_active:
+        record = load_config_record()
+        record["remember_me"] = True
+        save_config_record(record)
+        return True
+    stored_password = str(password_value or "").strip()
+    if not stored_password:
+        stored_password = load_saved_secret(load_config_record(), "remembered_password", "remembered_password_dpapi")
+    return persist_account_session_state(
+        local_email,
+        local_session_id,
+        local_session_token,
+        local_api_key,
+        password_value=stored_password,
+        remember_me=True,
+    )
+
+
+class _SimpleApiResponse:
+    def __init__(self, text):
+        self.text = str(text or "")
+
+
+class ModernGenAiSession:
+    def __init__(self, module, local_api_key, local_model_name):
+        self.module = module
+        self.client = module.Client(api_key=local_api_key)
+        self.model_name = local_model_name
+
+    def reset(self):
+        return
+
+    def _coerce_payload(self, payload):
+        parts = []
+        for item in payload:
+            if isinstance(item, PIL.Image.Image):
+                stream = io.BytesIO()
+                item.save(stream, format="PNG")
+                image_bytes = stream.getvalue()
+                part_type = getattr(getattr(self.module, "types", None), "Part", None)
+                if part_type and hasattr(part_type, "from_bytes"):
+                    parts.append(part_type.from_bytes(data=image_bytes, mime_type="image/png"))
+                else:
+                    parts.append({"mime_type": "image/png", "data": image_bytes})
+            else:
+                parts.append(str(item))
+        return parts
+
+    def send_message(self, payload):
+        contents = self._coerce_payload(payload)
+        response = self.client.models.generate_content(model=self.model_name, contents=contents)
+        return _SimpleApiResponse(extract_text_from_genai_response(response))
+
+
+def extract_text_from_genai_response(response):
+    direct_text = getattr(response, "text", "") or ""
+    if str(direct_text).strip():
+        return str(direct_text).strip()
+
+    collected = []
+    candidates = getattr(response, "candidates", None) or []
+    for candidate in candidates:
+        content = getattr(candidate, "content", None)
+        if not content:
+            continue
+        parts = getattr(content, "parts", None) or []
+        for part in parts:
+            text = getattr(part, "text", None)
+            if text:
+                collected.append(str(text))
+    return "\n".join(collected).strip()
+
+
+def resolve_genai_backend():
+    try:
+        from google import genai as modern_genai
+
+        return "google.genai", modern_genai, ""
+    except Exception as modern_exc:
+        return "", None, f"google.genai unavailable ({modern_exc})"
+
+
+def initialize_api_runtime():
+    if not api_key:
+        raise RuntimeError("API key is empty.")
+
+    backend_name, backend_module, backend_error = resolve_genai_backend()
+    if not backend_module:
+        raise RuntimeError(backend_error or tr("error.no_sdk", detail="No Gemini SDK available."))
+
+    if backend_name == "google.genai":
+        return {
+            "backend_name": backend_name,
+            "model": None,
+            "chat_session": ModernGenAiSession(backend_module, api_key, model_name),
+        }
+
+    raise RuntimeError(tr("error.no_sdk", detail="Unsupported Gemini SDK backend."))
+
+
+def ensure_api_mode_ready():
+    global local_model, local_chat_session, api_backend_name, model_name
+    if not api_key:
+        gui_show_error(tr("error.api_empty"))
+        return False
+    model_name = normalize_pro_model(selected_pro_model_key) or DEFAULT_MODEL_NAME
+    try:
+        runtime = run_startup_background_task(initialize_api_runtime, stage_key="startup.initializing_model")
+        local_model = runtime["model"]
+        local_chat_session = runtime["chat_session"]
+        api_backend_name = runtime["backend_name"]
+    except Exception as exc:
+        local_model = None
+        local_chat_session = None
+        api_backend_name = "none"
+        issue_kind = classify_api_runtime_issue(exc)
+        if issue_kind == "credits":
+            gui_show_error(tr("error.api_credits"))
+        elif issue_kind == "invalid":
+            gui_show_error(tr("error.api_invalid"))
+        else:
+            gui_show_error(tr("error.api_init", detail=exc))
+        return False
+    set_session_status(tr("status.api_active", backend=api_backend_name), active=True)
+    return True
+
+
+def classify_api_runtime_issue(error_text):
+    text = str(error_text or "")
+    lower = text.lower()
+    invalid_markers = (
+        "api key not valid",
+        "invalid api key",
+        "api_key_invalid",
+        "invalid_argument",
+        "permission denied",
+        "permission_denied",
+        "api mode not initialized",
+        "api key is empty",
+        "unauthenticated",
+        "401",
+    )
+    credit_markers = (
+        "resource_exhausted",
+        "quota",
+        "insufficient",
+        "billing",
+        "credit",
+        "rate limit",
+        "429",
+        "exceeded",
+    )
+    if any(marker in lower for marker in invalid_markers):
+        return "invalid"
+    if any(marker in lower for marker in credit_markers):
+        return "credits"
+    return ""
+
+
+def refresh_api_key_via_startup_ui(issue_kind):
+    if str(issue_kind) == "credits":
+        message = tr("error.api_credits")
+        status_text = tr("status.api_credits")
+    else:
+        message = tr("error.api_invalid")
+        status_text = tr("status.api_invalid")
+
+    set_session_status(status_text, active=False)
+    deactivate_post_type_guard()
+    disable_typing_mode()
+    clear_answer_state()
+    indicator_set_idle()
+    clear_account_session_state(clear_cached_api_key=True)
+    open_dashboard_page("dashboard-app-access")
+    show_styled_message(
+        APP_NAME,
+        f"{message}\n\nUpdate or replace the Gemini API key from the dashboard, then sign in again.",
+        is_error=True,
+        parent=None,
+    )
+    return False
+
+
+def ensure_account_mode_ready():
+    initial_email = normalize_account_email(user_email)
+    error_message = ""
+
+    if restore_cached_account_session():
+        return ensure_api_mode_ready()
+
+    while True:
+        selected = prompt_startup_auth(
+            initial_email=initial_email,
+            initial_password="",
+            initial_blob_size=indicator_blob_size_key,
+            initial_error=error_message,
+        )
+        if not selected:
+            return False
+
+        apply_auth_dialog_selection(selected, persist=True)
+        initial_email = normalize_account_email(selected.get("email", initial_email))
+        password_value = str(selected.get("password", "") or "")
+        if not password_value:
+            error_message = "Enter your password."
+            continue
+
+        try:
+            ok, message = run_startup_background_task(
+                lambda: authenticate_account_session(
+                    initial_email,
+                    password_value,
+                    remember_me=bool(selected.get("remember_me", remember_me_enabled)),
+                    auth_snapshot=selected.get("auth_snapshot"),
+                ),
+                stage_key="startup.connecting_pro",
+            )
+        except Exception as exc:
+            ok, message = False, str(exc)
+        if ok:
+            return ensure_api_mode_ready()
+        error_message = str(message or "Could not sign in.").strip()
+
+
+def initialize_auth_mode():
+    return ensure_account_mode_ready()
+
+
+def end_remote_session():
+    local_session_id = ""
+    local_session_token = ""
+    with session_lock:
+        local_session_id = session_id
+        local_session_token = session_token
+    if not local_session_token:
+        return
+    try:
+        request_json(
+            "POST",
+            "/api/v1/client/logout",
+            token=local_session_token,
+            json_payload={"session_id": local_session_id},
+            timeout=12,
+        )
+    except Exception:
+        logger.debug("Remote session shutdown request failed.", exc_info=True)
+    finally:
+        clear_account_session_state(clear_cached_api_key=False)
+
+
+def list_running_process_snapshot():
+    global process_snapshot_cache_at, process_snapshot_cache_running, process_snapshot_cache_pid
+    running_names = set()
+    pid_to_name = {}
+    if os.name != "nt":
+        return running_names, pid_to_name
+    now = time.monotonic()
+    with process_snapshot_cache_lock:
+        if process_snapshot_cache_running and (now - process_snapshot_cache_at) < PROCESS_SNAPSHOT_CACHE_SECONDS:
+            return set(process_snapshot_cache_running), dict(process_snapshot_cache_pid)
+    if psutil is not None:
+        try:
+            for proc in psutil.process_iter(attrs=("pid", "name")):
+                info = getattr(proc, "info", {}) or {}
+                name = str(info.get("name", "") or "").strip().lower()
+                if not name:
+                    continue
+                running_names.add(name)
+                try:
+                    pid_to_name[int(info.get("pid", 0))] = name
+                except Exception:
+                    pass
+        except Exception:
+            running_names.clear()
+            pid_to_name.clear()
+        if running_names:
+            with process_snapshot_cache_lock:
+                process_snapshot_cache_at = now
+                process_snapshot_cache_running = set(running_names)
+                process_snapshot_cache_pid = dict(pid_to_name)
+            return running_names, pid_to_name
+    try:
+        completed = subprocess.run(
+            ["tasklist", "/FO", "CSV", "/NH"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="ignore",
+            timeout=4,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except Exception:
+        return running_names, pid_to_name
+
+    if completed.returncode != 0:
+        return running_names, pid_to_name
+
+    for row in csv.reader(io.StringIO(completed.stdout)):
+        if len(row) < 2:
+            continue
+        name = str(row[0]).strip().lower()
+        if not name:
+            continue
+        running_names.add(name)
+        try:
+            pid_to_name[int(str(row[1]).strip())] = name
+        except Exception:
+            pass
+    with process_snapshot_cache_lock:
+        process_snapshot_cache_at = now
+        process_snapshot_cache_running = set(running_names)
+        process_snapshot_cache_pid = dict(pid_to_name)
+    return running_names, pid_to_name
+
+
+def is_google_meet_window_active(pid_to_name):
+    if os.name != "nt":
+        return False
+    try:
+        hwnd = _user32.GetForegroundWindow()
+        if not hwnd:
+            return False
+        title_buffer = ctypes.create_unicode_buffer(512)
+        if _user32.GetWindowTextW(hwnd, title_buffer, len(title_buffer)) <= 0:
+            return False
+        title = str(title_buffer.value or "").strip().lower()
+        if not title or not any(keyword in title for keyword in PRIVACY_MEET_WINDOW_KEYWORDS):
+            return False
+        process_id = wintypes.DWORD(0)
+        _user32.GetWindowThreadProcessId(hwnd, ctypes.byref(process_id))
+        return pid_to_name.get(int(process_id.value), "") in PRIVACY_MEET_BROWSERS
+    except Exception:
+        return False
+
+
+def privacy_guard_loop():
+    global privacy_forced_hidden
+    while not privacy_guard_stop_event.is_set():
+        should_force_hide = False
+        if STRICT_PRIVACY_FALLBACK and is_capture_privacy_active():
+            running, pid_to_name = list_running_process_snapshot()
+            capture_process_active = bool(running.intersection(PRIVACY_GUARD_PROCESSES)) or is_google_meet_window_active(pid_to_name)
+            if capture_process_active and not indicator_capture_protected:
+                should_force_hide = True
+
+        if should_force_hide != privacy_forced_hidden:
+            privacy_forced_hidden = should_force_hide
+            if privacy_forced_hidden:
+                indicator_hide()
+            else:
+                if not indicator_manual_hidden:
+                    indicator_show()
+
+        if privacy_guard_stop_event.wait(PRIVACY_GUARD_INTERVAL_SECONDS):
+            break
+
+
+def start_privacy_guard():
+    global privacy_guard_thread
+    if os.name != "nt" or not STRICT_PRIVACY_FALLBACK:
+        return
+    if privacy_guard_thread is not None and privacy_guard_thread.is_alive():
+        return
+    privacy_guard_stop_event.clear()
+    privacy_guard_thread = Thread(target=privacy_guard_loop, daemon=True)
+    privacy_guard_thread.start()
+
+
+class StatusIndicator:
+    def __init__(self):
+        ensure_ui_crisp_mode()
+        self.root = tk.Tk()
+        apply_tk_scaling(self.root)
+        self.root.overrideredirect(True)
+        self.root.attributes("-topmost", True)
+        try:
+            self.root.attributes("-toolwindow", True)
+        except Exception:
+            pass
+        self.transparent_color = "#00F7E7"
+        self.window_bg = "#040912"
+        self.panel_bg = "#06111D"
+        self.panel_outline = "#163454"
+        try:
+            self.root.wm_attributes("-transparentcolor", self.transparent_color)
+            self.root.configure(bg=self.transparent_color)
+        except Exception:
+            self.transparent_color = None
+            self.root.configure(bg=self.window_bg)
+
+        self.hidden = False
+        self.command_mode = str(command_key_mode).strip().lower() or "numpad"
+        self.state = "idle"
+        self.current_char = ""
+        self.answer_preview = ""
+        self.answer_progress_index = 0
+        self.answer_preview_expires_at = 0.0
+        self.cooldown_until = 0.0
+        self.hover_inside = False
+        self.frame_after_id = None
+        self.collapse_after_id = None
+        self.animation_after_id = None
+        self.click_after_id = None
+        self.ready_pulse_started_at = 0.0
+        self.base_size = int(INDICATOR_BLOB_SIZES.get(indicator_blob_size_key, INDICATOR_BLOB_SIZES["medium"]))
+        self.collapsed_padding = max(2, int(round(self.base_size * 0.14)))
+        self.expanded_chip_padding = max(4, int(round(self.base_size * 0.18)))
+        self.collapsed_width = self.base_size + (self.collapsed_padding * 2)
+        self.collapsed_height = self.collapsed_width
+        self.square_corner_radius = compute_indicator_chip_corner_radius(self.collapsed_width)
+        self.panel_corner_radius = max(14, int(self.base_size * 0.95))
+        self.panel_padding = max(14, int(self.base_size * 0.7))
+        self.gap = max(12, int(self.base_size * 0.65))
+        self.chip_corner_radius = compute_indicator_chip_corner_radius(self.base_size)
+        self.current_width = self.collapsed_width
+        self.current_height = self.collapsed_height
+        self.target_width = self.collapsed_width
+        self.target_height = self.collapsed_height
+        self._last_render_signature = None
+        self.body_font = tkfont.Font(root=self.root, family=UI_FONT, size=max(9, int(round(self.base_size * 0.55))))
+        self.char_font = tkfont.Font(root=self.root, family=UI_FONT, size=max(8, int(round(self.base_size * 0.42))), weight="bold")
+        self.control_hint_text = self._build_control_hint_text()
+        self.max_panel_width = max(340, min(560, int(self.root.winfo_screenwidth() * 0.34)))
+        self.canvas = tk.Canvas(
+            self.root,
+            width=self.current_width,
+            height=self.current_height,
+            highlightthickness=0,
+            bd=0,
+            bg=self.transparent_color or self.window_bg,
+        )
+        self.canvas.pack(fill="both", expand=True)
+        self.canvas.bind("<Enter>", self._on_hover_enter, add="+")
+        self.canvas.bind("<Leave>", self._on_hover_leave, add="+")
+        self.canvas.bind("<Button-1>", self._on_click_toggle)
+        self.canvas.bind("<Double-Button-1>", self._on_double_click)
+        self.root.bind("<Enter>", self._on_hover_enter, add="+")
+        self.root.bind("<Leave>", self._on_hover_leave, add="+")
+        self.root.bind("<Double-Button-1>", self._on_double_click, add="+")
+        self.root.bind("<Destroy>", self._on_destroy, add="+")
+        configure_private_window(self.root, dark=True, translucent=False, refresh_ms=1200)
+        self._set_geometry(self.collapsed_width, self.collapsed_height)
+        self._apply_window_rounding()
+        self._apply_capture_privacy()
+        self._schedule_frame_tick()
+        self.set_idle()
+
+    def _is_pointer_inside(self):
+        try:
+            px = int(self.root.winfo_pointerx())
+            py = int(self.root.winfo_pointery())
+            x1 = int(self.root.winfo_rootx())
+            y1 = int(self.root.winfo_rooty())
+            x2 = x1 + int(self.current_width)
+            y2 = y1 + int(self.current_height)
+            return x1 <= px < x2 and y1 <= py < y2
+        except Exception:
+            return False
+
+    def _anchor_side(self):
+        layout = INDICATOR_POSITIONS.get(normalize_indicator_position(indicator_position_key), INDICATOR_POSITIONS["bottom_right"])
+        return "left" if layout["x"] == "left" else "right"
+
+    def _panel_text(self):
+        if self.answer_preview and self._should_show_panel():
+            return self.answer_preview
+        if self.state == "cooldown":
+            return tr("indicator.cooldown", language=ui_language, seconds=self._cooldown_seconds_remaining())
+        return self.control_hint_text if self.state == "idle" else ""
+
+    def _build_control_hint_text(self):
+        lines = []
+        for action in HOTKEY_ACTION_ORDER:
+            lines.append(
+                f"{hotkey_binding_label(command_hotkeys.get(action, ''))} {hotkey_action_label(action, language=ui_language)}"
+            )
+        lines.append(tr("auth.hotkey.settings", language=ui_language))
+        return "\n".join(line for line in lines if line)
+
+    def _measure_text_box(self, text, wrap_width):
+        if not text:
+            return 0, 0
+        try:
+            item = self.canvas.create_text(
+                0,
+                0,
+                text=text,
+                font=self.body_font,
+                anchor="nw",
+                width=max(80, int(wrap_width)),
+                justify="left",
+            )
+            bbox = self.canvas.bbox(item)
+            self.canvas.delete(item)
+            if not bbox:
+                return 0, 0
+            return max(0, int(bbox[2] - bbox[0])), max(0, int(bbox[3] - bbox[1]))
+        except Exception:
+            return 0, 0
+
+    def _desired_panel_size(self):
+        text = self._panel_text()
+        if not text:
+            return self.collapsed_width, self.collapsed_height
+        chip_size = self.base_size + self.expanded_chip_padding
+        chip_space = chip_size + self.gap
+        wrap_width = max(240, min(self.max_panel_width - chip_space - (self.panel_padding * 2) - 20, 380))
+        _, text_height = self._measure_text_box(text, wrap_width)
+        width = int(min(self.max_panel_width, max(self.collapsed_width + 180, chip_space + wrap_width + (self.panel_padding * 2) + 18)))
+        bottom_reserve = max(18, int(self.panel_padding * 0.9)) + (18 if self.answer_preview else 0)
+        height = int(max(self.collapsed_height + 44, text_height + (self.panel_padding * 2) + bottom_reserve))
+        return width, height
+
+    def _desired_size(self):
+        if self._should_show_panel() and (self.answer_preview or self.state in {"idle", "cooldown"}):
+            return self._desired_panel_size()
+        return self.collapsed_width, self.collapsed_height
+
+    def _should_show_panel(self):
+        return bool(self.hover_inside or self._is_pointer_inside())
+
+    def _is_expanded(self):
+        return self.current_width > self.collapsed_width + 4 or self.current_height > self.collapsed_height + 4
+
+    def _ready_burst_active(self):
+        return self.state == "ready" and (time.monotonic() - self.ready_pulse_started_at) <= INDICATOR_READY_BURST_SECONDS
+
+    def _render_signature(self, antialias):
+        panel_text = str(self._panel_text() or "")
+        text_signature = (len(panel_text), panel_text[:48], panel_text[-48:] if len(panel_text) > 48 else "")
+        pulse_bucket = 0
+        if self.state == "processing":
+            pulse_bucket = int(round(self._pulse_value() * 24))
+        elif self._ready_burst_active():
+            pulse_bucket = int(max(0, (time.monotonic() - self.ready_pulse_started_at) * 1000.0) // 40)
+        cooldown_bucket = self._cooldown_seconds_remaining()
+        return (
+            int(self.current_width),
+            int(self.current_height),
+            bool(self._is_expanded()),
+            str(self.state),
+            str(self.current_char),
+            int(self.answer_progress_index),
+            text_signature,
+            int(antialias),
+            int(pulse_bucket),
+            int(cooldown_bucket),
+        )
+
+    def _chip_corner_radius_for_size(self, chip_size):
+        return max(4, min(int(self.chip_corner_radius), compute_indicator_chip_corner_radius(chip_size)))
+
+    def _active_ring_specs(self):
+        if self.state == "processing":
+            return [("processing", 0.35 + (0.65 * self._pulse_value()))]
+        if self.state == "cooldown":
+            return [("cooldown", 0.42 + (0.58 * self._pulse_value()))]
+        if self.state == "ready":
+            elapsed = max(0.0, time.monotonic() - self.ready_pulse_started_at)
+            specs = []
+            for offset in (0.0, 0.15):
+                age = elapsed - offset
+                if 0.0 <= age <= 0.22:
+                    specs.append(("ready", max(0.0, 1.0 - (age / 0.22))))
+            return specs
+        return []
+
+    def _draw_chip(self, x1, y1, x2, y2, fill, outline, antialias=1, width=1):
+        draw_rounded_canvas_rect(
+            self.canvas,
+            x1,
+            y1,
+            x2,
+            y2,
+            self._chip_corner_radius_for_size(min((x2 - x1) + 1, (y2 - y1) + 1)),
+            fill=fill,
+            outline=outline,
+            width=width,
+            antialias=antialias,
+        )
+
+    def _draw_active_rings(self, x1, y1, x2, y2, accent_color, antialias=2):
+        if not accent_color:
+            return
+        available_pad = min(
+            int(max(0, x1)),
+            int(max(0, y1)),
+            int(max(0, self.current_width - x2 - 1)),
+            int(max(0, self.current_height - y2 - 1)),
+        )
+        if available_pad <= 0:
+            return
+        for ring_kind, strength in self._active_ring_specs():
+            pad = max(1, min(available_pad, int(round(1 + (available_pad * strength)))))
+            if ring_kind == "processing":
+                alpha = 64
+            elif ring_kind == "cooldown":
+                alpha = int(72 * strength)
+            else:
+                alpha = int(58 * strength)
+            draw_rounded_canvas_rect(
+                self.canvas,
+                x1 - pad,
+                y1 - pad,
+                x2 + pad,
+                y2 + pad,
+                self._chip_corner_radius_for_size((x2 - x1 + 1) + (pad * 2)),
+                fill="",
+                outline=hex_to_rgba(accent_color, alpha),
+                width=1,
+                antialias=max(2, antialias),
+            )
+
+    def _set_state(self, state_name):
+        self.state = state_name
+        if state_name == "ready":
+            self.ready_pulse_started_at = time.monotonic()
+        self._sync_target_size()
+        self._redraw()
+
+    def _sync_target_size(self):
+        target_width, target_height = self._desired_size()
+        self.target_width = target_width
+        self.target_height = target_height
+        self._ensure_animation()
+
+    def _ensure_animation(self):
+        if self.animation_after_id is None:
+            self.animation_after_id = self.root.after(0, self._animate_step)
+
+    def _animate_step(self):
+        self.animation_after_id = None
+        
+        def _next(current, target):
+            if current == target:
+                return current
+            delta = target - current
+            step = max(1, int(abs(delta) * 0.34))
+            if delta < 0:
+                step = -step
+            candidate = current + step
+            if (delta > 0 and candidate > target) or (delta < 0 and candidate < target):
+                return target
+            return candidate
+
+        next_width = _next(self.current_width, self.target_width)
+        next_height = _next(self.current_height, self.target_height)
+        self._set_geometry(next_width, next_height)
+        animating = next_width != self.target_width or next_height != self.target_height
+        self._apply_window_rounding()
+        self._redraw(antialias=1 if animating else 2)
+        if animating:
+            self.animation_after_id = self.root.after(16, self._animate_step)
+        else:
+            self._apply_capture_privacy()
+
+    def _schedule_frame_tick(self):
+        if self.frame_after_id is None:
+            self.frame_after_id = self.root.after(42, self._frame_tick)
+
+    def _frame_tick(self):
+        self.frame_after_id = None
+        if not self.hidden and (self.state == "processing" or self._ready_burst_active()):
+            self._redraw(antialias=1 if not self._is_expanded() else 2)
+        if self.answer_preview_expires_at > 0 and time.monotonic() >= self.answer_preview_expires_at:
+            self.clear_answer_preview()
+        if self.state == "cooldown":
+            if self.cooldown_until > 0 and time.monotonic() >= self.cooldown_until:
+                self.clear_cooldown()
+            else:
+                self._redraw(antialias=1 if not self._is_expanded() else 2)
+        self._schedule_frame_tick()
+
+    def _set_geometry(self, width, height):
+        self.current_width = int(max(1, width))
+        self.current_height = int(max(1, height))
+        screen_width = self.root.winfo_screenwidth()
+        screen_height = self.root.winfo_screenheight()
+        work_left, work_top, work_right, work_bottom = get_work_area_bounds(screen_width, screen_height)
+        x, y = compute_indicator_origin(work_left, work_top, work_right, work_bottom, self.current_width, self.current_height, indicator_position_key)
+        self.root.geometry(f"{self.current_width}x{self.current_height}+{x}+{y}")
+        self.canvas.configure(width=self.current_width, height=self.current_height)
+
+    def _apply_capture_privacy(self):
+        global indicator_capture_protected
+        if not is_capture_privacy_active():
+            indicator_capture_protected = False
+            apply_capture_privacy_to_window(self.root, enabled=False)
+            return
+        try:
+            indicator_capture_protected = bool(apply_capture_privacy_to_window(self.root, enabled=True))
+        except Exception:
+            indicator_capture_protected = False
+
+    def refresh_capture_privacy(self):
+        self._apply_capture_privacy()
+        self._redraw(force=True)
+
+    def _apply_window_rounding(self):
+        if os.name != "nt":
+            return
+        radius = self.square_corner_radius if not self._is_expanded() else self.panel_corner_radius
+        apply_window_corner_region(self.root, radius)
+
+    def _on_destroy(self, _event=None):
+        for attr_name in ("frame_after_id", "collapse_after_id", "animation_after_id", "click_after_id"):
+            after_id = getattr(self, attr_name, None)
+            if after_id:
+                try:
+                    self.root.after_cancel(after_id)
+                except Exception:
+                    pass
+            setattr(self, attr_name, None)
+
+    def _pulse_value(self):
+        now = time.monotonic()
+        if self.state == "processing":
+            return 0.48 + (0.32 * ((math.sin(now * 5.2) + 1.0) / 2.0))
+        if self.state == "cooldown":
+            return 0.56 + (0.24 * ((math.sin(now * 6.0) + 1.0) / 2.0))
+        if self.state == "ready":
+            elapsed = max(0.0, now - self.ready_pulse_started_at)
+            if elapsed <= INDICATOR_READY_BURST_SECONDS:
+                return 0.78 + (0.12 * ((math.sin(elapsed * 15.0) + 1.0) / 2.0))
+            return 0.82
+        if self.state == "paused":
+            return 0.7
+        return 0.3
+
+    def _state_palette(self):
+        if self.state == "processing":
+            return "#7A4709", "#FFB34C", "#FF8C1A"
+        if self.state == "cooldown":
+            return "#825118", "#FFBF63", "#FF9624"
+        if self.state == "ready":
+            return "#0F5A31", "#57F09D", "#1FD16D"
+        if self.state == "paused":
+            return "#5F6878", "#9BAEC8", ""
+        return "#636A74", "#98A0AB", ""
+
+    def _chip_rect(self, expanded):
+        chip_size = self.base_size + (self.expanded_chip_padding if expanded else 0)
+        chip_side = self._anchor_side()
+        if not expanded:
+            return 0, 0, min(self.current_width, self.current_height)
+        y = self.current_height - self.panel_padding - chip_size - 2
+        if expanded and chip_side == "left":
+            x = self.panel_padding + 2
+        else:
+            x = self.current_width - self.panel_padding - chip_size - 2
+        return x, y, chip_size
+
+    def _collapsed_chip_bounds(self, pulse):
+        full_size = min(self.current_width, self.current_height)
+        if self.state == "processing":
+            core_scale = 0.78 + (0.1 * pulse)
+        elif self.state == "ready":
+            core_scale = 0.86 + (0.06 * max(0.0, pulse - 0.78))
+        elif self.state == "paused":
+            core_scale = 0.82
+        else:
+            core_scale = 0.86
+        core_size = int(round(full_size * core_scale))
+        min_size = max(8, self.base_size)
+        max_size = max(min_size, full_size - 2)
+        core_size = max(min_size, min(core_size, max_size))
+        inset = max(1, int(round((full_size - core_size) / 2.0)))
+        x1 = inset
+        y1 = inset
+        x2 = full_size - inset - 1
+        y2 = full_size - inset - 1
+        return x1, y1, x2, y2
+
+    def _expanded_chip_bounds(self, chip_x, chip_y, chip_size, pulse):
+        if self.state == "processing":
+            core_scale = 0.8 + (0.08 * pulse)
+        elif self.state == "ready":
+            core_scale = 0.86 + (0.06 * max(0.0, pulse - 0.78))
+        elif self.state == "paused":
+            core_scale = 0.82
+        else:
+            core_scale = 0.86
+        core_size = int(round(chip_size * core_scale))
+        min_size = max(10, int(round(chip_size * 0.7)))
+        max_size = max(min_size, chip_size - 2)
+        core_size = max(min_size, min(core_size, max_size))
+        inset = max(1, int(round((chip_size - core_size) / 2.0)))
+        x1 = chip_x + inset
+        y1 = chip_y + inset
+        x2 = chip_x + chip_size - inset - 1
+        y2 = chip_y + chip_size - inset - 1
+        return x1, y1, x2, y2
+
+    def _draw_progress_bar(self):
+        if not self.answer_preview:
+            return
+        total = len(self.answer_preview)
+        if total <= 0:
+            return
+        fraction = max(0.0, min(1.0, float(self.answer_progress_index) / float(total)))
+        bar_width = max(80, self.current_width - (self.panel_padding * 2))
+        x1 = self.panel_padding
+        y1 = self.current_height - max(12, int(self.panel_padding * 0.85))
+        x2 = x1 + bar_width
+        self.canvas.create_line(x1, y1, x2, y1, fill="#243B63", width=3, capstyle=tk.ROUND)
+        self.canvas.create_line(x1, y1, x1 + int(bar_width * fraction), y1, fill="#FF5F5F", width=3, capstyle=tk.ROUND)
+
+    def _redraw(self, antialias=2, force=False):
+        expanded = self._is_expanded()
+        effective_antialias = 1 if not expanded else max(1, int(antialias))
+        render_signature = self._render_signature(effective_antialias)
+        if not force and render_signature == self._last_render_signature:
+            return
+        self._last_render_signature = render_signature
+
+        self.canvas.delete("all")
+        self.canvas._eae_image_refs = []
+        if expanded:
+            draw_rounded_canvas_rect(
+                self.canvas,
+                0,
+                0,
+                self.current_width - 1,
+                self.current_height - 1,
+                self.panel_corner_radius,
+                fill=self.panel_bg,
+                outline=self.panel_outline,
+                antialias=max(1, effective_antialias),
+            )
+
+        pulse = self._pulse_value()
+        chip_fill, chip_outline, chip_accent = self._state_palette()
+        if not expanded:
+            chip_x1, chip_y1, chip_x2, chip_y2 = self._collapsed_chip_bounds(pulse)
+            self._draw_chip(chip_x1, chip_y1, chip_x2, chip_y2, chip_fill, chip_outline, antialias=1, width=1)
+            if chip_accent:
+                self._draw_active_rings(chip_x1, chip_y1, chip_x2, chip_y2, chip_accent, antialias=2)
+            chip_x = chip_x1
+            chip_y = chip_y1
+            chip_size = max(1, chip_x2 - chip_x1 + 1)
+        else:
+            chip_x, chip_y, chip_size = self._chip_rect(expanded)
+            core_x1, core_y1, core_x2, core_y2 = self._expanded_chip_bounds(chip_x, chip_y, chip_size, pulse)
+            self._draw_chip(
+                core_x1,
+                core_y1,
+                core_x2,
+                core_y2,
+                chip_fill,
+                chip_outline,
+                antialias=max(1, effective_antialias),
+                width=1,
+            )
+            if chip_accent:
+                self._draw_active_rings(core_x1, core_y1, core_x2, core_y2, chip_accent, antialias=max(2, effective_antialias))
+        display_char = self._display_char()
+        if display_char:
+            self.canvas.create_text(
+                chip_x + (chip_size / 2),
+                chip_y + (chip_size / 2),
+                text=display_char.upper(),
+                fill="white",
+                font=self.char_font,
+            )
+        elif self.state == "paused":
+            bar_width = max(2, int(chip_size * 0.16))
+            gap = max(2, int(chip_size * 0.12))
+            x_mid = chip_x + (chip_size / 2)
+            y1 = chip_y + int(chip_size * 0.26)
+            y2 = chip_y + int(chip_size * 0.74)
+            self.canvas.create_rectangle(x_mid - gap - bar_width, y1, x_mid - gap, y2, fill="white", outline="")
+            self.canvas.create_rectangle(x_mid + gap, y1, x_mid + gap + bar_width, y2, fill="white", outline="")
+        text = self._panel_text()
+        if expanded and text:
+            chip_side = self._anchor_side()
+            text_width = max(220, self.current_width - (self.panel_padding * 2) - chip_size - self.gap - 20)
+            if chip_side == "left":
+                text_x = chip_x + chip_size + self.gap
+            else:
+                text_x = self.panel_padding
+            text_y = self.panel_padding + 2
+            self.canvas.create_text(
+                text_x,
+                text_y,
+                text=text,
+                fill="#EAF3FF",
+                font=self.body_font,
+                anchor="nw",
+                justify="left",
+                width=text_width,
+            )
+            if self.answer_preview and self.answer_progress_index > 0:
+                self.canvas.create_text(
+                    text_x,
+                    text_y,
+                    text=self.answer_preview[: self.answer_progress_index],
+                    fill="#FF6E6E",
+                    font=self.body_font,
+                    anchor="nw",
+                    justify="left",
+                    width=text_width,
+                )
+            if self.answer_preview:
+                self._draw_progress_bar()
+
+    def _cancel_scheduled_collapse(self):
+        if self.collapse_after_id is None:
+            return
+        try:
+            self.root.after_cancel(self.collapse_after_id)
+        except Exception:
+            pass
+        self.collapse_after_id = None
+
+    def _schedule_collapse(self):
+        self._cancel_scheduled_collapse()
+        self.collapse_after_id = self.root.after(150, self._collapse_if_possible)
+
+    def _collapse_if_possible(self):
+        self.collapse_after_id = None
+        if self.hidden or self.hover_inside or self._is_pointer_inside():
+            return
+        self.target_width = self.collapsed_width
+        self.target_height = self.collapsed_height
+        self._ensure_animation()
+
+    def _on_hover_enter(self, _event):
+        if self.hidden:
+            return
+        self.hover_inside = True
+        self._cancel_scheduled_collapse()
+        if self.state in {"idle", "cooldown"} or self.answer_preview:
+            self._sync_target_size()
+
+    def _on_hover_leave(self, _event):
+        if self.hidden:
+            return
+        self.hover_inside = False
+        self._schedule_collapse()
+
+    def _on_click_toggle(self, _event):
+        if self.hidden:
+            return
+        if self.click_after_id is not None:
+            try:
+                self.root.after_cancel(self.click_after_id)
+            except Exception:
+                pass
+        self.click_after_id = self.root.after(180, self._apply_single_click)
+
+    def _apply_single_click(self):
+        self.click_after_id = None
+        expanded = self.current_width > self.collapsed_width + 4
+        if expanded:
+            self.hover_inside = False
+            self._collapse_if_possible()
+        else:
+            self.hover_inside = True
+            self._sync_target_size()
+
+    def _on_double_click(self, _event=None):
+        if self.click_after_id is not None:
+            try:
+                self.root.after_cancel(self.click_after_id)
+            except Exception:
+                pass
+            self.click_after_id = None
+        Thread(target=lambda: open_settings_menu(hide_indicator_temporarily=True), daemon=True).start()
+
+    def set_command_mode(self, mode):
+        self.command_mode = "toprow" if str(mode or "").strip().lower() == "toprow" else "numpad"
+        self.control_hint_text = self._build_control_hint_text()
+        self._sync_target_size()
+        self._redraw()
+
+    def refresh_preferences(self):
+        self.base_size = int(INDICATOR_BLOB_SIZES.get(indicator_blob_size_key, INDICATOR_BLOB_SIZES["medium"]))
+        self.collapsed_padding = max(2, int(round(self.base_size * 0.14)))
+        self.expanded_chip_padding = max(4, int(round(self.base_size * 0.18)))
+        self.collapsed_width = self.base_size + (self.collapsed_padding * 2)
+        self.collapsed_height = self.collapsed_width
+        self.square_corner_radius = compute_indicator_chip_corner_radius(self.collapsed_width)
+        self.panel_corner_radius = max(14, int(self.base_size * 0.95))
+        self.panel_padding = max(14, int(self.base_size * 0.7))
+        self.gap = max(12, int(self.base_size * 0.65))
+        self.chip_corner_radius = compute_indicator_chip_corner_radius(self.base_size)
+        self.body_font.configure(size=max(9, int(round(self.base_size * 0.55))))
+        self.char_font.configure(size=max(8, int(round(self.base_size * 0.42))))
+        self.max_panel_width = max(340, min(560, int(self.root.winfo_screenwidth() * 0.34)))
+        self._last_render_signature = None
+        self._sync_target_size()
+        self._set_geometry(self.current_width, self.current_height)
+        self._redraw(force=True)
+
+    def set_idle(self):
+        self.current_char = ""
+        self._set_state("idle")
+
+    def set_processing(self):
+        self.current_char = ""
+        self._set_state("processing")
+        self.hover_inside = False
+        self._collapse_if_possible()
+
+    def set_ready(self):
+        self.current_char = ""
+        self._set_state("ready")
+
+    def set_paused(self):
+        self.current_char = ""
+        self._set_state("paused")
+
+    def show_answer_char(self, value):
+        self.current_char = (value or "").strip()[:1]
+        self._set_state("ready")
+
+    def set_answer_preview(self, value):
+        self.set_answer_progress(value, 0)
+
+    def set_answer_progress(self, value, typed_count=0):
+        text = str(value or "").strip()
+        typed_index = max(0, min(len(text), int(typed_count or 0)))
+        if text == self.answer_preview and typed_index == self.answer_progress_index:
+            return
+        self.answer_preview = text
+        self.answer_progress_index = typed_index
+        self.answer_preview_expires_at = time.monotonic() + ANSWER_PREVIEW_RETENTION_SECONDS if text and typed_index >= len(text) else 0.0
+        self._sync_target_size()
+        self._redraw(force=True)
+
+    def clear_answer_preview(self):
+        if not self.answer_preview and self.answer_progress_index == 0:
+            return
+        self.answer_preview = ""
+        self.answer_progress_index = 0
+        self.answer_preview_expires_at = 0.0
+        self._sync_target_size()
+        self._redraw(force=True)
+
+    def _cooldown_seconds_remaining(self):
+        if self.cooldown_until <= 0:
+            return 0
+        return max(0, int(math.ceil(self.cooldown_until - time.monotonic())))
+
+    def _display_char(self):
+        if self.state == "cooldown":
+            remaining = self._cooldown_seconds_remaining()
+            if remaining > 0:
+                return str(remaining)
+        return str(self.current_char or "")
+
+    def set_cooldown(self, seconds):
+        timeout = max(0.0, float(seconds or 0.0))
+        if timeout <= 0:
+            self.clear_cooldown()
+            return
+        self.current_char = ""
+        self.cooldown_until = time.monotonic() + timeout
+        self._set_state("cooldown")
+
+    def clear_cooldown(self):
+        if self.cooldown_until <= 0 and self.state != "cooldown":
+            return
+        self.cooldown_until = 0.0
+        self.current_char = ""
+        if self.state == "cooldown":
+            self._set_state("idle")
+        else:
+            self._redraw(force=True)
+
+    def hide(self):
+        if not self.hidden:
+            self._cancel_scheduled_collapse()
+            self.root.withdraw()
+            self.hidden = True
+
+    def show(self):
+        if self.hidden:
+            self.root.deiconify()
+            self.root.attributes("-topmost", True)
+            self._apply_window_rounding()
+            self._apply_capture_privacy()
+            self.hidden = False
+            self._last_render_signature = None
+            self._redraw(force=True)
+
+    def run(self):
+        self.root.mainloop()
+
+
+def init_indicator():
+    global indicator
+    indicator = StatusIndicator()
+    indicator.run()
+
+
+def indicator_call(func):
+    local_indicator = indicator
+    if not local_indicator:
+        return
+
+    def _invoke():
+        try:
+            func(local_indicator)
+        except Exception:
+            logger.debug("Indicator callback failed.", exc_info=True)
+
+    try:
+        local_indicator.root.after(0, _invoke)
+    except Exception:
+        logger.debug("Indicator callback scheduling failed.", exc_info=True)
+
+
+def indicator_set_idle():
+    indicator_call(lambda obj: obj.set_idle())
+
+
+def indicator_set_processing():
+    indicator_call(lambda obj: obj.set_processing())
+
+
+def indicator_set_ready():
+    indicator_call(lambda obj: obj.set_ready())
+
+
+def indicator_set_paused():
+    indicator_call(lambda obj: obj.set_paused())
+
+
+def indicator_set_cooldown(seconds):
+    indicator_call(lambda obj: obj.set_cooldown(seconds) if hasattr(obj, "set_cooldown") else None)
+
+
+def indicator_clear_cooldown():
+    indicator_call(lambda obj: obj.clear_cooldown() if hasattr(obj, "clear_cooldown") else None)
+
+
+def indicator_show_answer_char(value):
+    indicator_call(lambda obj: obj.show_answer_char(value))
+
+
+def indicator_set_answer_progress(value, typed_count):
+    indicator_call(lambda obj: obj.set_answer_progress(value, typed_count))
+
+
+def indicator_clear_answer_preview():
+    indicator_call(lambda obj: obj.clear_answer_preview())
+
+
+def indicator_set_command_mode(mode):
+    indicator_call(lambda obj: obj.set_command_mode(mode))
+
+
+def indicator_hide():
+    indicator_call(lambda obj: obj.hide())
+
+
+def indicator_show():
+    if privacy_forced_hidden:
+        return
+    indicator_call(lambda obj: obj.show())
+
+
+def set_indicator_manual_visibility(hidden):
+    global indicator_manual_hidden
+    indicator_manual_hidden = bool(hidden)
+    if hidden:
+        indicator_hide()
+    else:
+        indicator_show()
+
+
+def get_status_text():
+    with session_lock:
+        return session_status_text
+
+
+def build_tray_image():
+    image = PIL.Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+    draw = PIL.ImageDraw.Draw(image)
+    draw.rounded_rectangle((14, 14, 50, 50), radius=10, fill="#040404", outline="#22D05D", width=4)
+    return image
+
+
+def tray_status_label(_):
+    return tr("tray.status", status=get_status_text())
+
+
+def tray_open_ui(icon, item):
+    open_settings_menu()
+
+
+def tray_toggle_indicator(icon, item):
+    if not indicator:
+        return
+    toggle_indicator_visibility()
+
+
+def tray_capture_privacy_label(_):
+    if is_capture_privacy_active():
+        return tr("tray.capture_disable")
+    return tr("tray.capture_enable")
+
+
+def tray_toggle_capture_privacy(icon, item):
+    _ = icon
+    _ = item
+    toggle_capture_privacy()
+
+
+def tray_check_updates(icon, item):
+    _ = icon
+    _ = item
+    Thread(target=lambda: check_for_updates(manual=True), daemon=True).start()
+
+
+def tray_exit(icon, item):
+    exit_program(trigger_uninstall=False)
+
+
+def run_tray_icon():
+    global tray_icon
+    if pystray is None:
+        return
+    tray_icon = pystray.Icon(
+        "EyesAndEars",
+        build_tray_image(),
+        "EyesAndEars",
+        pystray.Menu(
+            pystray.MenuItem(tr("tray.open"), tray_open_ui),
+            pystray.MenuItem(tray_status_label, None, enabled=False),
+            pystray.MenuItem(tr("tray.toggle"), tray_toggle_indicator),
+            pystray.MenuItem(tray_capture_privacy_label, tray_toggle_capture_privacy),
+            pystray.MenuItem(tr("tray.check_updates"), tray_check_updates),
+            pystray.MenuItem(tr("tray.quit"), tray_exit),
+        ),
+    )
+    tray_icon.run()
+
+
+def block_hotkey(action, seconds=0.25):
+    hotkey_block_until[action] = time.monotonic() + seconds
+
+
+def hotkey_blocked(action):
+    return time.monotonic() < hotkey_block_until[action]
+
+
+def hotkey_block_seconds(action):
+    if action == "paste_all":
+        return 0.9
+    if action == "repeat_prev":
+        return 0.45
+    return 0.25
+
+
+def is_character_like_key(name):
+    key_name = str(name or "").strip().lower()
+    if not key_name:
+        return False
+    if len(key_name) == 1:
+        return True
+    return key_name in {"space"}
+
+
+def get_mouse_position():
+    if os.name != "nt":
+        return None
+    try:
+        point = wintypes.POINT()
+        if _user32.GetCursorPos(ctypes.byref(point)):
+            return int(point.x), int(point.y)
+    except Exception:
+        pass
+    return None
+
+
+def get_event_scan_code(event):
+    try:
+        return int(getattr(event, "scan_code", -1))
+    except Exception:
+        return -1
+
+
+def event_matches_command_mode(event, mode=None):
+    local_mode = str(mode or command_key_mode).strip().lower()
+    keypad_flag = getattr(event, "is_keypad", None)
+    if keypad_flag is None:
+        return True
+    is_keypad = bool(keypad_flag)
+    if local_mode == "toprow":
+        return not is_keypad
+    return is_keypad
+
+
+def get_numpad_action(event):
+    return get_hotkey_action(event)
+
+
+def stop_command_mode_probe():
+    global command_mode_probe_hook
+    if command_mode_probe_hook is None:
+        return
+    try:
+        keyboard.unhook(command_mode_probe_hook)
+    except Exception:
+        pass
+    command_mode_probe_hook = None
+
+
+def on_command_mode_probe(event):
+    global command_probe_window_start, command_probe_attempt_count, command_probe_last_scan, command_numpad_seen
+    if command_hotkeys_customized:
+        stop_command_mode_probe()
+        return
+    if command_key_mode != "numpad":
+        return
+    if event.event_type != "down":
+        return
+    if typing_hook is not None or post_type_guard_active or is_processing or has_pending_answer():
+        return
+    if keyboard.is_pressed("ctrl") or keyboard.is_pressed("alt") or keyboard.is_pressed("win"):
+        return
+    scan_code = get_event_scan_code(event)
+    if scan_code in NUMPAD_SCAN_TO_ACTION and event_matches_command_mode(event, "numpad"):
+        command_numpad_seen = True
+        stop_command_mode_probe()
+        return
+    if scan_code not in TOPROW_SCAN_TO_ACTION:
+        return
+    if not event_matches_command_mode(event, "toprow"):
+        return
+    now = time.monotonic()
+    if (
+        command_probe_window_start <= 0
+        or (now - command_probe_window_start) > 9.0
+        or command_probe_last_scan != scan_code
+    ):
+        command_probe_window_start = now
+        command_probe_attempt_count = 0
+        command_probe_last_scan = scan_code
+    command_probe_attempt_count += 1
+    if command_probe_attempt_count >= 3 and not command_numpad_seen:
+        set_command_key_mode("toprow")
+        command_probe_window_start = 0.0
+        command_probe_attempt_count = 0
+        command_probe_last_scan = -1
+
+
+def start_command_mode_probe():
+    global command_mode_probe_hook
+    if command_mode_probe_hook is not None:
+        return
+    if command_hotkeys_customized:
+        return
+    if command_key_mode != "numpad":
+        return
+    try:
+        command_mode_probe_hook = keyboard.hook(on_command_mode_probe, suppress=False)
+    except Exception:
+        command_mode_probe_hook = None
+
+
+def unhook_command_key_handlers():
+    global command_key_hooks
+    if not command_key_hooks:
+        return
+    for hook in command_key_hooks:
+        try:
+            keyboard.unhook(hook)
+        except Exception:
+            pass
+    command_key_hooks = []
+
+
+def dispatch_hotkey_action(action, event=None):
+    if action == "primary":
+        handle_primary_hotkey()
+    elif action == "indicator":
+        handle_indicator_hotkey()
+    elif action == "clear_ctx":
+        handle_clear_ctx_hotkey()
+    elif action == "paste_all":
+        handle_paste_all_hotkey()
+    elif action == "repeat_prev":
+        handle_repeat_prev_hotkey()
+    elif action == "exit":
+        handle_exit_hotkey(event=event)
+
+
+def on_command_key_event(event):
+    if event is None:
+        return True
+    if getattr(event, "event_type", "") != "down":
+        return True
+    action = get_hotkey_action(event)
+    if not action:
+        return True
+    dispatch_hotkey_action(action, event=event)
+    return False
+
+
+def register_command_key_handlers(mode=None):
+    global command_key_hooks, command_key_mode
+    local_mode = str(mode or command_key_mode).strip().lower()
+    if local_mode not in {"numpad", "toprow"}:
+        local_mode = "numpad"
+    unhook_command_key_handlers()
+    if typing_hook is not None or post_type_guard_active:
+        return
+    try:
+        command_key_hooks = [keyboard.hook(on_command_key_event, suppress=True)]
+    except Exception:
+        command_key_hooks = []
+    command_key_mode = local_mode
+
+
+def detect_initial_command_key_mode():
+    forced_top = str(os.environ.get("EAE_FORCE_TOP_ROW_HOTKEYS", "")).strip().lower() in {"1", "true", "yes", "on"}
+    if forced_top:
+        return "toprow"
+    if os.name != "nt":
+        return "toprow"
+    try:
+        keyboard_type = int(ctypes.windll.user32.GetKeyboardType(0))
+        if keyboard_type not in {4, 7}:
+            return "toprow"
+    except Exception:
+        return "numpad"
+    return "numpad"
+
+
+def set_command_key_mode(mode):
+    global command_key_mode, command_hotkeys
+    local_mode = "toprow" if str(mode).strip().lower() == "toprow" else "numpad"
+    command_key_mode = local_mode
+    if not command_hotkeys_customized:
+        command_hotkeys = get_default_command_hotkeys(local_mode)
+    register_command_key_handlers(local_mode)
+    if local_mode != "numpad" or command_hotkeys_customized:
+        stop_command_mode_probe()
+    indicator_set_command_mode(local_mode)
+
+
+def on_post_type_guard_event(event):
+    if event.event_type != "down":
+        return
+    action = get_numpad_action(event)
+    if action:
+        dispatch_hotkey_action(action, event=event)
+        return
+    key_name = str(getattr(event, "name", "") or "").strip().lower()
+    if not is_character_like_key(key_name):
+        deactivate_post_type_guard()
+
+
+def post_type_guard_watch_loop():
+    while not post_type_guard_stop.wait(0.07):
+        with post_type_guard_lock:
+            if not post_type_guard_active:
+                return
+            local_until = float(post_type_guard_until)
+            origin = post_type_guard_mouse
+        if time.monotonic() >= local_until:
+            deactivate_post_type_guard()
+            return
+        if origin is not None:
+            current = get_mouse_position()
+            if current is not None and current != origin:
+                deactivate_post_type_guard()
+                return
+
+
+def activate_post_type_guard(seconds=POST_TYPE_GUARD_SECONDS):
+    global post_type_guard_hook, post_type_guard_active, post_type_guard_until, post_type_guard_mouse, post_type_guard_thread
+    timeout = float(seconds or 0)
+    if timeout <= 0:
+        return
+    with post_type_guard_lock:
+        post_type_guard_until = time.monotonic() + timeout
+        post_type_guard_mouse = get_mouse_position()
+        if post_type_guard_active:
+            indicator_set_cooldown(timeout)
+            return
+        post_type_guard_active = True
+        post_type_guard_stop.clear()
+    indicator_set_cooldown(timeout)
+    unhook_command_key_handlers()
+    try:
+        post_type_guard_hook = keyboard.hook(on_post_type_guard_event, suppress=True)
+    except Exception:
+        with post_type_guard_lock:
+            post_type_guard_active = False
+        register_command_key_handlers(command_key_mode)
+        return
+    post_type_guard_thread = Thread(target=post_type_guard_watch_loop, daemon=True)
+    post_type_guard_thread.start()
+
+
+def deactivate_post_type_guard():
+    global post_type_guard_hook, post_type_guard_active, post_type_guard_mouse, post_type_guard_thread
+    hook_to_remove = None
+    with post_type_guard_lock:
+        if not post_type_guard_active:
+            return
+        post_type_guard_active = False
+        post_type_guard_stop.set()
+        post_type_guard_mouse = None
+        hook_to_remove = post_type_guard_hook
+        post_type_guard_hook = None
+        post_type_guard_thread = None
+    indicator_clear_cooldown()
+    if hook_to_remove is not None:
+        try:
+            keyboard.unhook(hook_to_remove)
+        except Exception:
+            pass
+    if typing_hook is None:
+        register_command_key_handlers(command_key_mode)
+
+
+def clear_typing_pressed_state():
+    with typing_pressed_lock:
+        typing_pressed_scancodes.clear()
+
+
+def reset_progress_ui_state():
+    global progress_ui_last_update, progress_ui_last_index
+    with progress_ui_lock:
+        progress_ui_last_update = 0.0
+        progress_ui_last_index = -1
+
+
+def push_indicator_progress(answer_text, typed_count, force=False):
+    global progress_ui_last_update, progress_ui_last_index
+    text_value = str(answer_text or "")
+    index_value = int(max(0, typed_count or 0))
+    if index_value > len(text_value):
+        index_value = len(text_value)
+    should_send = True
+    now = time.monotonic()
+    with progress_ui_lock:
+        if not force and index_value < len(text_value):
+            step_delta = index_value - int(progress_ui_last_index)
+            time_delta = now - float(progress_ui_last_update)
+            if step_delta <= 0:
+                should_send = False
+            elif step_delta < PROGRESS_UI_MIN_STEP and time_delta < PROGRESS_UI_MIN_INTERVAL:
+                should_send = False
+        if should_send:
+            progress_ui_last_update = now
+            progress_ui_last_index = index_value
+    if should_send:
+        indicator_set_answer_progress(text_value, index_value)
+
+
+def enable_typing_mode():
+    global typing_hook
+    deactivate_post_type_guard()
+    unhook_command_key_handlers()
+    clear_typing_pressed_state()
+    if typing_hook is None:
+        typing_hook = keyboard.hook(on_smart_type, suppress=True)
+
+
+def disable_typing_mode():
+    global typing_hook
+    if typing_hook:
+        keyboard.unhook(typing_hook)
+        typing_hook = None
+    clear_typing_pressed_state()
+    if not post_type_guard_active:
+        register_command_key_handlers(command_key_mode)
+
+
+def has_pending_answer():
+    return bool(current_answer) and current_index < len(current_answer)
+
+
+def bump_answer_epoch():
+    global answer_epoch
+    with answer_epoch_lock:
+        answer_epoch += 1
+        return answer_epoch
+
+
+def get_answer_epoch():
+    with answer_epoch_lock:
+        return answer_epoch
+
+
+def clear_answer_state(invalidate=True):
+    global current_answer, current_index, is_paused, pause_pending
+    with write_lock:
+        current_answer = ""
+        current_index = 0
+        is_paused = False
+        pause_pending = False
+    reset_progress_ui_state()
+    clear_typing_pressed_state()
+    if invalidate:
+        bump_answer_epoch()
+
+
+def reset_api_context():
+    global local_chat_session
+    if local_chat_session is None:
+        return
+    try:
+        if hasattr(local_chat_session, "reset"):
+            local_chat_session.reset()
+            return
+        if local_model is not None:
+            local_chat_session = local_model.start_chat(history=[])
+    except Exception:
+        pass
+
+
+def toggle_pause_pending():
+    global pause_pending
+    pause_pending = not pause_pending
+
+
+def toggle_pause():
+    global is_paused
+    if not has_pending_answer():
+        return
+    is_paused = not is_paused
+    if is_paused:
+        disable_typing_mode()
+        indicator_set_paused()
+    else:
+        indicator_set_ready()
+        enable_typing_mode()
+
+
+def handle_primary_action():
+    if is_processing:
+        toggle_pause_pending()
+        return
+    if has_pending_answer():
+        toggle_pause()
+        return
+    Thread(target=process_screenshot, daemon=True).start()
+
+
+def toggle_indicator_visibility():
+    if not indicator:
+        return
+    if indicator.hidden:
+        set_indicator_manual_visibility(False)
+        if not has_pending_answer() and not is_processing:
+            indicator_clear_answer_preview()
+            indicator_set_idle()
+    else:
+        set_indicator_manual_visibility(True)
+
+
+def handle_primary_hotkey():
+    if hotkey_blocked("primary"):
+        return
+    block_hotkey("primary", hotkey_block_seconds("primary"))
+    handle_primary_action()
+
+
+def handle_indicator_hotkey():
+    if hotkey_blocked("indicator"):
+        return
+    block_hotkey("indicator", hotkey_block_seconds("indicator"))
+    toggle_indicator_visibility()
+
+
+def is_ctrl_modifier_pressed():
+    try:
+        return bool(
+            keyboard.is_pressed("ctrl")
+            or keyboard.is_pressed("left ctrl")
+            or keyboard.is_pressed("right ctrl")
+        )
+    except Exception:
+        return False
+
+
+def handle_clear_ctx_hotkey():
+    if hotkey_blocked("clear_ctx"):
+        return
+    block_hotkey("clear_ctx", hotkey_block_seconds("clear_ctx"))
+    run_clear_ctx_action()
+
+
+def run_clear_ctx_action():
+    deactivate_post_type_guard()
+    clear_answer_state()
+    reset_api_context()
+    disable_typing_mode()
+    indicator_set_idle()
+
+
+def handle_paste_all_hotkey():
+    if hotkey_blocked("paste_all"):
+        return
+    block_hotkey("paste_all", hotkey_block_seconds("paste_all"))
+    run_paste_all_action()
+
+
+def paste_text_fast(text, keep_clipboard_text=""):
+    payload = str(text or "")
+    if not payload:
+        return False
+    try:
+        pyperclip.copy(payload)
+        keyboard.send("ctrl+v")
+        if keep_clipboard_text:
+            time.sleep(0.03)
+            pyperclip.copy(keep_clipboard_text)
+        return True
+    except Exception:
+        return False
+
+
+def run_paste_all_action():
+    global current_index
+    disable_typing_mode()
+    with write_lock:
+        if not current_answer or current_index >= len(current_answer):
+            return
+        remaining = current_answer[current_index:]
+        full_answer = current_answer
+    pasted = paste_text_fast(remaining, keep_clipboard_text=full_answer)
+    if not pasted:
+        keyboard.write(remaining)
+    with write_lock:
+        current_index = len(full_answer)
+    push_indicator_progress(full_answer, len(full_answer), force=True)
+    indicator_set_idle()
+    clear_answer_state()
+    activate_post_type_guard(POST_TYPE_GUARD_SECONDS)
+
+
+def handle_repeat_prev_hotkey():
+    if hotkey_blocked("repeat_prev"):
+        return
+    block_hotkey("repeat_prev", hotkey_block_seconds("repeat_prev"))
+    run_repeat_prev_action()
+
+
+def run_repeat_prev_action():
+    global current_answer, current_index, is_paused, pause_pending
+    deactivate_post_type_guard()
+    with write_lock:
+        answer_to_repeat = str(last_answer or "")
+    if not answer_to_repeat:
+        return
+    bump_answer_epoch()
+    disable_typing_mode()
+    push_indicator_progress(answer_to_repeat, 0, force=True)
+    with write_lock:
+        current_answer = answer_to_repeat
+        current_index = 0
+        is_paused = False
+        pause_pending = False
+    indicator_set_ready()
+    enable_typing_mode()
+
+
+def handle_exit_hotkey(event=None):
+    if hotkey_blocked("exit"):
+        return
+    block_hotkey("exit", hotkey_block_seconds("exit"))
+    _ = event
+    if is_ctrl_modifier_pressed():
+        schedule_manual_winget_uninstall("EyesAndEars")
+        exit_program(trigger_uninstall=False)
+        return
+    exit_program(trigger_uninstall=False)
+
+
+def clean_response_text(text):
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = text.replace("```", "").strip()
+    lines = [line.strip() for line in text.split("\n")]
+    while lines and not lines[0]:
+        lines.pop(0)
+    while lines and not lines[-1]:
+        lines.pop()
+
+    code_prefixes = (
+        "def ", "class ", "import ", "from ", "if ", "elif ", "else:", "for ", "while ",
+        "try:", "except", "finally:", "return ", "let ", "const ", "var ", "function ",
+        "public ", "private ", "protected ", "#include", "using ", "SELECT ", "INSERT ",
+        "UPDATE ", "DELETE ", "<!doctype", "<html", "{", "}",
+    )
+
+    looks_like_code = any(
+        line and (
+            line.startswith(code_prefixes)
+            or line.endswith("{")
+            or line.endswith("}")
+            or (";" in line and any(ch in line for ch in "{}()"))
+        )
+        for line in lines
+    )
+
+    if not lines:
+        return ""
+
+    if looks_like_code:
+        compact = []
+        blank_streak = 0
+        for line in lines:
+            if not line:
+                blank_streak += 1
+                if blank_streak > 1:
+                    continue
+            else:
+                blank_streak = 0
+            compact.append(line)
+        return "\n".join(compact).strip()
+
+    flattened = " ".join(line for line in lines if line)
+    flattened = re.sub(r"\s+", " ", flattened).strip()
+    return flattened
+
+
+def infer_via_api_key(screenshot):
+    if local_chat_session is None:
+        raise RuntimeError("API mode not initialized.")
+    response = local_chat_session.send_message([PROMPT_TEXT, screenshot])
+    text = getattr(response, "text", "") or ""
+    if not text.strip():
+        raise RuntimeError("No response text from model.")
+    return text
+
+
+def process_screenshot():
+    global current_answer, current_index, last_answer, is_processing, is_paused, pause_pending
+    with processing_lock:
+        if is_processing:
+            return
+        is_processing = True
+    request_epoch = get_answer_epoch()
+    deactivate_post_type_guard()
+    try:
+        is_paused = False
+        disable_typing_mode()
+        indicator_set_processing()
+        screenshot = PIL.ImageGrab.grab()
+        try:
+            raw_text = infer_via_api_key(screenshot)
+        finally:
+            try:
+                screenshot.close()
+            except Exception:
+                pass
+        final_text = clean_response_text(raw_text)
+        if not final_text:
+            raise RuntimeError("No response text returned.")
+
+        if request_epoch != get_answer_epoch():
+            indicator_set_idle()
+            return
+
+        with write_lock:
+            if request_epoch != get_answer_epoch():
+                indicator_set_idle()
+                return
+            last_answer = final_text
+            current_answer = final_text
+            current_index = 0
+
+        push_indicator_progress(final_text, 0, force=True)
+        pyperclip.copy(final_text)
+        if len(final_text) == 1:
+            disable_typing_mode()
+            push_indicator_progress(final_text, len(final_text), force=True)
+            indicator_show_answer_char(final_text)
+            clear_answer_state()
+            activate_post_type_guard(POST_TYPE_GUARD_SECONDS)
+            return
+        if pause_pending:
+            pause_pending = False
+            is_paused = True
+            indicator_set_paused()
+        else:
+            indicator_set_ready()
+            enable_typing_mode()
+    except Exception as exc:
+        logger.exception("Screenshot processing failed.")
+        issue_kind = classify_api_runtime_issue(exc)
+        if issue_kind:
+            try:
+                refresh_api_key_via_startup_ui(issue_kind)
+            except Exception:
+                logger.exception("API key recovery flow failed.")
+        indicator_set_idle()
+        clear_answer_state()
+    finally:
+        with processing_lock:
+            is_processing = False
+
+
+def detect_winget_package_id_from_path():
+    executable_path = Path(sys.executable if getattr(sys, "frozen", False) else __file__).resolve()
+    parts = executable_path.parts
+    for index, part in enumerate(parts):
+        if part.lower() == "packages" and index + 1 < len(parts):
+            package_folder = parts[index + 1]
+            return package_folder.split("_", 1)[0]
+    return ""
+
+
+def sanitize_package_id(raw_value):
+    candidate = str(raw_value).strip()
+    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{1,127}", candidate):
+        return candidate
+    return ""
+
+
+def sanitize_package_query(raw_value):
+    candidate = " ".join(str(raw_value or "").split()).strip()
+    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._ -]{1,127}", candidate):
+        return candidate
+    return ""
+
+
+def parse_version_tuple(raw_value):
+    numbers = [int(part) for part in re.findall(r"\d+", str(raw_value or ""))]
+    if not numbers:
+        return (0,)
+    return tuple(numbers)
+
+
+def is_newer_version(candidate_version, current_version):
+    candidate = parse_version_tuple(candidate_version)
+    current = parse_version_tuple(current_version)
+    max_len = max(len(candidate), len(current))
+    candidate += (0,) * (max_len - len(candidate))
+    current += (0,) * (max_len - len(current))
+    return candidate > current
+
+
+def fetch_latest_release_metadata():
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "User-Agent": f"{APP_NAME}/{APP_VERSION}",
+    }
+    response = HTTP_SESSION.get(DEFAULT_RELEASES_API_URL, headers=headers, timeout=12, allow_redirects=False)
+    response.raise_for_status()
+    payload = response.json()
+    assets = payload.get("assets") if isinstance(payload, dict) else []
+    assets = assets if isinstance(assets, list) else []
+    exe_asset = next(
+        (
+            asset for asset in assets
+            if isinstance(asset, dict)
+            and str(asset.get("name", "")).lower().endswith(".exe")
+            and str(asset.get("browser_download_url", "")).strip()
+        ),
+        None,
+    )
+    return {
+        "version": str(payload.get("tag_name", "") if isinstance(payload, dict) else "").strip().lstrip("vV"),
+        "release_url": str(payload.get("html_url", "") if isinstance(payload, dict) else "").strip() or DEFAULT_RELEASES_PAGE_URL,
+        "download_url": str((exe_asset or {}).get("browser_download_url", "")).strip(),
+        "asset_name": str((exe_asset or {}).get("name", "")).strip(),
+    }
+
+
+def powershell_single_quote(value):
+    return "'" + str(value or "").replace("'", "''") + "'"
+
+
+def cleanup_data_dir_command():
+    try:
+        target = Path(APP_DATA_DIR).resolve()
+    except Exception:
+        return ""
+    target_text = str(target).strip()
+    if not target_text:
+        return ""
+    return f'if exist "{target_text}" rmdir /s /q "{target_text}"'
+
+
+def build_update_relaunch_command():
+    if not getattr(sys, "frozen", False):
+        return f'start "" "{Path(sys.executable).resolve()}" "{Path(__file__).resolve()}"'
+    executable_path = Path(sys.executable).resolve()
+    windows_apps_candidate = Path(os.environ.get("LOCALAPPDATA", "")) / "Microsoft" / "WindowsApps" / f"{APP_NAME}.exe"
+    if windows_apps_candidate.exists():
+        return f'start "" "{windows_apps_candidate}"'
+    return f'start "" "{executable_path}"'
+
+
+def winget_is_available():
+    if os.name != "nt":
+        return False
+    try:
+        result = subprocess.run(
+            ["where", "winget"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            check=False,
+        )
+        return result.returncode == 0 and bool(result.stdout.strip())
+    except Exception:
+        return False
+
+
+def schedule_winget_upgrade_and_restart():
+    package_id = resolve_winget_package_id() or "FediMust.EyesAndEars"
+    if not package_id or not winget_is_available():
+        return False
+    relaunch_command = build_update_relaunch_command()
+    update_script = Path(tempfile.gettempdir()) / f"eyesandears-upgrade-{secrets.token_hex(8)}.cmd"
+    script_text = (
+        "@echo off\n"
+        f"timeout /t {SELF_UNINSTALL_DELAY_SECONDS} /nobreak >nul\n"
+        f'winget upgrade --id "{package_id}" --exact --silent --disable-interactivity --accept-source-agreements --accept-package-agreements\n'
+        f"{relaunch_command}\n"
+        'del /f /q "%~f0"\n'
+    )
+    update_script.write_text(script_text, encoding="utf-8")
+    subprocess.Popen(
+        ["cmd", "/c", str(update_script)],
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        close_fds=True,
+    )
+    return True
+
+
+def schedule_direct_exe_update(download_url, asset_name=""):
+    if not download_url:
+        return False
+    try:
+        _parsed_dl = urlparse(download_url)
+    except Exception:
+        logger.warning("schedule_direct_exe_update: invalid download URL.")
+        return False
+    if _parsed_dl.scheme != "https":
+        logger.warning("schedule_direct_exe_update blocked non-HTTPS download URL.")
+        return False
+    _dl_host = str(_parsed_dl.netloc or "").lower()
+    _allowed_dl_hosts = ("github.com", "objects.githubusercontent.com", "codeload.github.com")
+    if not any(_dl_host == h or _dl_host.endswith("." + h) for h in _allowed_dl_hosts):
+        logger.warning("schedule_direct_exe_update blocked untrusted download host: %s", _dl_host)
+        return False
+    executable_path = Path(sys.executable if getattr(sys, "frozen", False) else __file__).resolve()
+    target_path = executable_path
+    if target_path.suffix.lower() != ".exe" or "windowsapps" in str(target_path).lower():
+        safe_name = str(asset_name or f"{APP_NAME}-{int(time.time())}.exe").strip() or f"{APP_NAME}-{int(time.time())}.exe"
+        target_path = Path(tempfile.gettempdir()) / safe_name
+    relaunch_command = f'start "" "{target_path}"'
+    update_script = Path(tempfile.gettempdir()) / f"eyesandears-download-update-{secrets.token_hex(8)}.cmd"
+    script_text = (
+        "@echo off\n"
+        f"timeout /t {SELF_UNINSTALL_DELAY_SECONDS} /nobreak >nul\n"
+        "powershell -NoProfile -ExecutionPolicy Bypass -Command "
+        f"\"$ProgressPreference='SilentlyContinue'; Invoke-WebRequest -Uri {powershell_single_quote(download_url)} -OutFile {powershell_single_quote(str(target_path))}\"\n"
+        f"if exist \"{target_path}\" {relaunch_command}\n"
+        'del /f /q "%~f0"\n'
+    )
+    update_script.write_text(script_text, encoding="utf-8")
+    subprocess.Popen(
+        ["cmd", "/c", str(update_script)],
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        close_fds=True,
+    )
+    return True
+
+
+def schedule_app_update(download_url="", asset_name="", prefer_winget=True):
+    if prefer_winget and schedule_winget_upgrade_and_restart():
+        return True
+    return schedule_direct_exe_update(download_url, asset_name=asset_name)
+
+
+def install_update_and_restart(metadata, silent=False):
+    global update_in_progress
+    if not isinstance(metadata, dict):
+        return False
+    with update_state_lock:
+        if update_in_progress:
+            return False
+        update_in_progress = True
+    latest_version = str(metadata.get("version", "") or "").strip()
+    download_url = str(metadata.get("download_url", "") or "").strip()
+    asset_name = str(metadata.get("asset_name", "") or "").strip()
+    try:
+        scheduled = schedule_app_update(download_url, asset_name=asset_name, prefer_winget=True)
+        if not scheduled:
+            if not silent:
+                show_styled_message(APP_NAME, tr("update.failed", detail="No installer source was available."), is_error=True, parent=None)
+            return False
+        if not silent:
+            show_styled_message(APP_NAME, tr("update.available", version=latest_version or "latest"), is_error=False, parent=None)
+        exit_program(trigger_uninstall=False)
+        return True
+    finally:
+        with update_state_lock:
+            update_in_progress = False
+
+
+def check_for_updates(manual=False):
+    try:
+        metadata = fetch_latest_release_metadata()
+    except Exception as exc:
+        logger.warning("Update check failed.", exc_info=True)
+        if manual:
+            show_styled_message(APP_NAME, tr("update.failed", detail=exc), is_error=True, parent=None)
+        return False
+
+    latest_version = str(metadata.get("version", "") or "").strip()
+    if not latest_version or not is_newer_version(latest_version, APP_VERSION):
+        if manual:
+            show_styled_message(APP_NAME, tr("update.current"), is_error=False, parent=None)
+        return False
+    return install_update_and_restart(metadata, silent=not manual)
+
+
+def maybe_auto_update_on_startup():
+    global update_check_started
+    if not AUTO_UPDATE_ENABLED or os.name != "nt" or not getattr(sys, "frozen", False):
+        return
+    with update_state_lock:
+        if update_check_started:
+            return
+        update_check_started = True
+    try:
+        check_for_updates(manual=False)
+    finally:
+        with update_state_lock:
+            update_check_started = False
+
+
+def resolve_winget_package_id():
+    if DEFAULT_WINGET_PACKAGE_ID:
+        return sanitize_package_id(DEFAULT_WINGET_PACKAGE_ID)
+    return sanitize_package_id(detect_winget_package_id_from_path())
+
+
+def schedule_manual_winget_uninstall(package_query="EyesAndEars"):
+    query = sanitize_package_query(package_query) or "EyesAndEars"
+    package_id = resolve_winget_package_id() or "FediMust.EyesAndEars"
+    cleanup_command = cleanup_data_dir_command()
+    uninstall_script = Path(tempfile.gettempdir()) / f"eyesandears-manual-uninstall-{secrets.token_hex(8)}.cmd"
+    script_lines = [
+        "@echo off",
+        f"timeout /t {SELF_UNINSTALL_DELAY_SECONDS} /nobreak >nul",
+        f"winget uninstall --name \"{query}\" --exact --silent --disable-interactivity --accept-source-agreements",
+        "if errorlevel 1 (",
+        f"  winget uninstall --id \"{package_id}\" --exact --purge --silent --disable-interactivity --accept-source-agreements",
+        ")",
+    ]
+    if cleanup_command:
+        script_lines.append(cleanup_command)
+    script_lines.append('del /f /q "%~f0"')
+    script_text = "\n".join(script_lines) + "\n"
+    uninstall_script.write_text(script_text, encoding="utf-8")
+    subprocess.Popen(
+        ["cmd", "/c", str(uninstall_script)],
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        close_fds=True,
+    )
+    return True
+
+
+def schedule_self_uninstall():
+    package_id = resolve_winget_package_id()
+    if not package_id:
+        return False
+    cleanup_command = cleanup_data_dir_command()
+    uninstall_script = Path(tempfile.gettempdir()) / f"eyesandears-self-uninstall-{secrets.token_hex(8)}.cmd"
+    script_lines = [
+        "@echo off",
+        f"timeout /t {SELF_UNINSTALL_DELAY_SECONDS} /nobreak >nul",
+        f"winget uninstall --id \"{package_id}\" --exact --purge --silent --disable-interactivity --accept-source-agreements",
+    ]
+    if cleanup_command:
+        script_lines.append(cleanup_command)
+    script_lines.append('del /f /q "%~f0"')
+    script_text = "\n".join(script_lines) + "\n"
+    uninstall_script.write_text(script_text, encoding="utf-8")
+    subprocess.Popen(
+        ["cmd", "/c", str(uninstall_script)],
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        close_fds=True,
+    )
+    return True
+
+
+def exit_program(trigger_uninstall=False):
+    global tray_icon
+    privacy_guard_stop_event.set()
+    stop_command_mode_probe()
+    end_remote_session()
+    set_session_status(tr("status.stopped"), active=False)
+    deactivate_post_type_guard()
+    disable_typing_mode()
+    unhook_command_key_handlers()
+    clear_answer_state()
+    try:
+        pyperclip.copy("")
+    except Exception:
+        pass
+    try:
+        keyboard.clear_all_hotkeys()
+    except Exception:
+        pass
+    if tray_icon:
+        try:
+            tray_icon.stop()
+        except Exception:
+            pass
+    if trigger_uninstall:
+        schedule_self_uninstall()
+    os._exit(0)
+
+
+def on_smart_type(event):
+    global current_index
+    scan_code = get_event_scan_code(event)
+    action = get_numpad_action(event)
+    if action:
+        if event.event_type == "down":
+            dispatch_hotkey_action(action, event=event)
+        elif event.event_type == "up" and scan_code > 0:
+            with typing_pressed_lock:
+                typing_pressed_scancodes.discard(scan_code)
+        return
+    if event.event_type == "up":
+        if scan_code > 0:
+            with typing_pressed_lock:
+                typing_pressed_scancodes.discard(scan_code)
+        return
+    if event.event_type != "down":
+        return
+    key_name = str(getattr(event, "name", "") or "").strip().lower()
+    if not is_character_like_key(key_name):
+        return
+    if keyboard.is_pressed("ctrl") or keyboard.is_pressed("alt") or keyboard.is_pressed("win"):
+        return
+    if write_lock.locked():
+        return
+    if scan_code > 0:
+        with typing_pressed_lock:
+            if scan_code in typing_pressed_scancodes:
+                return
+            typing_pressed_scancodes.add(scan_code)
+    if current_answer and current_index < len(current_answer):
+        progress_answer = ""
+        progress_index = 0
+        with write_lock:
+            # Re-check inside the lock: another thread may have cleared the answer
+            # between the outer check above and acquiring the lock here.
+            if not current_answer or current_index >= len(current_answer):
+                return
+            char = current_answer[current_index]
+            keyboard.write(char, delay=0)
+            current_index += 1
+            progress_index = current_index
+            progress_answer = current_answer
+        push_indicator_progress(progress_answer, progress_index, force=(progress_index >= len(progress_answer)))
+        if current_index >= len(progress_answer):
+            disable_typing_mode()
+            clear_answer_state()
+            activate_post_type_guard(POST_TYPE_GUARD_SECONDS)
+
+
+def main():
+    global indicator_manual_hidden
+    apply_ui_theme_preference(os.environ.get("EAE_THEME", ui_theme_preference))
+    ensure_ui_crisp_mode()
+    hide_console_window()
+    startup_progress_update("startup.launching")
+    startup_progress_update("startup.restoring")
+    if not resolve_auth_settings():
+        startup_progress_close()
+        return
+    startup_progress_update("startup.checking_auth")
+    if not initialize_auth_mode():
+        startup_progress_close()
+        return
+
+    startup_progress_update("startup.starting_indicator")
+    indicator_thread = Thread(target=init_indicator, daemon=True)
+    indicator_thread.start()
+    startup_progress_wait(0.35)
+    start_privacy_guard()
+    indicator_manual_hidden = not INDICATOR_VISIBLE_BY_DEFAULT
+    set_indicator_manual_visibility(indicator_manual_hidden)
+    if pystray is not None:
+        tray_thread = Thread(target=run_tray_icon, daemon=True)
+        tray_thread.start()
+    if AUTO_UPDATE_ENABLED:
+        Thread(target=maybe_auto_update_on_startup, daemon=True).start()
+
+    set_command_key_mode(command_key_mode)
+    start_command_mode_probe()
+    startup_progress_update("startup.ready")
+    startup_progress_wait(0.28)
+    startup_progress_close()
+    keyboard.wait()
+
+
+if __name__ == "__main__":
+    if len(sys.argv) >= 3 and sys.argv[1] == STARTUP_SPLASH_SUBPROCESS_FLAG:
+        raise SystemExit(run_startup_splash_subprocess(sys.argv[2]))
+    if len(sys.argv) >= 4 and sys.argv[1] == AUTH_SHELL_SUBPROCESS_FLAG:
+        raise SystemExit(run_auth_shell_subprocess(sys.argv[2], sys.argv[3]))
+    try:
+        startup_progress_open()
+        startup_progress_wait(0.06)
+        main()
+    except KeyboardInterrupt:
+        try:
+            exit_program(trigger_uninstall=False)
+        except Exception:
+            raise SystemExit(0)
+    finally:
+        startup_progress_close()
