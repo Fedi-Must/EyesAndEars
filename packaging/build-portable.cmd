@@ -6,6 +6,10 @@ if "%VERSION%"=="" set VERSION=1.0.0
 set SCRIPT_DIR=%~dp0
 set ICON_PATH=%SCRIPT_DIR%assets\eyesandears.ico
 set PYTHON_CMD=
+set PYI_HIDDEN_IMPORTS=^
+ --hidden-import tkinter ^
+ --hidden-import tkinter.font ^
+ --hidden-import _tkinter
 set PYI_EXCLUDES=^
  --exclude-module pandas ^
  --exclude-module scipy ^
@@ -30,7 +34,7 @@ echo [1/4] Installing build dependencies...
 if errorlevel 1 goto :fail
 
 echo [2/4] Building single-file GUI EXE...
-%PYTHON_CMD% -m PyInstaller --noconfirm --clean --onefile --windowed --icon "%ICON_PATH%" --name EyesAndEars %PYI_EXCLUDES% "eyesandears.py"
+%PYTHON_CMD% -m PyInstaller --noconfirm --clean --onefile --windowed --icon "%ICON_PATH%" --name EyesAndEars %PYI_HIDDEN_IMPORTS% %PYI_EXCLUDES% "eyesandears.py"
 if errorlevel 1 goto :fail
 
 echo [3/4] Creating versioned release artifact...

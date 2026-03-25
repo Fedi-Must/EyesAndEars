@@ -202,7 +202,7 @@ def resolve_pywebview_start_kwargs():
     return start_kwargs
 
 APP_NAME = "EyesAndEars"
-APP_VERSION = "2.6.7"
+APP_VERSION = "2.5.0"
 STARTUP_SPLASH_READY_FILE_NAME = "ready.flag"
 STARTUP_SPLASH_READY_TIMEOUT_SECONDS = 8.0
 STARTUP_SPLASH_READY_POLL_SECONDS = 0.10
