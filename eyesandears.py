@@ -8,6 +8,7 @@ import json
 import logging
 import math
 import os
+import queue
 import re
 import secrets
 import socket
@@ -19,6 +20,7 @@ import time
 import traceback
 import webbrowser
 import atexit
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from ctypes import wintypes
@@ -70,7 +72,7 @@ class _LazyModule:
 
 
 class _LazyPILNamespace:
-    _SUPPORTED = {"Image", "ImageDraw", "ImageGrab", "ImageTk"}
+    _SUPPORTED = {"Image", "ImageDraw", "ImageFont", "ImageGrab"}
 
     def __init__(self):
         self._cache = {}
@@ -84,9 +86,6 @@ class _LazyPILNamespace:
             self._cache[name] = module
         return module
 
-
-tk = _LazyModule("tkinter")
-tkfont = _LazyModule("tkinter.font")
 keyboard = _LazyModule("keyboard")
 pyperclip = _LazyModule("pyperclip")
 PIL = _LazyPILNamespace()
@@ -202,7 +201,7 @@ def resolve_pywebview_start_kwargs():
     return start_kwargs
 
 APP_NAME = "EyesAndEars"
-APP_VERSION = "2.6.7"
+APP_VERSION = "2.7"
 STARTUP_SPLASH_READY_FILE_NAME = "ready.flag"
 STARTUP_SPLASH_READY_TIMEOUT_SECONDS = 8.0
 STARTUP_SPLASH_READY_POLL_SECONDS = 0.10
@@ -281,7 +280,23 @@ DEFAULT_SERVER_URL = HARDCODED_SERVER_URL.strip().rstrip("/")
 DEFAULT_WEBSITE_URL = os.environ.get("EAE_WEBSITE_URL", DEFAULT_SERVER_URL).strip().rstrip("/") or DEFAULT_SERVER_URL
 FREE_MODEL_NAME = "gemini-2.5-flash"
 DEFAULT_MODEL_NAME = FREE_MODEL_NAME
-DEFAULT_WINGET_PACKAGE_ID = os.environ.get("EYESANDEARS_WINGET_ID", "").strip()
+GENAI_TRANSIENT_STATUS_CODES = {500, 502, 503, 504}
+GENAI_TRANSIENT_ERROR_MARKERS = (
+    "503 unavailable",
+    "currently experiencing high demand",
+    "high demand",
+    "service unavailable",
+    "temporarily unavailable",
+    "try again later",
+    "backend error",
+    "deadline exceeded",
+    "connection reset",
+    "connection aborted",
+)
+GENAI_TRANSIENT_RETRY_ATTEMPTS = 3
+GENAI_TRANSIENT_RETRY_BASE_DELAY_SECONDS = 0.85
+GENAI_TRANSIENT_RETRY_MAX_DELAY_SECONDS = 3.5
+DEFAULT_WINGET_PACKAGE_ID = os.environ.get("EYESANDEARS_WINGET_ID", "FediMust.EyesAndEars").strip()
 DEFAULT_RELEASE_REPO = os.environ.get("EYESANDEARS_RELEASE_REPO", "Fedi-Must/EyesAndEars").strip() or "Fedi-Must/EyesAndEars"
 DEFAULT_RELEASES_API_URL = os.environ.get(
     "EYESANDEARS_RELEASES_API_URL",
@@ -468,6 +483,7 @@ ALLOWED_HOTKEY_BINDINGS = {
     "f11": {"scan_code": 87, "keypad": None, "label": "F11"},
     "f12": {"scan_code": 88, "keypad": None, "label": "F12"},
 }
+RESERVED_SYSTEM_HOTKEY_BINDINGS = {"tab", "f4", "escape"}
 DEFAULT_HOTKEY_MODE = "numpad"
 POST_TYPE_GUARD_SECONDS = ANSWER_PREVIEW_RETENTION_SECONDS
 
@@ -493,8 +509,15 @@ typing_pressed_lock = Lock()
 progress_ui_lock = Lock()
 progress_ui_last_update = 0.0
 progress_ui_last_index = -1
-PROGRESS_UI_MIN_INTERVAL = 0.035
-PROGRESS_UI_MIN_STEP = 2
+# Coalesce UI progress updates so typing stays responsive on long answers.
+PROGRESS_UI_MIN_INTERVAL = 0.11
+PROGRESS_UI_MIN_STEP = 12
+indicator_progress_lock = Lock()
+indicator_progress_pending_text = ""
+indicator_progress_pending_index = 0
+indicator_progress_dispatch_scheduled = False
+indicator_dispatch_queue = queue.SimpleQueue()
+indicator_state_lock = Lock()
 PROCESS_SNAPSHOT_CACHE_SECONDS = 30.0
 
 auth_mode = "account"
@@ -527,8 +550,13 @@ update_metadata_cache_at = 0.0
 tray_icon = None
 indicator = None
 indicator_ready_event = Event()
+indicator_runtime_active = False
+indicator_runtime_hidden = True
 privacy_guard_thread = None
+privacy_process_thread = None
 privacy_guard_stop_event = Event()
+privacy_process_state_lock = Lock()
+privacy_required_by_process = False
 privacy_forced_hidden = False
 indicator_manual_hidden = False
 indicator_capture_protected = False
@@ -632,6 +660,12 @@ INDICATOR_PREVIEW_POINTS = {
 }
 INDICATOR_MARGIN_X = 10
 INDICATOR_MARGIN_Y = 50
+INDICATOR_PANEL_MAX_HEIGHT_RATIO = 0.72
+INDICATOR_PANEL_SCROLL_LINES = 3
+INDICATOR_TYPING_PANEL_RENDER_MIN_INTERVAL = 0.16
+INDICATOR_TYPING_PANEL_RENDER_MIN_STEP = 24
+INDICATOR_TYPING_HIGHLIGHT_MAX_CHARS = 420
+INDICATOR_NATIVE_HEARTBEAT_MS = 6000
 ui_crisp_mode_initialized = False
 system_dark_theme_enabled = False
 
@@ -1300,9 +1334,36 @@ def hotkey_binding_label(binding_key):
     return str(meta.get("label", "?"))
 
 
+def is_reserved_system_hotkey_binding(binding_key):
+    return str(binding_key or "").strip().lower() in RESERVED_SYSTEM_HOTKEY_BINDINGS
+
+
+def set_indicator_runtime_state(*, active=None, hidden=None):
+    global indicator_runtime_active, indicator_runtime_hidden
+    with indicator_state_lock:
+        if active is not None:
+            indicator_runtime_active = bool(active)
+        if hidden is not None:
+            indicator_runtime_hidden = bool(hidden)
+
+
+def indicator_runtime_snapshot():
+    with indicator_state_lock:
+        return bool(indicator_runtime_active), bool(indicator_runtime_hidden)
+
+
+def indicator_is_hidden():
+    active, hidden = indicator_runtime_snapshot()
+    if active:
+        return hidden
+    return bool(indicator_manual_hidden or privacy_forced_hidden)
+
+
 def canonicalize_hotkey_binding(binding_key, mode=None):
     candidate = str(binding_key or "").strip().lower()
     if not candidate:
+        return ""
+    if is_reserved_system_hotkey_binding(candidate):
         return ""
     if candidate in ALLOWED_HOTKEY_BINDINGS:
         return candidate
@@ -1346,10 +1407,18 @@ def normalize_command_hotkeys(value, mode=None):
     normalized = {}
     used = set()
     customized = False
-    remaining = [key for key in ALLOWED_HOTKEY_BINDINGS if key not in defaults.values()]
+    remaining = [
+        key
+        for key in ALLOWED_HOTKEY_BINDINGS
+        if key not in defaults.values() and not is_reserved_system_hotkey_binding(key)
+    ]
     for action in HOTKEY_ACTION_ORDER:
         candidate = canonicalize_hotkey_binding(source.get(action, ""), mode)
-        if candidate in ALLOWED_HOTKEY_BINDINGS and candidate not in used:
+        if (
+            candidate in ALLOWED_HOTKEY_BINDINGS
+            and candidate not in used
+            and not is_reserved_system_hotkey_binding(candidate)
+        ):
             normalized[action] = candidate
             used.add(candidate)
             if candidate != defaults[action]:
@@ -1925,7 +1994,21 @@ def profile_suspend_calls():
 
 if os.name == "nt":
     HRESULT = getattr(wintypes, "HRESULT", ctypes.c_long)
+    LRESULT = getattr(wintypes, "LRESULT", ctypes.c_ssize_t)
+    LONG_PTR = getattr(wintypes, "LONG_PTR", ctypes.c_ssize_t)
+    DWORD_PTR = ctypes.c_size_t
+    HINSTANCE = getattr(wintypes, "HINSTANCE", wintypes.HANDLE)
+    HICON = getattr(wintypes, "HICON", wintypes.HANDLE)
+    HCURSOR = getattr(wintypes, "HCURSOR", wintypes.HANDLE)
+    HBRUSH = getattr(wintypes, "HBRUSH", wintypes.HANDLE)
+    HMENU = getattr(wintypes, "HMENU", wintypes.HANDLE)
+    HDC = getattr(wintypes, "HDC", wintypes.HANDLE)
+    HGDIOBJ = getattr(wintypes, "HGDIOBJ", wintypes.HANDLE)
+    HBITMAP = getattr(wintypes, "HBITMAP", wintypes.HANDLE)
+    UINT_PTR = getattr(wintypes, "UINT_PTR", wintypes.WPARAM)
+    COLORREF = getattr(wintypes, "COLORREF", wintypes.DWORD)
     WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    WNDPROC = ctypes.WINFUNCTYPE(LRESULT, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)
     WDA_NONE = 0x0
     WDA_MONITOR = 0x1
     WDA_EXCLUDEFROMCAPTURE = 0x11
@@ -1937,6 +2020,179 @@ if os.name == "nt":
     DWMWCP_ROUND = 2
     DWMSBT_MAINWINDOW = 2
     DWMSBT_TRANSIENTWINDOW = 3
+    CS_HREDRAW = 0x0002
+    CS_VREDRAW = 0x0001
+    CS_DBLCLKS = 0x0008
+    DIB_RGB_COLORS = 0
+    BI_RGB = 0
+    ULW_ALPHA = 0x00000002
+    AC_SRC_OVER = 0x00
+    AC_SRC_ALPHA = 0x01
+    GWL_EXSTYLE = -20
+    WS_EX_LAYERED = 0x00080000
+    WS_EX_TOPMOST = 0x00000008
+    WS_EX_TOOLWINDOW = 0x00000080
+    WS_EX_NOACTIVATE = 0x08000000
+    WS_POPUP = 0x80000000
+    CW_USEDEFAULT = 0x80000000
+    WM_DESTROY = 0x0002
+    WM_GETTEXT = 0x000D
+    WM_TIMER = 0x0113
+    WM_MOUSEMOVE = 0x0200
+    WM_MOUSELEAVE = 0x02A3
+    WM_LBUTTONDOWN = 0x0201
+    WM_LBUTTONDBLCLK = 0x0203
+    WM_MOUSEACTIVATE = 0x0021
+    WM_MOUSEWHEEL = 0x020A
+    WM_DISPLAYCHANGE = 0x007E
+    WM_SETTINGCHANGE = 0x001A
+    WM_DPICHANGED = 0x02E0
+    WM_APP = 0x8000
+    WM_CLOSE = 0x0010
+    SW_HIDE = 0
+    SW_SHOWNOACTIVATE = 4
+    MA_NOACTIVATE = 3
+    HTCLIENT = 1
+    IDC_ARROW = 32512
+    TME_LEAVE = 0x00000002
+    SRCCOPY = 0x00CC0020
+    SMTO_ABORTIFHUNG = 0x0002
+    MB_OK = 0x00000000
+    MB_ICONERROR = 0x00000010
+    MB_ICONINFORMATION = 0x00000040
+    MB_TASKMODAL = 0x00002000
+    MB_TOPMOST = 0x00040000
+    MB_SETFOREGROUND = 0x00010000
+    MB_RETRYCANCEL = 0x00000005
+    IDOK = 1
+    IDCANCEL = 2
+    IDRETRY = 4
+    TDCBF_OK_BUTTON = 0x0001
+    TDCBF_YES_BUTTON = 0x0002
+    TDCBF_NO_BUTTON = 0x0004
+    TDCBF_CANCEL_BUTTON = 0x0008
+    TDCBF_RETRY_BUTTON = 0x0010
+    TDF_ALLOW_DIALOG_CANCELLATION = 0x0008
+    TD_ERROR_ICON = ctypes.c_wchar_p(-1)
+    TD_INFORMATION_ICON = ctypes.c_wchar_p(-3)
+    HWND_TOPMOST = wintypes.HWND(-1)
+    SWP_NOMOVE = 0x0002
+    SWP_NOSIZE = 0x0001
+    SWP_NOACTIVATE = 0x0010
+    SWP_SHOWWINDOW = 0x0040
+    SWP_NOOWNERZORDER = 0x0200
+    SWP_NOSENDCHANGING = 0x0400
+    SWP_NOZORDER = 0x0004
+    THREAD_PRIORITY_BELOW_NORMAL = -1
+
+    class WNDCLASSEXW(ctypes.Structure):
+        _fields_ = [
+            ("cbSize", wintypes.UINT),
+            ("style", wintypes.UINT),
+            ("lpfnWndProc", WNDPROC),
+            ("cbClsExtra", ctypes.c_int),
+            ("cbWndExtra", ctypes.c_int),
+            ("hInstance", HINSTANCE),
+            ("hIcon", HICON),
+            ("hCursor", HCURSOR),
+            ("hbrBackground", HBRUSH),
+            ("lpszMenuName", wintypes.LPCWSTR),
+            ("lpszClassName", wintypes.LPCWSTR),
+            ("hIconSm", HICON),
+        ]
+
+    class MSG(ctypes.Structure):
+        _fields_ = [
+            ("hwnd", wintypes.HWND),
+            ("message", wintypes.UINT),
+            ("wParam", wintypes.WPARAM),
+            ("lParam", wintypes.LPARAM),
+            ("time", wintypes.DWORD),
+            ("pt", wintypes.POINT),
+            ("lPrivate", wintypes.DWORD),
+        ]
+
+    class SIZE(ctypes.Structure):
+        _fields_ = [("cx", ctypes.c_long), ("cy", ctypes.c_long)]
+
+    class BLENDFUNCTION(ctypes.Structure):
+        _fields_ = [
+            ("BlendOp", ctypes.c_byte),
+            ("BlendFlags", ctypes.c_byte),
+            ("SourceConstantAlpha", ctypes.c_byte),
+            ("AlphaFormat", ctypes.c_byte),
+        ]
+
+    class TRACKMOUSEEVENT(ctypes.Structure):
+        _fields_ = [
+            ("cbSize", wintypes.DWORD),
+            ("dwFlags", wintypes.DWORD),
+            ("hwndTrack", wintypes.HWND),
+            ("dwHoverTime", wintypes.DWORD),
+        ]
+
+    class BITMAPINFOHEADER(ctypes.Structure):
+        _fields_ = [
+            ("biSize", wintypes.DWORD),
+            ("biWidth", ctypes.c_long),
+            ("biHeight", ctypes.c_long),
+            ("biPlanes", wintypes.WORD),
+            ("biBitCount", wintypes.WORD),
+            ("biCompression", wintypes.DWORD),
+            ("biSizeImage", wintypes.DWORD),
+            ("biXPelsPerMeter", ctypes.c_long),
+            ("biYPelsPerMeter", ctypes.c_long),
+            ("biClrUsed", wintypes.DWORD),
+            ("biClrImportant", wintypes.DWORD),
+        ]
+
+    class BITMAPINFO(ctypes.Structure):
+        _fields_ = [
+            ("bmiHeader", BITMAPINFOHEADER),
+            ("bmiColors", wintypes.DWORD * 3),
+        ]
+
+    class TASKDIALOG_BUTTON(ctypes.Structure):
+        _fields_ = [
+            ("nButtonID", ctypes.c_int),
+            ("pszButtonText", wintypes.LPCWSTR),
+        ]
+
+    PFTASKDIALOGCALLBACK = ctypes.WINFUNCTYPE(
+        HRESULT,
+        wintypes.HWND,
+        wintypes.UINT,
+        wintypes.WPARAM,
+        wintypes.LPARAM,
+        LONG_PTR,
+    )
+
+    class TASKDIALOGCONFIG(ctypes.Structure):
+        _fields_ = [
+            ("cbSize", wintypes.UINT),
+            ("hwndParent", wintypes.HWND),
+            ("hInstance", wintypes.HINSTANCE),
+            ("dwFlags", wintypes.UINT),
+            ("dwCommonButtons", wintypes.UINT),
+            ("pszWindowTitle", wintypes.LPCWSTR),
+            ("union1", wintypes.LPCWSTR),
+            ("pszMainInstruction", wintypes.LPCWSTR),
+            ("pszContent", wintypes.LPCWSTR),
+            ("cButtons", wintypes.UINT),
+            ("pButtons", ctypes.POINTER(TASKDIALOG_BUTTON)),
+            ("nDefaultButton", ctypes.c_int),
+            ("cRadioButtons", wintypes.UINT),
+            ("pRadioButtons", ctypes.c_void_p),
+            ("nDefaultRadioButton", ctypes.c_int),
+            ("pszVerificationText", wintypes.LPCWSTR),
+            ("pszExpandedInformation", wintypes.LPCWSTR),
+            ("pszExpandedControlText", wintypes.LPCWSTR),
+            ("pszCollapsedControlText", wintypes.LPCWSTR),
+            ("union2", wintypes.LPCWSTR),
+            ("pfCallback", PFTASKDIALOGCALLBACK),
+            ("lpCallbackData", LONG_PTR),
+            ("cxWidth", wintypes.UINT),
+        ]
 
     class DATA_BLOB(ctypes.Structure):
         _fields_ = [
@@ -1949,6 +2205,7 @@ if os.name == "nt":
     _user32 = ctypes.windll.user32
     _dwmapi = ctypes.windll.dwmapi
     _gdi32 = ctypes.windll.gdi32
+    _comctl32 = ctypes.WinDLL("comctl32", use_last_error=True)
     _crypt32.CryptProtectData.argtypes = [
         ctypes.POINTER(DATA_BLOB),
         wintypes.LPCWSTR,
@@ -1971,12 +2228,18 @@ if os.name == "nt":
     _crypt32.CryptUnprotectData.restype = wintypes.BOOL
     _kernel32.LocalFree.argtypes = [wintypes.HLOCAL]
     _kernel32.LocalFree.restype = wintypes.HLOCAL
+    _kernel32.GetCurrentThread.argtypes = []
+    _kernel32.GetCurrentThread.restype = wintypes.HANDLE
+    _kernel32.SetThreadPriority.argtypes = [wintypes.HANDLE, ctypes.c_int]
+    _kernel32.SetThreadPriority.restype = wintypes.BOOL
     _user32.SetWindowDisplayAffinity.argtypes = [wintypes.HWND, wintypes.DWORD]
     _user32.SetWindowDisplayAffinity.restype = wintypes.BOOL
     _user32.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
     _user32.GetAncestor.restype = wintypes.HWND
     _user32.GetForegroundWindow.argtypes = []
     _user32.GetForegroundWindow.restype = wintypes.HWND
+    _user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
+    _user32.GetAsyncKeyState.restype = ctypes.c_short
     _user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
     _user32.GetWindowTextW.restype = ctypes.c_int
     _user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
@@ -2005,8 +2268,73 @@ if os.name == "nt":
     _user32.ReleaseCapture.restype = wintypes.BOOL
     _user32.SendMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
     _user32.SendMessageW.restype = wintypes.LPARAM
+    _user32.SendMessageTimeoutW.argtypes = [
+        wintypes.HWND,
+        wintypes.UINT,
+        wintypes.WPARAM,
+        ctypes.c_void_p,
+        wintypes.UINT,
+        wintypes.UINT,
+        ctypes.POINTER(DWORD_PTR),
+    ]
+    _user32.SendMessageTimeoutW.restype = DWORD_PTR
     _user32.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
     _user32.PostMessageW.restype = wintypes.BOOL
+    _user32.RegisterClassExW.argtypes = [ctypes.POINTER(WNDCLASSEXW)]
+    _user32.RegisterClassExW.restype = wintypes.ATOM
+    _user32.CreateWindowExW.argtypes = [
+        wintypes.DWORD,
+        wintypes.LPCWSTR,
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        wintypes.HWND,
+        HMENU,
+        HINSTANCE,
+        wintypes.LPVOID,
+    ]
+    _user32.CreateWindowExW.restype = wintypes.HWND
+    _user32.DefWindowProcW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+    _user32.DefWindowProcW.restype = LRESULT
+    _user32.DestroyWindow.argtypes = [wintypes.HWND]
+    _user32.DestroyWindow.restype = wintypes.BOOL
+    _user32.GetMessageW.argtypes = [ctypes.POINTER(MSG), wintypes.HWND, wintypes.UINT, wintypes.UINT]
+    _user32.GetMessageW.restype = wintypes.BOOL
+    _user32.TranslateMessage.argtypes = [ctypes.POINTER(MSG)]
+    _user32.TranslateMessage.restype = wintypes.BOOL
+    _user32.DispatchMessageW.argtypes = [ctypes.POINTER(MSG)]
+    _user32.DispatchMessageW.restype = LRESULT
+    _user32.PostQuitMessage.argtypes = [ctypes.c_int]
+    _user32.PostQuitMessage.restype = None
+    _user32.UpdateLayeredWindow.argtypes = [
+        wintypes.HWND,
+        HDC,
+        ctypes.POINTER(wintypes.POINT),
+        ctypes.POINTER(SIZE),
+        HDC,
+        ctypes.POINTER(wintypes.POINT),
+        COLORREF,
+        ctypes.POINTER(BLENDFUNCTION),
+        wintypes.DWORD,
+    ]
+    _user32.UpdateLayeredWindow.restype = wintypes.BOOL
+    _user32.GetDC.argtypes = [wintypes.HWND]
+    _user32.GetDC.restype = HDC
+    _user32.LoadCursorW.argtypes = [HINSTANCE, wintypes.LPCWSTR]
+    _user32.LoadCursorW.restype = HCURSOR
+    _user32.TrackMouseEvent.argtypes = [ctypes.POINTER(TRACKMOUSEEVENT)]
+    _user32.TrackMouseEvent.restype = wintypes.BOOL
+    _user32.SetTimer.argtypes = [wintypes.HWND, UINT_PTR, wintypes.UINT, ctypes.c_void_p]
+    _user32.SetTimer.restype = UINT_PTR
+    _user32.KillTimer.argtypes = [wintypes.HWND, UINT_PTR]
+    _user32.KillTimer.restype = wintypes.BOOL
+    _user32.GetDoubleClickTime.argtypes = []
+    _user32.GetDoubleClickTime.restype = wintypes.UINT
+    _user32.MessageBoxW.argtypes = [wintypes.HWND, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.UINT]
+    _user32.MessageBoxW.restype = ctypes.c_int
     _user32.SetWindowRgn.argtypes = [wintypes.HWND, wintypes.HANDLE, wintypes.BOOL]
     _user32.SetWindowRgn.restype = ctypes.c_int
     _dwmapi.DwmSetWindowAttribute.argtypes = [
@@ -2032,8 +2360,30 @@ if os.name == "nt":
         ctypes.c_int,
     ]
     _gdi32.CreateEllipticRgn.restype = wintypes.HANDLE
+    _gdi32.CreateCompatibleDC.argtypes = [HDC]
+    _gdi32.CreateCompatibleDC.restype = HDC
+    _gdi32.DeleteDC.argtypes = [HDC]
+    _gdi32.DeleteDC.restype = wintypes.BOOL
+    _gdi32.SelectObject.argtypes = [HDC, HGDIOBJ]
+    _gdi32.SelectObject.restype = HGDIOBJ
+    _gdi32.CreateDIBSection.argtypes = [
+        HDC,
+        ctypes.POINTER(BITMAPINFO),
+        wintypes.UINT,
+        ctypes.POINTER(ctypes.c_void_p),
+        wintypes.HANDLE,
+        wintypes.DWORD,
+    ]
+    _gdi32.CreateDIBSection.restype = HBITMAP
     _gdi32.DeleteObject.argtypes = [wintypes.HANDLE]
     _gdi32.DeleteObject.restype = wintypes.BOOL
+    _comctl32.TaskDialogIndirect.argtypes = [
+        ctypes.POINTER(TASKDIALOGCONFIG),
+        ctypes.POINTER(ctypes.c_int),
+        ctypes.POINTER(ctypes.c_int),
+        ctypes.POINTER(wintypes.BOOL),
+    ]
+    _comctl32.TaskDialogIndirect.restype = HRESULT
 
 
 def hide_console_window():
@@ -2045,6 +2395,20 @@ def hide_console_window():
             ctypes.windll.user32.ShowWindow(console_window, SW_HIDE)
     except Exception:
         pass
+
+
+def set_current_thread_low_priority():
+    if os.name != "nt":
+        return False
+    try:
+        return bool(
+            _kernel32.SetThreadPriority(
+                _kernel32.GetCurrentThread(),
+                THREAD_PRIORITY_BELOW_NORMAL,
+            )
+        )
+    except Exception:
+        return False
 
 
 def ensure_ui_crisp_mode():
@@ -2069,17 +2433,344 @@ def ensure_ui_crisp_mode():
         pass
 
 
-def apply_tk_scaling(window):
-    if window is None:
-        return
+_image_font_cache = {}
+_image_measure_cache = OrderedDict()
+_image_measure_cache_lock = Lock()
+
+
+def ordered_cache_get(cache, key, lock=None):
+    if lock is None:
+        value = cache.get(key)
+        if value is not None and hasattr(cache, "move_to_end"):
+            try:
+                cache.move_to_end(key)
+            except Exception:
+                pass
+        return value
+    with lock:
+        value = cache.get(key)
+        if value is not None and hasattr(cache, "move_to_end"):
+            try:
+                cache.move_to_end(key)
+            except Exception:
+                pass
+        return value
+
+
+def ordered_cache_set(cache, key, value, max_items, lock=None):
+    if lock is None:
+        cache[key] = value
+        if hasattr(cache, "move_to_end"):
+            try:
+                cache.move_to_end(key)
+            except Exception:
+                pass
+        while len(cache) > int(max_items):
+            try:
+                if hasattr(cache, "popitem"):
+                    cache.popitem(last=False)
+                else:
+                    cache.pop(next(iter(cache)))
+            except Exception:
+                break
+        return value
+    with lock:
+        cache[key] = value
+        if hasattr(cache, "move_to_end"):
+            try:
+                cache.move_to_end(key)
+            except Exception:
+                pass
+        while len(cache) > int(max_items):
+            try:
+                if hasattr(cache, "popitem"):
+                    cache.popitem(last=False)
+                else:
+                    cache.pop(next(iter(cache)))
+            except Exception:
+                break
+    return value
+
+
+def _safe_text(value):
+    return str(value or "")
+
+
+def resolve_dialog_owner_hwnd(parent=None):
+    if os.name != "nt" or parent is None:
+        return None
+    candidates = [
+        getattr(parent, "hwnd", None),
+        getattr(parent, "_hwnd", None),
+        getattr(parent, "handle", None),
+    ]
+    for candidate in candidates:
+        try:
+            normalized = int(candidate or 0)
+        except Exception:
+            normalized = 0
+        if normalized:
+            return wintypes.HWND(normalized)
     try:
-        dpi = float(window.winfo_fpixels("1i"))
-        if dpi <= 0:
-            return
-        scale = max(1.0, dpi / 72.0)
-        window.tk.call("tk", "scaling", scale)
+        normalized = int(parent or 0)
     except Exception:
-        pass
+        normalized = 0
+    return wintypes.HWND(normalized) if normalized else None
+
+
+def _show_task_dialog(title, heading, message, is_error=False, ask_retry=False, parent=None):
+    if os.name != "nt":
+        return None
+    try:
+        owner = resolve_dialog_owner_hwnd(parent)
+        config = TASKDIALOGCONFIG()
+        config.cbSize = ctypes.sizeof(TASKDIALOGCONFIG)
+        config.hwndParent = owner
+        config.dwFlags = TDF_ALLOW_DIALOG_CANCELLATION
+        config.dwCommonButtons = 0
+        config.pszWindowTitle = _safe_text(title) or APP_NAME
+        config.pszMainInstruction = _safe_text(heading)
+        config.pszContent = _safe_text(message)
+        config.union1 = TD_ERROR_ICON if is_error else TD_INFORMATION_ICON
+        button_storage = None
+        if ask_retry:
+            button_storage = (TASKDIALOG_BUTTON * 2)()
+            button_storage[0] = TASKDIALOG_BUTTON(IDRETRY, tr("dialog.retry_login"))
+            button_storage[1] = TASKDIALOG_BUTTON(IDCANCEL, tr("dialog.quit"))
+            config.cButtons = 2
+            config.pButtons = button_storage
+            config.nDefaultButton = IDRETRY
+        else:
+            config.dwCommonButtons = TDCBF_OK_BUTTON
+            config.nDefaultButton = IDOK
+        selected = ctypes.c_int(0)
+        verified = wintypes.BOOL(False)
+        result = _comctl32.TaskDialogIndirect(
+            ctypes.byref(config),
+            ctypes.byref(selected),
+            None,
+            ctypes.byref(verified),
+        )
+        if int(result) < 0:
+            return None
+        return bool(int(selected.value) == IDRETRY) if ask_retry else False
+    except Exception:
+        return None
+
+
+def show_native_dialog(title, message, is_error=False, ask_retry=False, parent=None):
+    heading = tr("dialog.heading.retry") if ask_retry else (tr("dialog.heading.error") if is_error else tr("dialog.heading.info"))
+    task_result = _show_task_dialog(title, heading, message, is_error=is_error, ask_retry=ask_retry, parent=parent)
+    if task_result is not None:
+        return bool(task_result)
+    if os.name != "nt":
+        return False
+    flags = MB_TOPMOST | MB_TASKMODAL | MB_SETFOREGROUND
+    flags |= MB_ICONERROR if is_error else MB_ICONINFORMATION
+    if ask_retry:
+        flags |= MB_RETRYCANCEL
+        response = _user32.MessageBoxW(resolve_dialog_owner_hwnd(parent), _safe_text(message), _safe_text(title) or APP_NAME, flags)
+        return int(response) == IDRETRY
+    _user32.MessageBoxW(resolve_dialog_owner_hwnd(parent), _safe_text(message), _safe_text(title) or APP_NAME, flags | MB_OK)
+    return False
+
+
+def webview_required_message(context_label="this screen"):
+    label = str(context_label or "this screen").strip() or "this screen"
+    return f"Microsoft Edge WebView2 is required to open {label}. Install the WebView2 Runtime and try again."
+
+
+def get_ui_image_font(size, bold=False):
+    size_key = int(max(8, round(float(size or 10))))
+    cache_key = (size_key, bool(bold))
+    cached = _image_font_cache.get(cache_key)
+    if cached is not None:
+        return cached
+    font = None
+    if os.name == "nt":
+        font_dir = Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts"
+        candidates = ["segoeuib.ttf", "arialbd.ttf"] if bold else ["segoeui.ttf", "arial.ttf"]
+        for filename in candidates:
+            try:
+                candidate_path = font_dir / filename
+                if candidate_path.exists():
+                    font = PIL.ImageFont.truetype(str(candidate_path), size=size_key)
+                    break
+            except Exception:
+                continue
+    if font is None:
+        try:
+            font = PIL.ImageFont.load_default()
+        except Exception:
+            font = None
+    _image_font_cache[cache_key] = font
+    return font
+
+
+def image_font_line_height(font):
+    if font is None:
+        return 14
+    try:
+        ascent, descent = font.getmetrics()
+        return max(12, int(ascent + descent + 2))
+    except Exception:
+        try:
+            bbox = font.getbbox("Ag")
+            return max(12, int(bbox[3] - bbox[1] + 2))
+        except Exception:
+            return 14
+
+
+def measure_image_text_width(font, text):
+    if not text:
+        return 0
+    cache_key = (id(font), str(text))
+    cached = ordered_cache_get(_image_measure_cache, cache_key, lock=_image_measure_cache_lock)
+    if cached is not None:
+        return cached
+    try:
+        bbox = font.getbbox(str(text))
+        width = max(0, int(bbox[2] - bbox[0]))
+    except Exception:
+        width = max(0, len(str(text)) * 8)
+    ordered_cache_set(_image_measure_cache, cache_key, width, 4096, lock=_image_measure_cache_lock)
+    return width
+
+
+def layout_wrapped_text(text, font, max_width, spacing=4):
+    value = str(text or "")
+    normalized_width = max(80, int(max_width or 80))
+    cache_key = (value, id(font), normalized_width, int(max(0, spacing)))
+    cached = ordered_cache_get(_image_measure_cache, ("layout",) + cache_key, lock=_image_measure_cache_lock)
+    if cached is not None:
+        return cached
+
+    line_height = image_font_line_height(font)
+    lines = []
+    cursor = 0
+    paragraphs = value.split("\n")
+    for paragraph_index, paragraph in enumerate(paragraphs):
+        paragraph_start = cursor
+        paragraph_end = paragraph_start + len(paragraph)
+        if not paragraph:
+            lines.append({"text": "", "start": paragraph_start, "end": paragraph_start, "width": 0})
+        else:
+            index = 0
+            while index < len(paragraph):
+                probe = index + 1
+                best_end = index + 1
+                last_break = -1
+                while probe <= len(paragraph):
+                    segment = paragraph[index:probe]
+                    if measure_image_text_width(font, segment) <= normalized_width:
+                        best_end = probe
+                        if probe < len(paragraph) and paragraph[probe - 1].isspace():
+                            last_break = probe
+                        probe += 1
+                        continue
+                    break
+                end = best_end
+                if end < len(paragraph) and last_break > index:
+                    end = last_break
+                if end <= index:
+                    end = index + 1
+                line_text = paragraph[index:end].rstrip()
+                line_start = paragraph_start + index
+                line_end = paragraph_start + end
+                lines.append(
+                    {
+                        "text": line_text,
+                        "start": line_start,
+                        "end": line_end,
+                        "width": measure_image_text_width(font, line_text),
+                    }
+                )
+                index = end
+                while index < len(paragraph) and paragraph[index].isspace():
+                    if paragraph[index] == "\n":
+                        break
+                    index += 1
+        cursor = paragraph_end + (1 if paragraph_index < (len(paragraphs) - 1) else 0)
+    if not lines:
+        lines.append({"text": "", "start": 0, "end": 0, "width": 0})
+    max_line_width = max((int(item["width"]) for item in lines), default=0)
+    layout = {
+        "lines": lines,
+        "line_height": line_height,
+        "spacing": int(max(0, spacing)),
+        "width": int(max_line_width),
+        "height": int((line_height * len(lines)) + (max(0, len(lines) - 1) * int(max(0, spacing)))),
+    }
+    ordered_cache_set(_image_measure_cache, ("layout",) + cache_key, layout, 4096, lock=_image_measure_cache_lock)
+    return layout
+
+
+def update_layered_window_image(hwnd, image, x, y):
+    if os.name != "nt":
+        return False
+    try:
+        normalized_hwnd = int(hwnd or 0)
+        if not normalized_hwnd:
+            return False
+        rgba = image.convert("RGBA")
+        width_px, height_px = rgba.size
+        if width_px <= 0 or height_px <= 0:
+            return False
+        screen_dc = _user32.GetDC(None)
+        if not screen_dc:
+            return False
+        mem_dc = _gdi32.CreateCompatibleDC(screen_dc)
+        if not mem_dc:
+            _user32.ReleaseDC(None, screen_dc)
+            return False
+        bmi = BITMAPINFO()
+        bmi.bmiHeader.biSize = ctypes.sizeof(BITMAPINFOHEADER)
+        bmi.bmiHeader.biWidth = int(width_px)
+        bmi.bmiHeader.biHeight = -int(height_px)
+        bmi.bmiHeader.biPlanes = 1
+        bmi.bmiHeader.biBitCount = 32
+        bmi.bmiHeader.biCompression = BI_RGB
+        bmi.bmiHeader.biSizeImage = int(width_px * height_px * 4)
+        pixel_buffer = ctypes.c_void_p()
+        bitmap = _gdi32.CreateDIBSection(screen_dc, ctypes.byref(bmi), DIB_RGB_COLORS, ctypes.byref(pixel_buffer), None, 0)
+        if not bitmap:
+            _gdi32.DeleteDC(mem_dc)
+            _user32.ReleaseDC(None, screen_dc)
+            return False
+        old_bitmap = _gdi32.SelectObject(mem_dc, bitmap)
+        try:
+            raw = rgba.tobytes("raw", "BGRA")
+            ctypes.memmove(pixel_buffer, raw, len(raw))
+            dst_point = wintypes.POINT(int(x), int(y))
+            src_point = wintypes.POINT(0, 0)
+            size = SIZE(int(width_px), int(height_px))
+            blend = BLENDFUNCTION(AC_SRC_OVER, 0, 255, AC_SRC_ALPHA)
+            return bool(
+                _user32.UpdateLayeredWindow(
+                    wintypes.HWND(normalized_hwnd),
+                    screen_dc,
+                    ctypes.byref(dst_point),
+                    ctypes.byref(size),
+                    mem_dc,
+                    ctypes.byref(src_point),
+                    0,
+                    ctypes.byref(blend),
+                    ULW_ALPHA,
+                )
+            )
+        finally:
+            if old_bitmap:
+                _gdi32.SelectObject(mem_dc, old_bitmap)
+            _gdi32.DeleteObject(bitmap)
+            _gdi32.DeleteDC(mem_dc)
+            _user32.ReleaseDC(None, screen_dc)
+    except Exception:
+        logger.debug("Layered window image update failed.", exc_info=True)
+        return False
+
+
+def apply_tk_scaling(window):
+    return
 
 
 def get_work_area_bounds(screen_width, screen_height):
@@ -2207,16 +2898,7 @@ def set_window_capture_excluded(hwnd, enabled=True):
 
 
 def apply_capture_privacy_to_window(window, enabled=True):
-    if os.name != "nt" or window is None:
-        return False
-    try:
-        if not window.winfo_exists():
-            return False
-        window.update_idletasks()
-        return set_window_capture_excluded(window.winfo_id(), enabled=enabled)
-    except Exception:
-        logger.debug("Window capture privacy application failed.", exc_info=True)
-        return False
+    return False
 
 
 def is_capture_privacy_active():
@@ -2224,67 +2906,15 @@ def is_capture_privacy_active():
 
 
 def schedule_window_privacy_refresh(window, refresh_ms=1800):
-    if os.name != "nt" or window is None:
-        return
-    if getattr(window, "_eae_privacy_refresh_enabled", False):
-        return
-    window._eae_privacy_refresh_enabled = True
-    window._eae_privacy_refresh_after_id = None
-
-    def _cancel(_event=None):
-        after_id = getattr(window, "_eae_privacy_refresh_after_id", None)
-        if after_id:
-            try:
-                window.after_cancel(after_id)
-            except Exception:
-                pass
-        window._eae_privacy_refresh_after_id = None
-
-    def _tick():
-        try:
-            if not window.winfo_exists():
-                return
-            apply_capture_privacy_to_window(window, enabled=is_capture_privacy_active())
-            window._eae_privacy_refresh_after_id = window.after(refresh_ms, _tick)
-        except Exception:
-            pass
-
-    try:
-        window.bind("<Destroy>", _cancel, add="+")
-    except Exception:
-        pass
-    try:
-        window._eae_privacy_refresh_after_id = window.after(80, _tick)
-    except Exception:
-        pass
+    return
 
 
 def configure_private_window(window, *, dark=False, translucent=False, refresh_ms=1800):
-    apply_win11_window_style(window, dark=dark, translucent=translucent)
-    apply_capture_privacy_to_window(window, enabled=is_capture_privacy_active())
-    schedule_window_privacy_refresh(window, refresh_ms=refresh_ms)
+    return
 
 
 def apply_window_corner_region(window, radius):
-    if os.name != "nt" or window is None:
-        return False
-    try:
-        if not window.winfo_exists():
-            return False
-        window.update_idletasks()
-        width = int(max(1, window.winfo_width()))
-        height = int(max(1, window.winfo_height()))
-        radius = int(max(2, min(radius, width // 2, height // 2)))
-        region = _gdi32.CreateRoundRectRgn(0, 0, width + 1, height + 1, radius * 2, radius * 2)
-        if not region:
-            return False
-        hwnd = wintypes.HWND(window.winfo_id())
-        applied = bool(_user32.SetWindowRgn(hwnd, region, True))
-        if not applied:
-            _gdi32.DeleteObject(region)
-        return applied
-    except Exception:
-        return False
+    return False
 
 
 def apply_hwnd_corner_region(hwnd, width, height, radius):
@@ -2326,148 +2956,55 @@ def apply_hwnd_corner_region(hwnd, width, height, radius):
 
 
 def draw_canvas_ellipse(canvas, x1, y1, x2, y2, **kwargs):
-    fill = kwargs.get("fill", "")
-    outline = kwargs.get("outline", "")
-    line_width = int(max(1, kwargs.get("width", 1)))
-    antialias = int(max(1, kwargs.get("antialias", 1)))
-    x1 = int(x1)
-    y1 = int(y1)
-    x2 = int(x2)
-    y2 = int(y2)
-    if x2 <= x1 or y2 <= y1:
-        return []
-
-    if antialias > 1:
-        width_px = int(max(1, x2 - x1 + 1))
-        height_px = int(max(1, y2 - y1 + 1))
-        aa_width = width_px * antialias
-        aa_height = height_px * antialias
-        aa_line = max(1, line_width * antialias)
-        cache = getattr(canvas, "_eae_ellipse_cache", None)
-        if cache is None:
-            cache = {}
-            canvas._eae_ellipse_cache = cache
-        cache_key = (width_px, height_px, fill, outline, line_width, antialias)
-        image_ref = cache.get(cache_key)
-        if image_ref is None:
-            img = PIL.Image.new("RGBA", (aa_width, aa_height), (0, 0, 0, 0))
-            drawer = PIL.ImageDraw.Draw(img)
-            shape = (0, 0, aa_width - 1, aa_height - 1)
-            if fill and outline:
-                drawer.ellipse(shape, fill=fill, outline=outline, width=aa_line)
-            elif fill:
-                drawer.ellipse(shape, fill=fill)
-            elif outline:
-                drawer.ellipse(shape, outline=outline, width=aa_line)
-            resampling = getattr(getattr(PIL.Image, "Resampling", PIL.Image), "BILINEAR", PIL.Image.BILINEAR)
-            img = img.resize((width_px, height_px), resampling)
-            image_ref = PIL.ImageTk.PhotoImage(img, master=canvas)
-            cache[cache_key] = image_ref
-            if len(cache) > 32:
-                try:
-                    cache.pop(next(iter(cache)))
-                except Exception:
-                    pass
-        refs = getattr(canvas, "_eae_image_refs", None)
-        if refs is None:
-            refs = []
-            canvas._eae_image_refs = refs
-        refs.append(image_ref)
-        return [canvas.create_image(x1, y1, image=image_ref, anchor="nw")]
-
-    return [
-        canvas.create_oval(
-            x1,
-            y1,
-            x2,
-            y2,
-            fill=fill,
-            outline=outline,
-            width=line_width,
-        )
-    ]
+    return []
 
 
 def draw_rounded_canvas_rect(canvas, x1, y1, x2, y2, radius, **kwargs):
-    fill = kwargs.get("fill", "")
-    outline = kwargs.get("outline", "")
-    line_width = int(max(1, kwargs.get("width", 1)))
-    antialias = int(max(1, kwargs.get("antialias", 1)))
-    x1 = int(x1)
-    y1 = int(y1)
-    x2 = int(x2)
-    y2 = int(y2)
-    if x2 <= x1 or y2 <= y1:
-        return []
+    return []
 
-    radius = int(max(0, min(radius, (x2 - x1) // 2, (y2 - y1) // 2)))
-    if antialias > 1:
-        width_px = int(max(1, x2 - x1 + 1))
-        height_px = int(max(1, y2 - y1 + 1))
-        aa_width = width_px * antialias
-        aa_height = height_px * antialias
-        aa_radius = radius * antialias
-        aa_line = max(1, line_width * antialias)
-        cache = getattr(canvas, "_eae_rr_cache", None)
-        if cache is None:
-            cache = {}
-            canvas._eae_rr_cache = cache
-        cache_key = (width_px, height_px, radius, fill, outline, line_width, antialias)
-        image_ref = cache.get(cache_key)
-        if image_ref is None:
-            img = PIL.Image.new("RGBA", (aa_width, aa_height), (0, 0, 0, 0))
-            drawer = PIL.ImageDraw.Draw(img)
-            shape = (0, 0, aa_width - 1, aa_height - 1)
-            if fill and outline:
-                drawer.rounded_rectangle(shape, radius=aa_radius, fill=fill, outline=outline, width=aa_line)
-            elif fill:
-                drawer.rounded_rectangle(shape, radius=aa_radius, fill=fill)
-            elif outline:
-                drawer.rounded_rectangle(shape, radius=aa_radius, outline=outline, width=aa_line)
-            resampling = getattr(getattr(PIL.Image, "Resampling", PIL.Image), "BILINEAR", PIL.Image.BILINEAR)
-            img = img.resize((width_px, height_px), resampling)
-            image_ref = PIL.ImageTk.PhotoImage(img, master=canvas)
-            cache[cache_key] = image_ref
-            if len(cache) > 32:
-                try:
-                    cache.pop(next(iter(cache)))
-                except Exception:
-                    pass
-        refs = getattr(canvas, "_eae_image_refs", None)
-        if refs is None:
-            refs = []
-            canvas._eae_image_refs = refs
-        refs.append(image_ref)
-        return [canvas.create_image(x1, y1, image=image_ref, anchor="nw")]
 
-    def _draw_fill(rx1, ry1, rx2, ry2, rr, color):
-        if rr <= 0:
-            return [canvas.create_rectangle(rx1, ry1, rx2, ry2, fill=color, outline="")]
-        items = []
-        items.append(canvas.create_rectangle(rx1 + rr, ry1, rx2 - rr, ry2, fill=color, outline=""))
-        items.append(canvas.create_rectangle(rx1, ry1 + rr, rx2, ry2 - rr, fill=color, outline=""))
-        items.append(canvas.create_arc(rx1, ry1, rx1 + rr * 2, ry1 + rr * 2, start=90, extent=90, style=tk.PIESLICE, fill=color, outline=""))
-        items.append(canvas.create_arc(rx2 - rr * 2, ry1, rx2, ry1 + rr * 2, start=0, extent=90, style=tk.PIESLICE, fill=color, outline=""))
-        items.append(canvas.create_arc(rx1, ry2 - rr * 2, rx1 + rr * 2, ry2, start=180, extent=90, style=tk.PIESLICE, fill=color, outline=""))
-        items.append(canvas.create_arc(rx2 - rr * 2, ry2 - rr * 2, rx2, ry2, start=270, extent=90, style=tk.PIESLICE, fill=color, outline=""))
-        return items
-
-    items = []
-    if fill:
-        items.extend(_draw_fill(x1, y1, x2, y2, radius, fill))
-    if outline:
-        if radius <= 0:
-            items.append(canvas.create_rectangle(x1, y1, x2, y2, outline=outline, width=line_width))
-        else:
-            items.append(canvas.create_arc(x1, y1, x1 + radius * 2, y1 + radius * 2, start=90, extent=90, style=tk.ARC, outline=outline, width=line_width))
-            items.append(canvas.create_arc(x2 - radius * 2, y1, x2, y1 + radius * 2, start=0, extent=90, style=tk.ARC, outline=outline, width=line_width))
-            items.append(canvas.create_arc(x1, y2 - radius * 2, x1 + radius * 2, y2, start=180, extent=90, style=tk.ARC, outline=outline, width=line_width))
-            items.append(canvas.create_arc(x2 - radius * 2, y2 - radius * 2, x2, y2, start=270, extent=90, style=tk.ARC, outline=outline, width=line_width))
-            items.append(canvas.create_line(x1 + radius, y1, x2 - radius, y1, fill=outline, width=line_width))
-            items.append(canvas.create_line(x1 + radius, y2, x2 - radius, y2, fill=outline, width=line_width))
-            items.append(canvas.create_line(x1, y1 + radius, x1, y2 - radius, fill=outline, width=line_width))
-            items.append(canvas.create_line(x2, y1 + radius, x2, y2 - radius, fill=outline, width=line_width))
-    return items
+def apply_hwnd_win11_window_style(hwnd, dark=False, translucent=False):
+    if os.name != "nt":
+        return False
+    try:
+        normalized_hwnd = int(hwnd or 0)
+        if not normalized_hwnd:
+            return False
+        top_level = int(_user32.GetAncestor(wintypes.HWND(normalized_hwnd), GA_ROOT) or 0)
+        if top_level:
+            normalized_hwnd = top_level
+        hwnd_ref = wintypes.HWND(normalized_hwnd)
+        rounded = ctypes.c_int(DWMWCP_ROUND)
+        backdrop = ctypes.c_int(DWMSBT_TRANSIENTWINDOW if translucent else DWMSBT_MAINWINDOW)
+        mica_enabled = ctypes.c_int(1 if translucent else 0)
+        dark_mode = ctypes.c_int(1 if dark else 0)
+        _dwmapi.DwmSetWindowAttribute(
+            hwnd_ref,
+            DWMWA_WINDOW_CORNER_PREFERENCE,
+            ctypes.byref(rounded),
+            ctypes.sizeof(rounded),
+        )
+        _dwmapi.DwmSetWindowAttribute(
+            hwnd_ref,
+            DWMWA_SYSTEMBACKDROP_TYPE,
+            ctypes.byref(backdrop),
+            ctypes.sizeof(backdrop),
+        )
+        _dwmapi.DwmSetWindowAttribute(
+            hwnd_ref,
+            DWMWA_MICA_EFFECT,
+            ctypes.byref(mica_enabled),
+            ctypes.sizeof(mica_enabled),
+        )
+        _dwmapi.DwmSetWindowAttribute(
+            hwnd_ref,
+            DWMWA_USE_IMMERSIVE_DARK_MODE,
+            ctypes.byref(dark_mode),
+            ctypes.sizeof(dark_mode),
+        )
+        return True
+    except Exception:
+        return False
 
 
 def apply_win11_window_style(window, dark=False, translucent=False):
@@ -2475,35 +3012,7 @@ def apply_win11_window_style(window, dark=False, translucent=False):
         return
     try:
         window.update_idletasks()
-        hwnd = wintypes.HWND(window.winfo_id())
-        rounded = ctypes.c_int(DWMWCP_ROUND)
-        backdrop = ctypes.c_int(DWMSBT_TRANSIENTWINDOW if translucent else DWMSBT_MAINWINDOW)
-        mica_enabled = ctypes.c_int(1 if translucent else 0)
-        dark_mode = ctypes.c_int(1 if dark else 0)
-        _dwmapi.DwmSetWindowAttribute(
-            hwnd,
-            DWMWA_WINDOW_CORNER_PREFERENCE,
-            ctypes.byref(rounded),
-            ctypes.sizeof(rounded),
-        )
-        _dwmapi.DwmSetWindowAttribute(
-            hwnd,
-            DWMWA_SYSTEMBACKDROP_TYPE,
-            ctypes.byref(backdrop),
-            ctypes.sizeof(backdrop),
-        )
-        _dwmapi.DwmSetWindowAttribute(
-            hwnd,
-            DWMWA_MICA_EFFECT,
-            ctypes.byref(mica_enabled),
-            ctypes.sizeof(mica_enabled),
-        )
-        _dwmapi.DwmSetWindowAttribute(
-            hwnd,
-            DWMWA_USE_IMMERSIVE_DARK_MODE,
-            ctypes.byref(dark_mode),
-            ctypes.sizeof(dark_mode),
-        )
+        apply_hwnd_win11_window_style(window.winfo_id(), dark=dark, translucent=translucent)
     except Exception:
         pass
 
@@ -3088,159 +3597,27 @@ def sync_local_pro_auth_lockout(now_epoch, server_message, time_source=""):
 
 
 def center_window(window, width, height):
-    window.update_idletasks()
-    screen_width = window.winfo_screenwidth()
-    screen_height = window.winfo_screenheight()
-    max_width = max(360, screen_width - 24)
-    max_height = max(280, screen_height - 56)
-    width = int(max(320, min(int(width), max_width)))
-    height = int(max(240, min(int(height), max_height)))
-    x = max(0, (screen_width - width) // 2)
-    y = max(0, (screen_height - height) // 2)
-    window.geometry(f"{width}x{height}+{x}+{y}")
+    return
 
 
 def fit_window_to_content(window, min_width=0, min_height=0, max_width=0, max_height=0):
-    try:
-        window.update_idletasks()
-        target_width = max(int(min_width), int(window.winfo_width()), int(window.winfo_reqwidth()))
-        target_height = max(int(min_height), int(window.winfo_height()), int(window.winfo_reqheight()))
-        if max_width:
-            target_width = min(target_width, int(max_width))
-        if max_height:
-            target_height = min(target_height, int(max_height))
-        center_window(window, target_width, target_height)
-    except Exception:
-        pass
+    return
 
 
 def make_dialog_shell(title, width, height, parent=None):
-    ensure_ui_crisp_mode()
-    root = tk.Toplevel(parent) if parent else tk.Tk()
-    apply_tk_scaling(root)
-    root.title(title)
-    root.configure(bg=UI_BG)
-    center_window(root, width, height)
-    screen_width = root.winfo_screenwidth()
-    screen_height = root.winfo_screenheight()
-    min_width = min(max(420, min(width, 960)), max(320, screen_width - 24))
-    min_height = min(max(280, min(height, 860)), max(240, screen_height - 56))
-    root.minsize(min_width, min_height)
-    root.resizable(True, True)
-    configure_private_window(root, dark=system_dark_theme_enabled, translucent=True)
-    try:
-        root.attributes("-alpha", 0.985)
-    except Exception:
-        pass
-    if parent:
-        try:
-            root.transient(parent)
-        except Exception:
-            pass
-    root.lift()
-    try:
-        root.attributes("-topmost", True)
-        root.after(250, lambda: root.attributes("-topmost", False))
-    except Exception:
-        pass
-
-    shell = tk.Frame(root, bg=UI_BG, bd=0)
-    shell.pack(fill="both", expand=True, padx=18, pady=16)
-
-    accent = tk.Frame(shell, bg=UI_ACCENT, height=5, bd=0)
-    accent.pack(fill="x", pady=(0, 10))
-
-    card = tk.Frame(
-        shell,
-        bg=UI_CARD_BG,
-        highlightbackground=UI_BORDER,
-        highlightthickness=1,
-        bd=0,
-    )
-    card.pack(fill="both", expand=True)
-    return root, card
+    raise RuntimeError("Tk dialog shell is no longer available.")
 
 
 def apply_widget_corner_region(widget, radius=12):
-    if os.name != "nt" or widget is None:
-        return False
-    try:
-        if not widget.winfo_exists():
-            return False
-        widget.update_idletasks()
-        width = int(max(1, widget.winfo_width()))
-        height = int(max(1, widget.winfo_height()))
-        if width <= 2 or height <= 2:
-            return False
-        radius = int(max(2, min(radius, width // 2, height // 2)))
-        region = _gdi32.CreateRoundRectRgn(0, 0, width + 1, height + 1, radius * 2, radius * 2)
-        if not region:
-            return False
-        hwnd = wintypes.HWND(widget.winfo_id())
-        applied = bool(_user32.SetWindowRgn(hwnd, region, True))
-        if not applied:
-            _gdi32.DeleteObject(region)
-        return applied
-    except Exception:
-        return False
+    return False
 
 
 def schedule_widget_rounding(widget, radius=12):
-    if os.name != "nt" or widget is None:
-        return
-    widget._eae_round_radius = int(max(2, radius))
-
-    def _apply(_event=None):
-        try:
-            if widget.winfo_exists():
-                apply_widget_corner_region(widget, int(getattr(widget, "_eae_round_radius", radius)))
-        except Exception:
-            pass
-
-    if not getattr(widget, "_eae_round_bound", False):
-        try:
-            widget.bind("<Configure>", _apply, add="+")
-            widget._eae_round_bound = True
-        except Exception:
-            pass
-    try:
-        widget.after(16, _apply)
-    except Exception:
-        pass
+    return
 
 
 def style_button(widget, *, primary=False, active=False):
-    if primary:
-        widget.configure(
-            bg=UI_PRIMARY,
-            fg="white",
-            activebackground=UI_PRIMARY_ACTIVE,
-            activeforeground="white",
-            highlightbackground=UI_PRIMARY,
-            highlightcolor=UI_PRIMARY,
-        )
-        schedule_widget_rounding(widget, radius=14)
-        return
-    if active:
-        widget.configure(
-            bg=UI_SOFT,
-            fg=UI_TEXT,
-            activebackground=UI_SOFT,
-            activeforeground=UI_TEXT,
-            highlightbackground=UI_SOFT,
-            highlightcolor=UI_SOFT,
-        )
-        schedule_widget_rounding(widget, radius=14)
-        return
-    widget.configure(
-        bg=UI_GHOST_BG,
-        fg=UI_TEXT,
-        activebackground=UI_GHOST_ACTIVE,
-        activeforeground=UI_TEXT,
-        highlightbackground=UI_BORDER,
-        highlightcolor=UI_BORDER,
-    )
-    schedule_widget_rounding(widget, radius=14)
+    return
 
 
 STARTUP_PROGRESS_STAGE_ORDER = [
@@ -3823,6 +4200,31 @@ def run_startup_splash_subprocess(state_path):
                 return 1
             bridge.bind_window(window)
 
+            def _on_window_shown(*_args, **_kwargs):
+                try:
+                    splash_hwnd = resolve_webview_window_hwnd(window, title=tr("startup.title"), timeout_seconds=0.0)
+                    if splash_hwnd and is_capture_privacy_active():
+                        set_window_capture_excluded(splash_hwnd, enabled=True)
+                except Exception:
+                    logger.debug("Could not apply startup splash capture privacy.", exc_info=True)
+                try:
+                    place_startup_splash_window(
+                        window,
+                        tr("startup.title"),
+                        splash_x,
+                        splash_y,
+                        splash_width,
+                        splash_height,
+                    )
+                except Exception:
+                    logger.debug("Could not position startup splash window after show.", exc_info=True)
+                bridge.notify_ready()
+
+            try:
+                window.events.shown += _on_window_shown
+            except Exception:
+                pass
+
             def _prepare(window_obj):
                 def _close_watcher():
                     last_hidden = False
@@ -3877,10 +4279,6 @@ def run_startup_splash_subprocess(state_path):
                 try:
                     profile_mark("startup_splash.window_show")
                     window_obj.show()
-                    if is_capture_privacy_active():
-                        splash_hwnd = resolve_webview_window_hwnd(window_obj, title=tr("startup.title"), timeout_seconds=1.5)
-                        if splash_hwnd:
-                            set_window_capture_excluded(splash_hwnd, enabled=True)
                     place_startup_splash_window(
                         window_obj,
                         tr("startup.title"),
@@ -3888,8 +4286,6 @@ def run_startup_splash_subprocess(state_path):
                         splash_y,
                         splash_width,
                         splash_height,
-                        attempts=5,
-                        delay_seconds=0.05,
                     )
                     bridge.notify_ready()
                 except Exception:
@@ -4087,6 +4483,8 @@ def startup_progress_open():
     with startup_progress_lock:
         if not startup_loading_screen_enabled:
             return None
+        if not has_pywebview_support():
+            return None
         if startup_progress_window is None:
             env_theme_raw = os.environ.get("EAE_THEME", "").strip()
             if env_theme_raw:
@@ -4169,122 +4567,7 @@ def run_startup_background_task(task, stage_key=None, interval_seconds=0.10):
 
 
 def show_styled_message(title, message, is_error=False, ask_retry=False, parent=None):
-    result = {"value": False}
-    message_text = str(message or "")
-    base_height = 320 if ask_retry else 290
-    line_count = message_text.count("\n") + 1
-    estimated_height = min(620, base_height + max(0, line_count - 4) * 18 + max(0, len(message_text) - 180) // 15)
-    root, card = make_dialog_shell(title, 640, estimated_height, parent=parent)
-
-    heading = tr("dialog.heading.retry") if ask_retry else (tr("dialog.heading.error") if is_error else tr("dialog.heading.info"))
-    heading_color = UI_DANGER if is_error else UI_TEXT
-
-    header = tk.Frame(card, bg=UI_CARD_BG, bd=0)
-    header.pack(fill="x", padx=30, pady=(26, 12))
-    tk.Label(header, text=heading, bg=UI_CARD_BG, fg=heading_color, font=(UI_FONT, 22, "bold")).pack(anchor="w")
-
-    content = tk.Frame(card, bg=UI_PANEL_BG, highlightbackground=UI_BORDER, highlightthickness=1, bd=0)
-    content.pack(fill="both", expand=True, padx=30, pady=(0, 14))
-
-    badge = tk.Frame(content, bg=UI_GLASS, bd=0)
-    badge.pack(anchor="w", padx=16, pady=(16, 0))
-    badge_label = tk.Label(
-        badge,
-        text=APP_NAME,
-        bg=UI_GLASS,
-        fg="#DCE8FF",
-        font=(UI_FONT, 9, "bold"),
-        padx=10,
-        pady=6,
-    )
-    badge_label.pack()
-    schedule_widget_rounding(badge, radius=14)
-
-    message_label = tk.Label(
-        content,
-        text=message_text,
-        bg=UI_PANEL_BG,
-        fg=UI_TEXT,
-        font=(UI_FONT, 11),
-        justify="left",
-        wraplength=540,
-    )
-    message_label.pack(anchor="w", padx=16, pady=(12, 16))
-
-    button_bar = tk.Frame(card, bg=UI_CARD_BG, bd=0)
-    button_bar.pack(fill="x", padx=30, pady=(0, 24))
-
-    def close_with(value=False):
-        result["value"] = value
-        root.destroy()
-
-    if ask_retry:
-        exit_btn = tk.Button(
-            button_bar,
-            text=tr("dialog.quit"),
-            command=lambda: close_with(False),
-            relief="flat",
-            bd=0,
-            padx=18,
-            pady=10,
-            font=(UI_FONT, 10, "bold"),
-            cursor="hand2",
-        )
-        style_button(exit_btn, primary=False)
-        exit_btn.pack(side="right")
-
-        retry_btn = tk.Button(
-            button_bar,
-            text=tr("dialog.retry_login"),
-            command=lambda: close_with(True),
-            relief="flat",
-            bd=0,
-            padx=18,
-            pady=10,
-            font=(UI_FONT, 10, "bold"),
-            cursor="hand2",
-        )
-        style_button(retry_btn, primary=True)
-        retry_btn.pack(side="right", padx=(0, 10))
-    else:
-        close_btn = tk.Button(
-            button_bar,
-            text=tr("dialog.ok"),
-            command=lambda: close_with(False),
-            relief="flat",
-            bd=0,
-            padx=20,
-            pady=10,
-            font=(UI_FONT, 10, "bold"),
-            cursor="hand2",
-        )
-        style_button(close_btn, primary=True)
-        close_btn.pack(side="right")
-
-    fit_window_to_content(root, min_width=620, min_height=estimated_height, max_width=860, max_height=640)
-    root.minsize(560, 300)
-    root.maxsize(max(660, root.winfo_screenwidth() - 24), max(360, root.winfo_screenheight() - 56))
-
-    def _refresh_wrap(_event=None):
-        wrap = max(340, root.winfo_width() - 110)
-        try:
-            message_label.configure(wraplength=wrap)
-        except Exception:
-            pass
-
-    root.bind("<Configure>", _refresh_wrap, add="+")
-    root.after(30, _refresh_wrap)
-    root.protocol("WM_DELETE_WINDOW", lambda: close_with(False))
-    root.bind("<Escape>", lambda _event: close_with(False))
-    if parent:
-        try:
-            root.grab_set()
-            parent.wait_window(root)
-        except Exception:
-            pass
-    else:
-        root.mainloop()
-    return bool(result["value"])
+    return show_native_dialog(title, message, is_error=is_error, ask_retry=ask_retry, parent=parent)
 
 
 WEBVIEW_RESIZE_HIT_TESTS = {
@@ -4346,16 +4629,73 @@ def get_top_level_window_handle(hwnd):
     return 0
 
 
-def get_window_title(hwnd):
+def get_window_text_safe(hwnd, timeout_ms=50, max_chars=512):
     if os.name != "nt":
         return ""
     try:
-        title_buffer = ctypes.create_unicode_buffer(512)
-        if _user32.GetWindowTextW(wintypes.HWND(int(hwnd)), title_buffer, len(title_buffer)) <= 0:
+        normalized_hwnd = int(hwnd or 0)
+        if not normalized_hwnd:
             return ""
-        return str(title_buffer.value or "").strip()
+        buffer = ctypes.create_unicode_buffer(max(2, int(max_chars or 512)))
+        result = DWORD_PTR()
+        success = _user32.SendMessageTimeoutW(
+            wintypes.HWND(normalized_hwnd),
+            WM_GETTEXT,
+            wintypes.WPARAM(len(buffer)),
+            ctypes.cast(buffer, ctypes.c_void_p),
+            SMTO_ABORTIFHUNG,
+            max(1, int(timeout_ms or 50)),
+            ctypes.byref(result),
+        )
+        if not success:
+            return ""
+        return str(buffer.value or "").strip()
     except Exception:
         return ""
+
+
+def get_window_title(hwnd):
+    return get_window_text_safe(hwnd, timeout_ms=50, max_chars=512)
+
+
+def cache_webview_window_hwnd(window, hwnd):
+    try:
+        normalized = int(hwnd or 0)
+    except Exception:
+        normalized = 0
+    if not normalized or not is_valid_window_handle(normalized):
+        return 0
+    try:
+        setattr(window, "_eae_hwnd_cache", int(normalized))
+    except Exception:
+        pass
+    return int(normalized)
+
+
+def get_cached_webview_window_hwnd(window):
+    try:
+        cached = int(getattr(window, "_eae_hwnd_cache", 0) or 0)
+    except Exception:
+        cached = 0
+    if cached and is_valid_window_handle(cached):
+        return int(cached)
+    return 0
+
+
+def capture_webview_window_hwnd(window, title=""):
+    hwnd = get_cached_webview_window_hwnd(window)
+    if hwnd:
+        return int(hwnd)
+    hwnd = extract_native_window_handle(window, max_depth=3)
+    if not hwnd:
+        hwnd = extract_native_window_handle(getattr(window, "native", None), max_depth=4)
+    if not hwnd:
+        hwnd = find_webview_window_hwnd(title or getattr(window, "title", ""), process_id=os.getpid())
+    if hwnd:
+        hwnd = get_top_level_window_handle(hwnd) or int(hwnd)
+    if hwnd and is_valid_window_handle(hwnd):
+        return cache_webview_window_hwnd(window, hwnd)
+    return 0
 
 
 def extract_native_window_handle(obj, max_depth=2):
@@ -4436,16 +4776,13 @@ def find_webview_window_hwnd(title, process_id=None):
 def resolve_webview_window_hwnd(window, title="", timeout_seconds=0.0):
     if os.name != "nt":
         return 0
+    hwnd = capture_webview_window_hwnd(window, title=title)
+    if hwnd or float(timeout_seconds or 0.0) <= 0.0:
+        return int(hwnd or 0)
     deadline = time.monotonic() + max(0.0, float(timeout_seconds or 0.0))
     while True:
-        hwnd = extract_native_window_handle(window, max_depth=3)
-        if not hwnd:
-            hwnd = extract_native_window_handle(getattr(window, "native", None), max_depth=4)
-        if not hwnd:
-            hwnd = find_webview_window_hwnd(title or getattr(window, "title", ""), process_id=os.getpid())
+        hwnd = capture_webview_window_hwnd(window, title=title)
         if hwnd:
-            hwnd = get_top_level_window_handle(hwnd) or int(hwnd)
-        if hwnd and is_valid_window_handle(hwnd):
             return int(hwnd)
         if time.monotonic() >= deadline:
             return 0
@@ -4646,21 +4983,19 @@ def run_auth_shell_automated_selftest(bridge, result_path):
 
 
 def place_startup_splash_window(window, title, x, y, width, height, attempts=5, delay_seconds=0.05):
-    applied = False
     normalized_title = str(title or "").strip()
-    for _attempt in range(max(1, int(attempts or 1))):
-        hwnd = resolve_webview_window_hwnd(window, title=normalized_title, timeout_seconds=0.75 if not applied else 0.18)
-        if hwnd:
-            applied = position_native_window(hwnd, x, y, width, height, on_top=True) or applied
-        if not applied:
-            try:
-                if hasattr(window, "resize"):
-                    window.resize(int(width), int(height))
-                if hasattr(window, "move"):
-                    window.move(int(x), int(y))
-            except Exception:
-                pass
-        time.sleep(max(0.0, float(delay_seconds or 0.0)))
+    applied = False
+    hwnd = resolve_webview_window_hwnd(window, title=normalized_title, timeout_seconds=0.0)
+    if hwnd:
+        applied = bool(position_native_window(hwnd, x, y, width, height, on_top=True))
+    if not applied:
+        try:
+            if hasattr(window, "resize"):
+                window.resize(int(width), int(height))
+            if hasattr(window, "move"):
+                window.move(int(x), int(y))
+        except Exception:
+            pass
     return applied
 
 class AuthShellBridge:
@@ -4681,13 +5016,15 @@ class AuthShellBridge:
         self._drag_window_size = (0, 0)
         self._drag_hwnd = 0
         self._drag_last_position = None
+        self._corner_refresh_lock = Lock()
+        self._corner_refresh_timer = None
 
     def bind_window(self, window):
         self._window = window
         try:
             if self._window is not None:
                 self._window.events.closed += self._on_closed
-                self._window.events.shown += self._on_window_geometry_changed
+                self._window.events.shown += self._on_window_shown
                 self._window.events.maximized += self._on_window_maximized
                 self._window.events.resized += self._on_window_geometry_changed
                 self._window.events.restored += self._on_window_geometry_changed
@@ -4703,30 +5040,90 @@ class AuthShellBridge:
         return self._result
 
     def _on_closed(self, *args, **kwargs):
+        self._cancel_corner_refresh_timer()
         self._window = None
         self._done.set()
 
-    def _on_window_geometry_changed(self, *args, **kwargs):
+    def _capture_hwnd(self):
+        if self._window is None:
+            return 0
+        hwnd = capture_webview_window_hwnd(
+            self._window,
+            title=getattr(self._window, "title", ""),
+        )
+        if hwnd:
+            self._hwnd_cache = int(hwnd)
+            return int(hwnd)
+        return 0
+
+    def _cancel_corner_refresh_timer(self):
+        with self._corner_refresh_lock:
+            timer = self._corner_refresh_timer
+            self._corner_refresh_timer = None
+        if timer is not None:
+            try:
+                timer.cancel()
+            except Exception:
+                pass
+
+    def schedule_native_corner_refresh(self, delay_ms=100, immediate=False):
+        if immediate:
+            self._cancel_corner_refresh_timer()
+            try:
+                self.refresh_native_corners()
+            except Exception:
+                pass
+            return
+
+        timer = None
+
+        def _run():
+            with self._corner_refresh_lock:
+                if self._corner_refresh_timer is not timer:
+                    return
+                self._corner_refresh_timer = None
+            try:
+                self.refresh_native_corners()
+            except Exception:
+                pass
+
+        new_timer = threading.Timer(max(0.01, float(delay_ms or 100) / 1000.0), _run)
+        new_timer.daemon = True
+        with self._corner_refresh_lock:
+            previous = self._corner_refresh_timer
+            self._corner_refresh_timer = new_timer
+            timer = new_timer
+        if previous is not None:
+            try:
+                previous.cancel()
+            except Exception:
+                pass
+        new_timer.start()
+
+    def _on_window_shown(self, *args, **kwargs):
+        self._capture_hwnd()
+        self.schedule_native_corner_refresh(immediate=True)
         try:
-            self.refresh_native_corners()
+            self.ensure_capture_privacy()
         except Exception:
             pass
 
+    def _on_window_geometry_changed(self, *args, **kwargs):
+        self._capture_hwnd()
+        self.schedule_native_corner_refresh(delay_ms=100)
+
     def _on_window_maximized(self, *args, **kwargs):
         self._manual_maximized = True
-        try:
-            self.refresh_native_corners()
-        except Exception:
-            pass
+        self._capture_hwnd()
+        self.schedule_native_corner_refresh(immediate=True)
 
     def _get_hwnd(self):
         if is_valid_window_handle(self._hwnd_cache):
             return int(self._hwnd_cache)
-        hwnd = resolve_webview_window_hwnd(self._window, title=getattr(self._window, "title", ""), timeout_seconds=0.18)
+        hwnd = self._capture_hwnd()
         if hwnd:
             self._hwnd_cache = int(hwnd)
             return int(hwnd)
-        logger.warning("Could not resolve auth window handle for resize operations.")
         return 0
 
     def ensure_capture_privacy(self):
@@ -4817,6 +5214,7 @@ class AuthShellBridge:
             self._done.set()
             return True
         self._closing = True
+        self._cancel_corner_refresh_timer()
         window = self._window
         self._window = None
         try:
@@ -5092,7 +5490,11 @@ def build_auth_shell_html(initial_state):
         "translations": TRANSLATIONS,
         "initialState": dict(initial_state),
         "hotkeyActionIds": list(HOTKEY_ACTION_ORDER),
-        "allowedHotkeys": dict(ALLOWED_HOTKEY_BINDINGS),
+        "allowedHotkeys": {
+            key: dict(value)
+            for key, value in ALLOWED_HOTKEY_BINDINGS.items()
+            if not is_reserved_system_hotkey_binding(key)
+        },
         "defaultNumpadHotkeys": get_default_command_hotkeys("numpad"),
         "sizeIds": list(INDICATOR_BLOB_SIZES.keys()),
         "positionIds": list(INDICATOR_POSITIONS.keys()),
@@ -7449,419 +7851,8 @@ def build_auth_shell_html(initial_state):
 
 
 def prompt_account_auth_dialog_tk(initial_email="", initial_password="", initial_blob_size="medium", initial_error="", allow_cancel=False):
-    result = {"value": None}
-    root, card = make_dialog_shell(tr("auth.window_title"), 860, 760)
-    root.minsize(720, 620)
-    center_window(root, 860, 760)
-    remembered_password = ""
-    if not str(initial_password or "") and remember_me_enabled:
-        remembered_password = load_saved_secret(
-            load_config_record(),
-            "remembered_password",
-            "remembered_password_dpapi",
-            persist_migration=False,
-        )
-
-    language_var = tk.StringVar(value=normalize_language(ui_language))
-    theme_var = tk.StringVar(value=normalize_theme_preference(ui_theme_preference))
-    blob_size_var = tk.StringVar(value=normalize_indicator_blob_size(initial_blob_size))
-    position_var = tk.StringVar(value=normalize_indicator_position(indicator_position_key))
-    startup_screen_var = tk.BooleanVar(value=bool(startup_loading_screen_enabled))
-    email_var = tk.StringVar(value=normalize_account_email(initial_email))
-    password_var = tk.StringVar(value=str(initial_password or remembered_password or ""))
-    show_password_var = tk.BooleanVar(value=False)
-    remember_me_var = tk.BooleanVar(value=bool(remember_me_enabled))
-    model_var = tk.StringVar(value=normalize_pro_model(selected_pro_model_key))
-    error_var = tk.StringVar(value=str(initial_error or ""))
-    import_preview = {"auth_snapshot": None}
-
-    wrap_labels = []
-
-    header = tk.Frame(card, bg=UI_CARD_BG, bd=0)
-    header.pack(fill="x", padx=28, pady=(24, 10))
-    title_label = tk.Label(header, text=APP_NAME, bg=UI_CARD_BG, fg=UI_TEXT, font=(UI_FONT, 30, "bold"))
-    title_label.pack(anchor="w")
-    subtitle_label = None
-
-    lang_theme_row = tk.Frame(card, bg=UI_CARD_BG, bd=0)
-    lang_theme_row.pack(fill="x", padx=28, pady=(0, 12))
-
-    language_shell = tk.Frame(lang_theme_row, bg=UI_CARD_BG, bd=0)
-    language_shell.pack(side="left")
-    language_title = tk.Label(language_shell, text="", bg=UI_CARD_BG, fg=UI_MUTED, font=(UI_FONT, 9, "bold"))
-    language_title.pack(anchor="w", pady=(0, 6))
-    language_buttons = {}
-    for lang_key in ("en", "fr"):
-        btn = tk.Button(
-            language_shell,
-            text=lang_key.upper(),
-            relief="flat",
-            bd=0,
-            padx=10,
-            pady=6,
-            font=(UI_FONT, 9, "bold"),
-            cursor="hand2",
-            command=lambda value=lang_key: (language_var.set(value), refresh_copy()),
-        )
-        btn.pack(side="left", padx=(0, 6))
-        language_buttons[lang_key] = btn
-
-    theme_shell = tk.Frame(lang_theme_row, bg=UI_CARD_BG, bd=0)
-    theme_shell.pack(side="right")
-    theme_title = tk.Label(theme_shell, text="", bg=UI_CARD_BG, fg=UI_MUTED, font=(UI_FONT, 9, "bold"))
-    theme_title.pack(anchor="e", pady=(0, 6))
-    theme_buttons = {}
-    theme_labels = {"light": "Light", "dark": "Dark", "system": "Auto"}
-    for theme_key in ("light", "dark", "system"):
-        btn = tk.Button(
-            theme_shell,
-            text=theme_labels[theme_key],
-            relief="flat",
-            bd=0,
-            padx=12,
-            pady=6,
-            font=(UI_FONT, 9, "bold"),
-            cursor="hand2",
-            command=lambda value=theme_key: (theme_var.set(value), refresh_copy()),
-        )
-        btn.pack(side="left", padx=(6 if theme_key != "light" else 0, 0))
-        theme_buttons[theme_key] = btn
-
-    body = tk.Frame(card, bg=UI_CARD_BG, bd=0)
-    body.pack(fill="both", expand=True, padx=28, pady=(0, 10))
-
-    account_card = tk.Frame(body, bg=UI_PANEL_BG, highlightbackground=UI_BORDER, highlightthickness=1, bd=0)
-    account_card.pack(fill="x", pady=(0, 12))
-    account_inner = tk.Frame(account_card, bg=UI_PANEL_BG, bd=0)
-    account_inner.pack(fill="both", expand=True, padx=18, pady=16)
-
-    account_title = tk.Label(account_inner, text="", bg=UI_PANEL_BG, fg=UI_TEXT, font=(UI_FONT, 12, "bold"))
-    account_title.pack(anchor="w")
-
-    email_label = tk.Label(account_inner, text="", bg=UI_PANEL_BG, fg=UI_TEXT, font=(UI_FONT, 10, "bold"))
-    email_label.pack(anchor="w", pady=(4, 6))
-    email_field = tk.Frame(account_inner, bg=UI_FIELD_BG, highlightbackground=UI_BORDER, highlightthickness=1, bd=0)
-    email_field.pack(fill="x")
-    email_entry = tk.Entry(
-        email_field,
-        textvariable=email_var,
-        bg=UI_FIELD_BG,
-        fg=UI_TEXT,
-        relief="flat",
-        bd=0,
-        insertbackground=UI_TEXT,
-        font=(UI_FONT, 11),
-    )
-    email_entry.pack(fill="x", padx=12, pady=10)
-
-    password_row = tk.Frame(account_inner, bg=UI_PANEL_BG, bd=0)
-    password_row.pack(fill="x", pady=(12, 0))
-    password_label = tk.Label(password_row, text="", bg=UI_PANEL_BG, fg=UI_TEXT, font=(UI_FONT, 10, "bold"))
-    password_label.pack(anchor="w", pady=(0, 6))
-    password_field = tk.Frame(account_inner, bg=UI_FIELD_BG, highlightbackground=UI_BORDER, highlightthickness=1, bd=0)
-    password_field.pack(fill="x")
-    password_entry = tk.Entry(
-        password_field,
-        textvariable=password_var,
-        show="*",
-        bg=UI_FIELD_BG,
-        fg=UI_TEXT,
-        relief="flat",
-        bd=0,
-        insertbackground=UI_TEXT,
-        font=(UI_FONT, 11),
-    )
-    password_entry.pack(side="left", fill="x", expand=True, padx=(12, 0), pady=10)
-    password_toggle = tk.Button(
-        password_field,
-        text="",
-        relief="flat",
-        bd=0,
-        padx=12,
-        pady=6,
-        font=(UI_FONT, 9, "bold"),
-        cursor="hand2",
-    )
-    password_toggle.pack(side="right", padx=8)
-
-    account_inline_actions = tk.Frame(account_inner, bg=UI_PANEL_BG, bd=0)
-    account_inline_actions.pack(fill="x", pady=(10, 0))
-    import_btn = tk.Button(
-        account_inline_actions,
-        text="Reset password",
-        command=lambda: webbrowser.open(f"{str(DEFAULT_WEBSITE_URL).rstrip('/')}/forgot-password.php", new=2),
-        relief="flat",
-        bd=0,
-        padx=12,
-        pady=7,
-        font=(UI_FONT, 9, "bold"),
-        cursor="hand2",
-    )
-    import_btn.pack(side="left")
-    remember_btn = tk.Button(
-        account_inline_actions,
-        text="Remember me",
-        relief="flat",
-        bd=0,
-        padx=12,
-        pady=7,
-        font=(UI_FONT, 9, "bold"),
-        cursor="hand2",
-        command=lambda: (remember_me_var.set(not remember_me_var.get()), refresh_copy()),
-    )
-    remember_btn.pack(side="left", padx=(8, 0))
-
-    account_actions = tk.Frame(account_inner, bg=UI_PANEL_BG, bd=0)
-    account_actions.pack(fill="x", pady=(10, 0))
-    reset_btn = tk.Button(
-        account_actions,
-        text="Reset password",
-        command=lambda: webbrowser.open(f"{str(DEFAULT_WEBSITE_URL).rstrip('/')}/forgot-password.php", new=2),
-        relief="flat",
-        bd=0,
-        padx=12,
-        pady=7,
-        font=(UI_FONT, 9, "bold"),
-        cursor="hand2",
-    )
-    style_button(reset_btn, primary=False)
-    reset_btn.pack(side="left", padx=(8, 0))
-
-    settings_card = tk.Frame(body, bg=UI_PANEL_BG, highlightbackground=UI_BORDER, highlightthickness=1, bd=0)
-    settings_card.pack(fill="both", expand=True)
-    settings_inner = tk.Frame(settings_card, bg=UI_PANEL_BG, bd=0)
-    settings_inner.pack(fill="both", expand=True, padx=18, pady=16)
-
-    model_label = tk.Label(settings_inner, text="", bg=UI_PANEL_BG, fg=UI_TEXT, font=(UI_FONT, 10, "bold"))
-    model_label.pack(anchor="w")
-    model_options = get_pro_model_options()
-    model_menu = tk.OptionMenu(settings_inner, model_var, *(item["id"] for item in model_options))
-    model_menu.configure(
-        relief="flat",
-        bd=0,
-        bg=UI_GHOST_BG,
-        fg=UI_TEXT,
-        activebackground=UI_GHOST_ACTIVE,
-        activeforeground=UI_TEXT,
-        highlightthickness=0,
-        font=(UI_FONT, 10),
-    )
-    model_menu.pack(fill="x", pady=(6, 0))
-    model_menu["menu"].delete(0, "end")
-    model_labels = {item["id"]: item["label"] for item in model_options}
-    for model_option in model_options:
-        model_menu["menu"].add_command(
-            label=model_option["label"],
-            command=lambda value=model_option["id"]: model_var.set(value),
-        )
-    model_note = tk.Label(settings_inner, text="", bg=UI_PANEL_BG, fg=UI_MUTED, font=(UI_FONT, 9), justify="left")
-    model_note.pack(anchor="w", pady=(6, 12))
-    wrap_labels.append(model_note)
-
-    blob_title = tk.Label(settings_inner, text="", bg=UI_PANEL_BG, fg=UI_TEXT, font=(UI_FONT, 10, "bold"))
-    blob_title.pack(anchor="w")
-    blob_button_row = tk.Frame(settings_inner, bg=UI_PANEL_BG, bd=0)
-    blob_button_row.pack(fill="x", pady=(6, 12))
-    blob_buttons = {}
-    for size_key in ("very_small", "small", "medium", "large"):
-        btn = tk.Button(
-            blob_button_row,
-            text=INDICATOR_BLOB_SIZE_LABELS[size_key],
-            relief="flat",
-            bd=0,
-            padx=12,
-            pady=8,
-            font=(UI_FONT, 9, "bold"),
-            cursor="hand2",
-            command=lambda value=size_key: (blob_size_var.set(value), refresh_copy()),
-        )
-        btn.pack(side="left", padx=(0, 8))
-        blob_buttons[size_key] = btn
-
-    position_label = tk.Label(settings_inner, text="", bg=UI_PANEL_BG, fg=UI_TEXT, font=(UI_FONT, 10, "bold"))
-    position_label.pack(anchor="w")
-    position_labels = {key: key for key in INDICATOR_POSITIONS}
-    position_menu = tk.OptionMenu(settings_inner, position_var, *INDICATOR_POSITIONS)
-    position_menu.configure(
-        relief="flat",
-        bd=0,
-        bg=UI_GHOST_BG,
-        fg=UI_TEXT,
-        activebackground=UI_GHOST_ACTIVE,
-        activeforeground=UI_TEXT,
-        highlightthickness=0,
-        font=(UI_FONT, 10),
-    )
-    position_menu.pack(fill="x", pady=(6, 12))
-
-    startup_label = tk.Label(settings_inner, text="", bg=UI_PANEL_BG, fg=UI_TEXT, font=(UI_FONT, 10, "bold"))
-    startup_label.pack(anchor="w")
-    startup_toggle_btn = tk.Button(
-        settings_inner,
-        text="",
-        command=lambda: (startup_screen_var.set(not startup_screen_var.get()), refresh_copy()),
-        relief="flat",
-        bd=0,
-        padx=12,
-        pady=8,
-        font=(UI_FONT, 9, "bold"),
-        cursor="hand2",
-    )
-    startup_toggle_btn.pack(anchor="w", pady=(6, 0))
-    startup_copy = tk.Label(settings_inner, text="", bg=UI_PANEL_BG, fg=UI_MUTED, font=(UI_FONT, 9), justify="left")
-    startup_copy.pack(anchor="w", pady=(8, 0))
-    wrap_labels.append(startup_copy)
-
-    security_copy = tk.Label(card, text="", bg=UI_CARD_BG, fg=UI_MUTED, font=(UI_FONT, 9), justify="left")
-    security_copy.pack(fill="x", padx=28, pady=(10, 4))
-    wrap_labels.append(security_copy)
-
-    error_label = tk.Label(card, textvariable=error_var, bg=UI_CARD_BG, fg=UI_DANGER, font=(UI_FONT, 10, "bold"))
-    error_label.pack(fill="x", padx=28, pady=(0, 6))
-
-    button_bar = tk.Frame(card, bg=UI_CARD_BG, bd=0)
-    button_bar.pack(fill="x", padx=28, pady=(0, 22))
-
-    def sync_wraps():
-        wrap = max(280, int(root.winfo_width()) - 110)
-        for label in wrap_labels:
-            try:
-                label.configure(wraplength=wrap)
-            except Exception:
-                pass
-
-    def toggle_password():
-        visible = not show_password_var.get()
-        show_password_var.set(visible)
-        password_entry.configure(show="" if visible else "*")
-        refresh_copy()
-
-    def close_with(value):
-        result["value"] = value
-        root.destroy()
-
-    def on_continue():
-        error_var.set("")
-        email_value = normalize_account_email(email_var.get())
-        password_value = str(password_var.get() or "")
-        if email_value and not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email_value):
-            error_var.set("Enter a valid email address.")
-            email_entry.focus_set()
-            return
-        if not email_value:
-            error_var.set("Enter your account email.")
-            email_entry.focus_set()
-            return
-        close_with({
-            "mode": "account",
-            "email": email_value,
-            "password": password_value,
-            "remember_me": bool(remember_me_var.get()),
-            "blob_size": normalize_indicator_blob_size(blob_size_var.get()),
-            "language": normalize_language(language_var.get()),
-            "theme": normalize_theme_preference(theme_var.get()),
-            "indicator_position": normalize_indicator_position(position_var.get()),
-            "show_startup_screen": bool(startup_screen_var.get()),
-            "preferred_model": normalize_pro_model(model_var.get()),
-            "pro_model": normalize_pro_model(model_var.get()),
-            "hotkeys": dict(command_hotkeys),
-            "hotkey_mode": command_key_mode,
-            "auth_snapshot": import_preview.get("auth_snapshot"),
-        })
-
-    def refresh_copy():
-        lang = normalize_language(language_var.get())
-        language_title.configure(text=tr("auth.language", language=lang))
-        for key, button in language_buttons.items():
-            button.configure(text=tr(f"lang.{key}", language=lang))
-            style_button(button, primary=(language_var.get() == key))
-        theme_title.configure(text="Theme" if lang != "fr" else "Theme")
-        for key, button in theme_buttons.items():
-            button.configure(text=theme_labels[key])
-            style_button(button, primary=(theme_var.get() == key))
-        account_title.configure(text="Login to Eyes And Ears" if lang != "fr" else "Connexion a Eyes And Ears")
-        email_label.configure(text="Email" if lang != "fr" else "Email")
-        password_label.configure(text="Password" if lang != "fr" else "Mot de passe")
-        password_toggle.configure(
-            text=("Hide" if show_password_var.get() else "Show") if lang != "fr" else ("Masquer" if show_password_var.get() else "Afficher"),
-            command=toggle_password,
-        )
-        import_btn.configure(text=tr("auth.account.reset", language=lang))
-        remember_btn.configure(text=tr("auth.account.remember", language=lang))
-        style_button(import_btn, primary=False)
-        style_button(remember_btn, primary=bool(remember_me_var.get()), active=not bool(remember_me_var.get()))
-        reset_btn.configure(text="Reset password" if lang != "fr" else "Reinitialiser le mot de passe")
-        model_label.configure(text="Preferred model" if lang != "fr" else "Modele prefere")
-        model_note.configure(
-            text=(
-                "The selected Gemini model is used for local screenshot analysis after sign-in."
-                if lang != "fr" else
-                "Le modele Gemini choisi est utilise localement pour l'analyse des captures apres connexion."
-            )
-        )
-        position_label.configure(text=tr("auth.section.indicator_position", language=lang))
-        position_menu["menu"].delete(0, "end")
-        for position_key in INDICATOR_POSITIONS:
-            position_labels[position_key] = tr(f"position.{position_key}", language=lang)
-            position_menu["menu"].add_command(
-                label=position_labels[position_key],
-                command=lambda value=position_key: position_var.set(value),
-            )
-        blob_title.configure(text=tr("auth.section.indicator_size", language=lang))
-        for size_key, button in blob_buttons.items():
-            button.configure(text=tr(f"size.{size_key}", language=lang))
-            style_button(button, primary=(blob_size_var.get() == size_key))
-        startup_label.configure(text=tr("auth.startup_screen.label", language=lang))
-        startup_copy.configure(text=tr("auth.startup_screen.copy", language=lang))
-        startup_toggle_btn.configure(
-            text=tr("auth.startup_screen.enabled", language=lang)
-            if startup_screen_var.get() else tr("auth.startup_screen.disabled", language=lang)
-        )
-        style_button(startup_toggle_btn, primary=bool(startup_screen_var.get()), active=not bool(startup_screen_var.get()))
-        security_copy.configure(text=tr("auth.security", language=lang))
-        cancel_btn.configure(text=tr("auth.cancel", language=lang))
-        continue_btn.configure(text=("Sign in" if lang != "fr" else "Se connecter"))
-        sync_wraps()
-
-    cancel_btn = tk.Button(
-        button_bar,
-        text="Cancel",
-        command=lambda: close_with(None),
-        relief="flat",
-        bd=0,
-        padx=20,
-        pady=10,
-        font=(UI_FONT, 10, "bold"),
-        cursor="hand2",
-    )
-    style_button(cancel_btn, primary=False)
-    if bool(allow_cancel):
-        cancel_btn.pack(side="left", padx=(0, 10))
-
-    continue_btn = tk.Button(
-        button_bar,
-        text="Sign in",
-        command=on_continue,
-        relief="flat",
-        bd=0,
-        padx=22,
-        pady=10,
-        font=(UI_FONT, 10, "bold"),
-        cursor="hand2",
-    )
-    style_button(continue_btn, primary=True)
-    continue_btn.pack(side="left")
-
-    button_bar.pack_configure(anchor="center")
-
-    if bool(allow_cancel):
-        root.bind("<Escape>", lambda _event: close_with(None))
-    root.bind("<Return>", lambda _event: (on_continue(), "break")[1])
-    root.bind("<Configure>", lambda _event: sync_wraps(), add="+")
-    refresh_copy()
-    email_entry.focus_set()
-    root.mainloop()
-    return result["value"]
+    show_styled_message(APP_NAME, webview_required_message("the sign-in and settings screen"), is_error=True, parent=None)
+    return None
 
 
 def build_account_auth_shell_state(initial_email="", initial_password="", initial_blob_size="medium", initial_error="", allow_cancel=False):
@@ -7925,11 +7916,11 @@ def auth_shell_window_geometry():
 def run_auth_shell_webview(initial_state):
     with profile_span("auth_shell.webview"):
         if not has_pywebview_support():
-            return {"__fallback__": "tk", "__reason__": "missing_webview"}
+            return {"__error__": "webview_required"}
 
         webview_module = get_webview_module()
         if webview_module is None:
-            return {"__fallback__": "tk", "__reason__": "missing_webview"}
+            return {"__error__": "webview_required"}
 
         bridge = AuthShellBridge()
         bridge._initial_state = dict(initial_state or {})
@@ -7953,34 +7944,19 @@ def run_auth_shell_webview(initial_state):
                 text_select=False,
             )
             if window is None:
-                return {"__fallback__": "tk", "__reason__": "window_init"}
+                return {"__error__": "window_init"}
             bridge.bind_window(window)
 
             def _prepare(window_obj, bridge_obj):
                 try:
                     profile_mark("auth_shell.window_show")
                     window_obj.show()
-                    bridge_obj._get_hwnd()
+                    bridge_obj._on_window_shown()
                 except Exception:
                     logger.warning("Could not show auth webview window.", exc_info=True)
-                    bridge_obj._result = {"__fallback__": "tk", "__reason__": "show_failed"}
+                    bridge_obj._result = {"__error__": "show_failed"}
                     bridge_obj.close()
                     return
-
-                deadline = time.time() + 1.2
-                while time.time() < deadline:
-                    if bridge_obj.refresh_native_corners():
-                        break
-                    time.sleep(0.03)
-
-                if is_capture_privacy_active():
-                    deadline = time.time() + 1.8
-                    while time.time() < deadline:
-                        if bridge_obj.ensure_capture_privacy():
-                            break
-                        time.sleep(0.05)
-                    else:
-                        logger.warning("Could not apply capture privacy to auth webview window; continuing without it.")
 
                 selftest_path = str(os.environ.get("EAE_AUTH_SHELL_SELFTEST_FILE", "") or "").strip()
                 if selftest_path:
@@ -7998,7 +7974,7 @@ def run_auth_shell_webview(initial_state):
             )
         except Exception:
             logger.warning("Webview auth shell failed.", exc_info=True)
-            return {"__fallback__": "tk", "__reason__": "webview_error"}
+            return {"__error__": "webview_error"}
 
         return bridge.result
 
@@ -8044,13 +8020,8 @@ def prompt_account_auth_dialog(initial_email="", initial_password="", initial_bl
             allow_cancel=allow_cancel,
         )
         if not has_pywebview_support():
-            return prompt_account_auth_dialog_tk(
-                initial_email=initial_email,
-                initial_password=initial_password,
-                initial_blob_size=initial_blob_size,
-                initial_error=initial_error,
-                allow_cancel=allow_cancel,
-            )
+            show_styled_message(APP_NAME, webview_required_message("the sign-in and settings screen"), is_error=True, parent=None)
+            return None
 
         with tempfile.TemporaryDirectory(prefix="eae-auth-") as temp_dir:
             request_path = Path(temp_dir) / "request.json"
@@ -8076,13 +8047,8 @@ def prompt_account_auth_dialog(initial_email="", initial_password="", initial_bl
                 completed = None
 
             if completed is None:
-                return prompt_account_auth_dialog_tk(
-                    initial_email=initial_email,
-                    initial_password=initial_password,
-                    initial_blob_size=initial_blob_size,
-                    initial_error=initial_error,
-                    allow_cancel=allow_cancel,
-                )
+                show_styled_message(APP_NAME, webview_required_message("the sign-in and settings screen"), is_error=True, parent=None)
+                return None
             if not response_path.exists():
                 if completed.returncode != 0:
                     logger.warning("Auth shell subprocess closed without a response payload; treating as cancelled.")
@@ -8098,14 +8064,9 @@ def prompt_account_auth_dialog(initial_email="", initial_password="", initial_bl
         result = payload.get("result") if isinstance(payload, dict) else None
         if isinstance(result, dict) and str(result.get("__action__", "")).strip().lower() == "exit_app":
             exit_program(trigger_uninstall=False)
-        if isinstance(result, dict) and result.get("__fallback__") == "tk":
-            return prompt_account_auth_dialog_tk(
-                initial_email=initial_email,
-                initial_password=initial_password,
-                initial_blob_size=initial_blob_size,
-                initial_error=initial_error,
-                allow_cancel=allow_cancel,
-            )
+        if isinstance(result, dict) and result.get("__error__"):
+            show_styled_message(APP_NAME, webview_required_message("the sign-in and settings screen"), is_error=True, parent=None)
+            return None
         return result
 
 
@@ -8174,7 +8135,7 @@ def open_settings_menu(hide_indicator_temporarily=False):
         settings_window_open = True
     restore_indicator_after_close = False
     try:
-        if hide_indicator_temporarily and indicator and not indicator.hidden:
+        if hide_indicator_temporarily and not indicator_is_hidden():
             restore_indicator_after_close = True
             indicator_hide()
         selected = prompt_startup_auth(
@@ -8228,7 +8189,7 @@ def open_settings_menu(hide_indicator_temporarily=False):
 
 
 def gui_show_error(message):
-    parent = indicator.root if indicator and indicator.root.winfo_exists() else None
+    parent = None
     splash = startup_progress_window
     splash_was_visible = False
     if parent is None and splash is not None:
@@ -8269,12 +8230,6 @@ def refresh_runtime_capture_privacy():
     active = is_capture_privacy_active()
     indicator_capture_protected = False
     indicator_call(lambda obj: obj.refresh_capture_privacy() if hasattr(obj, "refresh_capture_privacy") else None)
-    try:
-        window = getattr(startup_progress_window, "root", None)
-        if window is not None:
-            apply_capture_privacy_to_window(window, enabled=active)
-    except Exception:
-        pass
     if not active:
         privacy_forced_hidden = False
         if not indicator_manual_hidden:
@@ -9114,8 +9069,108 @@ class ModernGenAiSession:
 
     def send_message(self, payload):
         contents = self._coerce_payload(payload)
-        response = self.client.models.generate_content(model=self.model_name, contents=contents)
-        return _SimpleApiResponse(extract_text_from_genai_response(response))
+        last_error = None
+        request_models = build_genai_request_models(self.model_name)
+        for model_index, candidate_model in enumerate(request_models):
+            for attempt in range(1, GENAI_TRANSIENT_RETRY_ATTEMPTS + 1):
+                try:
+                    response = self.client.models.generate_content(model=candidate_model, contents=contents)
+                    if candidate_model != self.model_name:
+                        logger.warning(
+                            "Gemini request fell back from '%s' to '%s' after temporary overload.",
+                            self.model_name,
+                            candidate_model,
+                        )
+                    return _SimpleApiResponse(extract_text_from_genai_response(response))
+                except Exception as exc:
+                    last_error = exc
+                    if not is_retryable_genai_request_error(exc):
+                        raise
+                    if attempt < GENAI_TRANSIENT_RETRY_ATTEMPTS:
+                        delay_seconds = min(
+                            float(GENAI_TRANSIENT_RETRY_MAX_DELAY_SECONDS),
+                            float(GENAI_TRANSIENT_RETRY_BASE_DELAY_SECONDS) * (2 ** (attempt - 1)),
+                        )
+                        logger.warning(
+                            "Gemini request temporary failure for model '%s' (attempt %s/%s): %s",
+                            candidate_model,
+                            attempt,
+                            GENAI_TRANSIENT_RETRY_ATTEMPTS,
+                            exc,
+                        )
+                        time.sleep(delay_seconds)
+                        continue
+                    break
+            if model_index + 1 < len(request_models):
+                logger.warning(
+                    "Gemini model '%s' remained temporarily unavailable after %s attempts; trying '%s'.",
+                    candidate_model,
+                    GENAI_TRANSIENT_RETRY_ATTEMPTS,
+                    request_models[model_index + 1],
+                )
+        if last_error is not None and is_retryable_genai_request_error(last_error):
+            raise RuntimeError("Gemini is temporarily busy. Try the scan again in a few seconds.") from last_error
+        raise last_error if last_error is not None else RuntimeError("Gemini request failed.")
+
+
+def extract_api_error_status_code(error):
+    if error is None:
+        return 0
+    for attr_name in ("status_code", "code"):
+        try:
+            value = int(getattr(error, attr_name, 0) or 0)
+            if 100 <= value <= 599:
+                return value
+        except Exception:
+            pass
+    response = getattr(error, "response", None)
+    if response is not None:
+        try:
+            value = int(getattr(response, "status_code", 0) or 0)
+            if 100 <= value <= 599:
+                return value
+        except Exception:
+            pass
+    response_json = getattr(error, "response_json", None)
+    if isinstance(response_json, dict):
+        try:
+            value = int((response_json.get("error") or {}).get("code", 0) or 0)
+            if 100 <= value <= 599:
+                return value
+        except Exception:
+            pass
+    match = re.search(r"\b(500|502|503|504)\b", str(error or ""))
+    if match:
+        try:
+            return int(match.group(1))
+        except Exception:
+            return 0
+    return 0
+
+
+def is_retryable_genai_request_error(error):
+    status_code = extract_api_error_status_code(error)
+    if status_code in GENAI_TRANSIENT_STATUS_CODES:
+        return True
+    lower = str(error or "").strip().lower()
+    if not lower:
+        return False
+    return any(marker in lower for marker in GENAI_TRANSIENT_ERROR_MARKERS)
+
+
+def is_temporary_genai_busy_error(error):
+    lower = str(error or "").strip().lower()
+    if "temporarily busy" in lower or "scan again in a few seconds" in lower:
+        return True
+    return is_retryable_genai_request_error(error)
+
+
+def build_genai_request_models(primary_model):
+    ordered = []
+    for candidate in (str(primary_model or "").strip(), FREE_MODEL_NAME):
+        if candidate and candidate not in ordered:
+            ordered.append(candidate)
+    return ordered or [FREE_MODEL_NAME]
 
 
 def extract_text_from_genai_response(response):
@@ -9414,10 +9469,7 @@ def is_google_meet_window_active(pid_to_name):
         hwnd = _user32.GetForegroundWindow()
         if not hwnd:
             return False
-        title_buffer = ctypes.create_unicode_buffer(512)
-        if _user32.GetWindowTextW(hwnd, title_buffer, len(title_buffer)) <= 0:
-            return False
-        title = str(title_buffer.value or "").strip().lower()
+        title = get_window_text_safe(hwnd, timeout_ms=50, max_chars=512).lower()
         if not title or not any(keyword in title for keyword in PRIVACY_MEET_WINDOW_KEYWORDS):
             return False
         process_id = wintypes.DWORD(0)
@@ -9427,6 +9479,36 @@ def is_google_meet_window_active(pid_to_name):
         return False
 
 
+def set_privacy_required_by_process(value):
+    global privacy_required_by_process
+    with privacy_process_state_lock:
+        privacy_required_by_process = bool(value)
+
+
+def get_privacy_required_by_process():
+    with privacy_process_state_lock:
+        return bool(privacy_required_by_process)
+
+
+def privacy_process_monitor_loop():
+    set_current_thread_low_priority()
+    interval_fast = max(1.0, min(PRIVACY_GUARD_INTERVAL_SECONDS, 2.0))
+    interval_slow = max(4.0, interval_fast * 3.0)
+    wait_seconds = interval_slow
+    try:
+        while not privacy_guard_stop_event.is_set():
+            capture_process_active = False
+            if STRICT_PRIVACY_FALLBACK and is_capture_privacy_active():
+                running, pid_to_name = list_running_process_snapshot()
+                capture_process_active = bool(running.intersection(PRIVACY_GUARD_PROCESSES)) or is_google_meet_window_active(pid_to_name)
+            set_privacy_required_by_process(capture_process_active)
+            wait_seconds = interval_fast if capture_process_active else interval_slow
+            if privacy_guard_stop_event.wait(wait_seconds):
+                break
+    finally:
+        set_privacy_required_by_process(False)
+
+
 def privacy_guard_loop():
     global privacy_forced_hidden
     interval_fast = max(1.0, min(PRIVACY_GUARD_INTERVAL_SECONDS, 2.0))
@@ -9434,12 +9516,13 @@ def privacy_guard_loop():
     wait_seconds = interval_slow
     while not privacy_guard_stop_event.is_set():
         should_force_hide = False
-        capture_process_active = False
-        if STRICT_PRIVACY_FALLBACK and is_capture_privacy_active():
-            running, pid_to_name = list_running_process_snapshot()
-            capture_process_active = bool(running.intersection(PRIVACY_GUARD_PROCESSES)) or is_google_meet_window_active(pid_to_name)
-            if capture_process_active and not indicator_capture_protected:
-                should_force_hide = True
+        capture_process_active = bool(
+            STRICT_PRIVACY_FALLBACK
+            and is_capture_privacy_active()
+            and get_privacy_required_by_process()
+        )
+        if capture_process_active and not indicator_capture_protected:
+            should_force_hide = True
         wait_seconds = interval_fast if capture_process_active else interval_slow
 
         if should_force_hide != privacy_forced_hidden:
@@ -9461,34 +9544,33 @@ def privacy_guard_loop():
 
 
 def start_privacy_guard():
-    global privacy_guard_thread
+    global privacy_guard_thread, privacy_process_thread
     if os.name != "nt" or not STRICT_PRIVACY_FALLBACK:
         return
+    set_privacy_required_by_process(False)
+    privacy_guard_stop_event.clear()
+    if privacy_process_thread is None or not privacy_process_thread.is_alive():
+        privacy_process_thread = Thread(target=privacy_process_monitor_loop, daemon=True, name="privacy-process-monitor")
+        privacy_process_thread.start()
     if privacy_guard_thread is not None and privacy_guard_thread.is_alive():
         return
-    privacy_guard_stop_event.clear()
-    privacy_guard_thread = Thread(target=privacy_guard_loop, daemon=True)
+    privacy_guard_thread = Thread(target=privacy_guard_loop, daemon=True, name="privacy-guard")
     privacy_guard_thread.start()
 
 
-class StatusIndicator:
+class Win32StatusIndicator:
+    WM_DISPATCH = WM_APP + 0x431
+    TIMER_FRAME = 0x501
+    TIMER_NATIVE = 0x502
+    TIMER_COLLAPSE = 0x503
+    TIMER_CLICK = 0x504
+    TEXT_SPACING = 4
+
     def __init__(self):
         ensure_ui_crisp_mode()
-        self.root = tk.Tk()
-        apply_tk_scaling(self.root)
-        self.root.overrideredirect(True)
-        self.root.attributes("-topmost", True)
-        try:
-            self.root.attributes("-toolwindow", True)
-        except Exception:
-            pass
-        self.transparent_color = None
-        self.window_bg = "#07111A"
-        self.root.configure(bg=self.window_bg)
-
-        self.hidden = False
-        self.command_mode = str(command_key_mode).strip().lower() or "numpad"
+        self.hidden = True
         self.state = "idle"
+        self.command_mode = str(command_key_mode).strip().lower() or "numpad"
         self.current_char = ""
         self.answer_preview = ""
         self.answer_progress_index = 0
@@ -9496,50 +9578,878 @@ class StatusIndicator:
         self.cooldown_until = 0.0
         self.hover_inside = False
         self.panel_pinned = False
-        self.frame_after_id = None
-        self.collapse_after_id = None
-        self.animation_after_id = None
-        self.click_after_id = None
-        self.ready_pulse_started_at = 0.0
-        self.animation_duration_ms = 140
-        self.animation_from_width = 0
-        self.animation_from_height = 0
-        self.animation_started_at = 0.0
-        self._active_window_bg = self.window_bg
+        self.panel_scroll_offset = 0
+        self.panel_scroll_max = 0
+        self.progress_rendered_at = 0.0
+        self.progress_rendered_index = -1
+        self._thread_id = 0
+        self._thread_error = None
+        self._hwnd_ready = Event()
+        self._mouse_tracking = False
+        self._timer_delays = {}
+        self._last_render_signature = None
+        self._surface_cache = OrderedDict()
+        self._rendered_surface_cache = OrderedDict()
+        self._render_cache_lock = Lock()
+        self._render_request_lock = Lock()
+        self._render_request_event = Event()
+        self._render_stop_event = Event()
+        self._render_pending_snapshot = None
+        self._render_pending_signature = None
+        self._render_inflight_signature = None
+        self._screen_width = 1920
+        self._screen_height = 1080
+        self.hwnd = 0
+        self._class_name = f"EyesAndEarsIndicatorWindow.{os.getpid()}.{id(self)}"
+        self._wndproc = WNDPROC(self._wndproc_impl)
+        self._update_screen_metrics()
         self._apply_size_metrics()
         self.current_width = self.collapsed_width
         self.current_height = self.collapsed_height
+        self.current_x = 0
+        self.current_y = 0
         self.target_width = self.collapsed_width
         self.target_height = self.collapsed_height
-        self._last_render_signature = None
-        self._text_measure_cache = {}
-        self._surface_cache = {}
-        self.body_font = tkfont.Font(root=self.root, family=UI_FONT, size=max(9, int(round(self.base_size * 0.55))))
-        self.char_font = tkfont.Font(root=self.root, family=UI_FONT, size=max(8, int(round(self.base_size * 0.42))), weight="bold")
-        self.control_hint_text = self._build_control_hint_text()
-        self.max_panel_width = max(340, min(560, int(self.root.winfo_screenwidth() * 0.34)))
-        self.canvas = tk.Canvas(
-            self.root,
-            width=self.current_width,
-            height=self.current_height,
-            highlightthickness=0,
-            bd=0,
-            bg=self.window_bg,
+        self._render_thread = Thread(target=self._render_thread_main, daemon=True, name="indicator-render")
+        self._render_thread.start()
+        self._thread = Thread(target=self._thread_main, daemon=False, name="indicator-ui")
+        self._thread.start()
+        if not self._hwnd_ready.wait(5.0):
+            raise RuntimeError("Indicator window initialization timed out.")
+        if self._thread_error is not None:
+            raise RuntimeError("Indicator window initialization failed.") from self._thread_error
+
+    def _on_ui_thread(self):
+        return int(threading.get_ident()) == int(self._thread_id or 0)
+
+    def _enqueue(self, callback):
+        try:
+            indicator_dispatch_queue.put(callback)
+            self.wake_dispatch()
+        except Exception:
+            logger.debug("Indicator callback queueing failed.", exc_info=True)
+
+    def wake_dispatch(self):
+        try:
+            hwnd = int(self.hwnd or 0)
+        except Exception:
+            hwnd = 0
+        if hwnd:
+            try:
+                _user32.PostMessageW(wintypes.HWND(hwnd), self.WM_DISPATCH, 0, 0)
+            except Exception:
+                pass
+
+    def _clear_render_caches(self):
+        with self._render_cache_lock:
+            self._surface_cache.clear()
+            self._rendered_surface_cache.clear()
+
+    def _cache_rendered_surface(self, signature, rendered):
+        ordered_cache_set(
+            self._rendered_surface_cache,
+            signature,
+            rendered,
+            8,
+            lock=self._render_cache_lock,
         )
-        self.canvas.pack(fill="both", expand=True)
-        self.canvas.bind("<Enter>", self._on_hover_enter, add="+")
-        self.canvas.bind("<Leave>", self._on_hover_leave, add="+")
-        self.canvas.bind("<Button-1>", self._on_click_toggle)
-        self.canvas.bind("<Double-Button-1>", self._on_double_click)
-        self.root.bind("<Enter>", self._on_hover_enter, add="+")
-        self.root.bind("<Leave>", self._on_hover_leave, add="+")
-        self.root.bind("<Double-Button-1>", self._on_double_click, add="+")
-        self.root.bind("<Destroy>", self._on_destroy, add="+")
-        configure_private_window(self.root, dark=True, translucent=False, refresh_ms=1200)
-        self._set_geometry(self.collapsed_width, self.collapsed_height)
-        self._apply_window_rounding()
+
+    def _get_cached_rendered_surface(self, signature):
+        return ordered_cache_get(
+            self._rendered_surface_cache,
+            signature,
+            lock=self._render_cache_lock,
+        )
+
+    def _request_render(self, snapshot):
+        signature = snapshot.get("signature")
+        with self._render_request_lock:
+            if signature == self._render_pending_signature or signature == self._render_inflight_signature:
+                return
+            self._render_pending_snapshot = dict(snapshot)
+            self._render_pending_signature = signature
+            self._render_request_event.set()
+
+    def _update_screen_metrics(self):
+        if os.name != "nt":
+            return
+        try:
+            self._screen_width = max(640, int(ctypes.windll.user32.GetSystemMetrics(0)))
+            self._screen_height = max(480, int(ctypes.windll.user32.GetSystemMetrics(1)))
+        except Exception:
+            self._screen_width = 1920
+            self._screen_height = 1080
+
+    def _apply_size_metrics(self):
+        self.base_size = int(INDICATOR_BLOB_SIZES.get(indicator_blob_size_key, INDICATOR_BLOB_SIZES["medium"]))
+        self.collapsed_padding = max(4, int(round(self.base_size * 0.22)))
+        self.expanded_chip_padding = max(6, int(round(self.base_size * 0.24)))
+        self.collapsed_width = self.base_size + (self.collapsed_padding * 3)
+        self.collapsed_height = self.collapsed_width
+        self.panel_corner_radius = max(18, int(self.base_size * 1.05))
+        self.panel_padding = max(14, int(self.base_size * 0.78))
+        self.gap = max(12, int(self.base_size * 0.72))
+        self.chip_corner_radius = max(8, compute_indicator_chip_corner_radius(self.base_size + self.expanded_chip_padding))
+        size_key = normalize_indicator_blob_size(indicator_blob_size_key)
+        body_font_min = {
+            "very_small": 12,
+            "small": 14,
+            "medium": 15,
+            "large": 16,
+        }.get(size_key, 15)
+        char_font_min = {
+            "very_small": 10,
+            "small": 12,
+            "medium": 13,
+            "large": 14,
+        }.get(size_key, 13)
+        self.body_font = get_ui_image_font(max(body_font_min, int(round(self.base_size * 0.78))), bold=False)
+        self.char_font = get_ui_image_font(max(char_font_min, int(round(self.base_size * 0.62))), bold=True)
+        self.control_hint_text = self._build_control_hint_text()
+        self.max_panel_width = max(340, min(560, int(self._screen_width * 0.34)))
+
+    def _work_area(self):
+        return get_window_monitor_work_area(self.hwnd, self._screen_width, self._screen_height)
+
+    def _anchor_side(self):
+        layout = INDICATOR_POSITIONS.get(normalize_indicator_position(indicator_position_key), INDICATOR_POSITIONS["bottom_right"])
+        return "left" if layout["x"] == "left" else "right"
+
+    def _panel_text(self):
+        if self.answer_preview and self._panel_requested():
+            return self.answer_preview
+        if self.state == "cooldown":
+            return tr("indicator.cooldown", language=ui_language, seconds=self._cooldown_seconds_remaining())
+        return self.control_hint_text if self.state == "idle" else ""
+
+    def _build_control_hint_text(self):
+        lines = []
+        for action in HOTKEY_ACTION_ORDER:
+            lines.append(f"{hotkey_binding_label(command_hotkeys.get(action, ''))} {hotkey_action_label(action, language=ui_language)}")
+        lines.append(tr("auth.hotkey.settings", language=ui_language))
+        return "\n".join(line for line in lines if line)
+
+    def _measure_layout(self, text, wrap_width):
+        return layout_wrapped_text(text, self.body_font, wrap_width, spacing=self.TEXT_SPACING)
+
+    def _panel_requested(self):
+        return bool(self.panel_pinned or self.hover_inside)
+
+    def _desired_size(self):
+        if not self._panel_requested() or not (self.answer_preview or self.state in {"idle", "cooldown"}):
+            return self.collapsed_width, self.collapsed_height
+        chip_size = self.base_size + self.expanded_chip_padding
+        chip_space = chip_size + self.gap
+        wrap_width = max(240, min(self.max_panel_width - chip_space - (self.panel_padding * 2) - 20, 380))
+        layout = self._measure_layout(self._panel_text(), wrap_width)
+        width = int(min(self.max_panel_width, max(self.collapsed_width + 180, chip_space + wrap_width + (self.panel_padding * 2) + 18)))
+        bottom_reserve = max(18, int(self.panel_padding * 0.9)) + (18 if self.answer_preview else 0)
+        desired_height = int(max(self.collapsed_height + 44, int(layout["height"]) + (self.panel_padding * 2) + bottom_reserve))
+        work_left, work_top, work_right, work_bottom = self._work_area()
+        usable_height = max(1, int(work_bottom) - int(work_top) - (INDICATOR_MARGIN_Y * 2))
+        max_height = int(max(self.collapsed_height + 44, usable_height * INDICATOR_PANEL_MAX_HEIGHT_RATIO))
+        return width, int(min(desired_height, max_height))
+
+    def _chip_rect(self, expanded, snapshot=None):
+        source = snapshot if isinstance(snapshot, dict) else {}
+        base_size = int(source.get("base_size", self.base_size))
+        expanded_chip_padding = int(source.get("expanded_chip_padding", self.expanded_chip_padding))
+        current_width = int(source.get("current_width", self.current_width))
+        current_height = int(source.get("current_height", self.current_height))
+        panel_padding = int(source.get("panel_padding", self.panel_padding))
+        anchor_side = str(source.get("anchor_side", self._anchor_side()))
+        chip_size = max(base_size + (expanded_chip_padding if expanded else 0), base_size + 4)
+        if not expanded:
+            chip_x = max(2, int((current_width - chip_size) / 2))
+            chip_y = max(2, int((current_height - chip_size) / 2))
+            return chip_x, chip_y, chip_size
+        y = panel_padding + 2
+        x = panel_padding + 2 if anchor_side == "left" else current_width - panel_padding - chip_size - 2
+        return x, y, chip_size
+
+    def _chip_corner_radius_for_size(self, chip_size):
+        return max(4, min(int(self.chip_corner_radius), compute_indicator_chip_corner_radius(chip_size)))
+
+    def _cooldown_seconds_remaining(self):
+        if self.cooldown_until <= 0:
+            return 0
+        return max(0, int(math.ceil(self.cooldown_until - time.monotonic())))
+
+    def _display_char(self, snapshot=None):
+        source = snapshot if isinstance(snapshot, dict) else {}
+        state_name = str(source.get("state", self.state))
+        if state_name == "cooldown":
+            remaining = int(source.get("cooldown_seconds", self._cooldown_seconds_remaining()))
+            if remaining > 0:
+                return str(remaining)
+        return str(source.get("current_char", self.current_char) or "")
+
+    def _state_palette(self, state_name=None):
+        active_state = str(state_name or self.state)
+        if active_state == "processing":
+            return {"surface_fill": "#16110A", "surface_outline": "#FFB05A", "surface_inner": "#4B2D09", "chip_fill": "#FF7A00", "chip_outline": "#FFD54A", "chip_inner": "#FFF1A8", "chip_text": "#1D1103", "text": "#FFF6E8", "highlight_text": "#FFD54A", "progress_fill": "#FF9B1F", "progress_track": "#4F3310"}
+        if active_state == "cooldown":
+            return {"surface_fill": "#1A1107", "surface_outline": "#FFB347", "surface_inner": "#573211", "chip_fill": "#FF9322", "chip_outline": "#FFE08B", "chip_inner": "#FFF3BF", "chip_text": "#211304", "text": "#FFF7EC", "highlight_text": "#FFE08B", "progress_fill": "#FFB347", "progress_track": "#5A3715"}
+        if active_state == "ready":
+            return {"surface_fill": "#081810", "surface_outline": "#00F08A", "surface_inner": "#123C26", "chip_fill": "#00D85D", "chip_outline": "#8EFFB8", "chip_inner": "#D8FFE4", "chip_text": "#04120A", "text": "#ECFFF4", "highlight_text": "#8EFFB8", "progress_fill": "#00F08A", "progress_track": "#114028"}
+        if active_state == "paused":
+            return {"surface_fill": "#091421", "surface_outline": "#53A7FF", "surface_inner": "#173B62", "chip_fill": "#257DFF", "chip_outline": "#A6D2FF", "chip_inner": "#DCECFF", "chip_text": "#03111F", "text": "#EDF6FF", "highlight_text": "#A6D2FF", "progress_fill": "#53A7FF", "progress_track": "#173B62"}
+        return {"surface_fill": "#091523", "surface_outline": "#2C4765", "surface_inner": "#18324E", "chip_fill": "#567393", "chip_outline": "#BFD3E8", "chip_inner": "#E1ECF8", "chip_text": "#06111B", "text": "#EAF3FF", "highlight_text": "#D7E8FA", "progress_fill": "#7AA7D7", "progress_track": "#20344E"}
+
+    def _set_timer(self, timer_id, delay_ms):
+        if not self.hwnd:
+            return
+        self._kill_timer(timer_id)
+        normalized = max(1, int(delay_ms or 1))
+        if _user32.SetTimer(wintypes.HWND(int(self.hwnd)), int(timer_id), int(normalized), None):
+            self._timer_delays[int(timer_id)] = normalized
+
+    def _kill_timer(self, timer_id):
+        self._timer_delays.pop(int(timer_id), None)
+        if not self.hwnd:
+            return
+        try:
+            _user32.KillTimer(wintypes.HWND(int(self.hwnd)), int(timer_id))
+        except Exception:
+            pass
+
+    def _set_state(self, state_name):
+        self.state = str(state_name or "idle")
+        self._sync_size()
+        self._last_render_signature = None
+        if not self.hidden:
+            self._redraw(force=True)
+        self._schedule_frame_tick()
+
+    def _sync_size(self):
+        target_width, target_height = self._desired_size()
+        self.target_width = int(target_width)
+        self.target_height = int(target_height)
+        self._set_geometry(self.target_width, self.target_height)
+
+    def _set_geometry(self, width, height):
+        work_left, work_top, work_right, work_bottom = self._work_area()
+        max_width = max(1, int(work_right) - int(work_left) - (INDICATOR_MARGIN_X * 2))
+        max_height = max(1, int(work_bottom) - int(work_top) - (INDICATOR_MARGIN_Y * 2))
+        self.current_width = int(min(max(1, int(width)), max_width))
+        self.current_height = int(min(max(1, int(height)), max_height))
+        x, y = compute_indicator_origin(work_left, work_top, work_right, work_bottom, self.current_width, self.current_height, indicator_position_key)
+        self.current_x = int(x)
+        self.current_y = int(y)
+
+    def _apply_capture_privacy(self):
+        global indicator_capture_protected
+        if not self.hwnd:
+            indicator_capture_protected = False
+            return False
+        indicator_capture_protected = bool(set_window_capture_excluded(self.hwnd, enabled=is_capture_privacy_active()))
+        return indicator_capture_protected
+
+    def _apply_native_state(self):
+        if not self.hwnd:
+            return
+        try:
+            _user32.SetWindowPos(
+                wintypes.HWND(int(self.hwnd)),
+                HWND_TOPMOST,
+                int(self.current_x),
+                int(self.current_y),
+                int(self.current_width),
+                int(self.current_height),
+                SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_NOSENDCHANGING,
+            )
+        except Exception:
+            logger.debug("Indicator native window update failed.", exc_info=True)
         self._apply_capture_privacy()
-        self.set_idle()
+
+    def _schedule_native_tick(self):
+        if not self.hidden:
+            self._set_timer(self.TIMER_NATIVE, INDICATOR_NATIVE_HEARTBEAT_MS)
+
+    def _schedule_frame_tick(self):
+        needs_tick = bool((self.state == "cooldown" and self.cooldown_until > 0) or self.answer_preview_expires_at > 0)
+        if not needs_tick:
+            self._kill_timer(self.TIMER_FRAME)
+            return
+        delay_ms = 150 if self.state == "cooldown" else 200
+        if self.answer_preview_expires_at > 0:
+            remaining_ms = int(max(0.0, (self.answer_preview_expires_at - time.monotonic()) * 1000.0))
+            delay_ms = max(100, min(remaining_ms or delay_ms, 250))
+        self._set_timer(self.TIMER_FRAME, delay_ms)
+
+    def _frame_tick(self):
+        if self.answer_preview_expires_at > 0 and time.monotonic() >= self.answer_preview_expires_at:
+            self.clear_answer_preview()
+            return
+        if self.state == "cooldown" and self.cooldown_until > 0:
+            if time.monotonic() >= self.cooldown_until:
+                self.clear_cooldown()
+                return
+            if not self.hidden:
+                self._redraw(force=True)
+        self._schedule_frame_tick()
+
+    def _draw_chip_center_text(self, draw, text, fill, chip_x, chip_y, chip_size, font=None):
+        active_font = font or self.char_font
+        bbox = active_font.getbbox(str(text))
+        text_width = max(0, int(bbox[2] - bbox[0]))
+        text_height = max(0, int(bbox[3] - bbox[1]))
+        draw.text(
+            (
+                int(chip_x + ((chip_size - text_width) / 2)),
+                int(chip_y + ((chip_size - text_height) / 2) - bbox[1]),
+            ),
+            str(text),
+            fill=fill,
+            font=active_font,
+        )
+
+    def _build_render_snapshot(self):
+        cooldown_seconds = self._cooldown_seconds_remaining()
+        panel_requested = self._panel_requested()
+        panel_text = str(self._panel_text() or "")
+        state_name = str(self.state)
+        snapshot = {
+            "current_width": int(self.current_width),
+            "current_height": int(self.current_height),
+            "state": state_name,
+            "current_char": str(self.current_char or ""),
+            "answer_preview": str(self.answer_preview or ""),
+            "answer_progress_index": int(self.answer_progress_index),
+            "panel_scroll_offset": int(self.panel_scroll_offset),
+            "panel_pinned": bool(self.panel_pinned),
+            "hover_inside": bool(self.hover_inside),
+            "panel_requested": bool(panel_requested),
+            "panel_text": panel_text,
+            "cooldown_seconds": int(cooldown_seconds),
+            "base_size": int(self.base_size),
+            "expanded_chip_padding": int(self.expanded_chip_padding),
+            "panel_padding": int(self.panel_padding),
+            "panel_corner_radius": int(self.panel_corner_radius),
+            "chip_corner_radius": int(self.chip_corner_radius),
+            "gap": int(self.gap),
+            "body_font": self.body_font,
+            "char_font": self.char_font,
+            "anchor_side": str(self._anchor_side()),
+        }
+        snapshot["expanded"] = bool(
+            snapshot["panel_requested"]
+            and (snapshot["answer_preview"] or state_name in {"idle", "cooldown"})
+        )
+        snapshot["display_char"] = self._display_char(snapshot)
+        signature = (
+            snapshot["current_width"],
+            snapshot["current_height"],
+            snapshot["state"],
+            snapshot["current_char"],
+            snapshot["answer_preview"],
+            snapshot["panel_text"],
+            snapshot["answer_progress_index"],
+            snapshot["panel_scroll_offset"],
+            snapshot["panel_pinned"],
+            snapshot["hover_inside"],
+            snapshot["cooldown_seconds"],
+            snapshot["base_size"],
+            snapshot["expanded"],
+        )
+        snapshot["signature"] = signature
+        return snapshot
+
+    def _render_thread_main(self):
+        set_current_thread_low_priority()
+        while not self._render_stop_event.is_set():
+            if not self._render_request_event.wait(0.25):
+                continue
+            if self._render_stop_event.is_set():
+                break
+            while not self._render_stop_event.is_set():
+                with self._render_request_lock:
+                    snapshot = self._render_pending_snapshot
+                    signature = self._render_pending_signature
+                    self._render_pending_snapshot = None
+                    self._render_pending_signature = None
+                    if snapshot is None:
+                        self._render_request_event.clear()
+                        self._render_inflight_signature = None
+                        break
+                    self._render_inflight_signature = signature
+                try:
+                    rendered = self._render_image(snapshot)
+                except Exception:
+                    logger.debug("Indicator background render failed.", exc_info=True)
+                    rendered = None
+                finally:
+                    with self._render_request_lock:
+                        if self._render_inflight_signature == signature:
+                            self._render_inflight_signature = None
+                        if self._render_pending_snapshot is None:
+                            self._render_request_event.clear()
+                if rendered is None:
+                    continue
+                self._cache_rendered_surface(signature, rendered)
+                self._enqueue(lambda obj, render_signature=signature: obj._apply_render_result(render_signature))
+
+    def _render_base_surface(self, snapshot):
+        cache_key = (
+            bool(snapshot["expanded"]),
+            int(snapshot["current_width"]),
+            int(snapshot["current_height"]),
+            str(snapshot["state"]),
+            str(snapshot["display_char"]),
+            int(snapshot["base_size"]),
+            int(snapshot["expanded_chip_padding"]),
+            int(snapshot["panel_padding"]),
+            str(snapshot["anchor_side"]),
+        )
+        cached = ordered_cache_get(self._surface_cache, cache_key, lock=self._render_cache_lock)
+        if cached is not None:
+            return cached
+        expanded = bool(snapshot["expanded"])
+        palette = self._state_palette(snapshot["state"])
+        image = PIL.Image.new(
+            "RGBA",
+            (max(1, int(snapshot["current_width"])), max(1, int(snapshot["current_height"]))),
+            (0, 0, 0, 0),
+        )
+        draw = PIL.ImageDraw.Draw(image)
+        chip_x, chip_y, chip_size = self._chip_rect(expanded, snapshot=snapshot)
+        display_char = str(snapshot["display_char"] or "")
+        if expanded:
+            draw.rounded_rectangle(
+                (1, 1, int(snapshot["current_width"]) - 2, int(snapshot["current_height"]) - 2),
+                radius=int(snapshot["panel_corner_radius"]),
+                fill=palette["surface_fill"],
+                outline=palette["surface_outline"],
+                width=1,
+            )
+            draw.rounded_rectangle(
+                (2, 2, int(snapshot["current_width"]) - 3, int(snapshot["current_height"]) - 3),
+                radius=max(6, int(snapshot["panel_corner_radius"]) - 2),
+                outline=palette["surface_inner"],
+                width=1,
+            )
+        draw.rounded_rectangle((chip_x, chip_y, chip_x + chip_size - 1, chip_y + chip_size - 1), radius=self._chip_corner_radius_for_size(chip_size), fill=palette["chip_fill"], outline=palette["chip_outline"] if expanded else None, width=1)
+        if display_char:
+            self._draw_chip_center_text(
+                draw,
+                display_char.upper(),
+                palette["chip_text"],
+                chip_x,
+                chip_y,
+                chip_size,
+                font=snapshot.get("char_font"),
+            )
+        elif snapshot["state"] == "paused":
+            bar_width = max(2, int(chip_size * 0.14))
+            gap = max(2, int(chip_size * 0.12))
+            x_mid = chip_x + int(chip_size / 2)
+            y1 = chip_y + int(chip_size * 0.24)
+            y2 = chip_y + int(chip_size * 0.76)
+            draw.rounded_rectangle((x_mid - gap - bar_width, y1, x_mid - gap - 1, y2), radius=max(1, int(bar_width / 2)), fill=palette["chip_text"])
+            draw.rounded_rectangle((x_mid + gap, y1, x_mid + gap + bar_width - 1, y2), radius=max(1, int(bar_width / 2)), fill=palette["chip_text"])
+        else:
+            inner = max(3, int(round(chip_size * 0.23)))
+            if chip_size >= 20:
+                draw.rounded_rectangle((chip_x + inner, chip_y + inner, chip_x + chip_size - inner - 1, chip_y + chip_size - inner - 1), radius=max(4, self._chip_corner_radius_for_size(max(6, chip_size - (inner * 2)))), outline=palette["chip_inner"], width=1)
+        ordered_cache_set(self._surface_cache, cache_key, image, 48, lock=self._render_cache_lock)
+        return image
+
+    def _render_image(self, snapshot):
+        expanded = bool(snapshot["expanded"])
+        palette = self._state_palette(snapshot["state"])
+        chip_x, chip_y, chip_size = self._chip_rect(expanded, snapshot=snapshot)
+        image = self._render_base_surface(snapshot).copy()
+        draw = PIL.ImageDraw.Draw(image)
+        panel_scroll_max = 0
+        panel_scroll_offset = int(snapshot["panel_scroll_offset"])
+        if expanded and snapshot["panel_text"]:
+            text_width = max(220, int(snapshot["current_width"]) - (int(snapshot["panel_padding"]) * 2) - chip_size - int(snapshot["gap"]) - 18)
+            bottom_reserve = max(18, int(int(snapshot["panel_padding"]) * 0.9)) + (18 if snapshot["answer_preview"] else 0)
+            text_view_height = max(56, int(snapshot["current_height"]) - (int(snapshot["panel_padding"]) * 2) - bottom_reserve)
+            layout = layout_wrapped_text(
+                snapshot["panel_text"],
+                snapshot.get("body_font"),
+                text_width,
+                spacing=self.TEXT_SPACING,
+            )
+            panel_scroll_max = max(0, int(layout["height"]) - text_view_height)
+            panel_scroll_offset = min(max(0, panel_scroll_offset), panel_scroll_max)
+            text_x = chip_x + chip_size + int(snapshot["gap"]) if snapshot["anchor_side"] == "left" else int(snapshot["panel_padding"])
+            base_y = int(snapshot["panel_padding"]) + 2 - panel_scroll_offset
+            line_step = int(layout["line_height"] + layout["spacing"])
+            view_top = int(snapshot["panel_padding"]) + 2
+            view_bottom = view_top + text_view_height
+            preview_text = str(snapshot["answer_preview"] or "")
+            typed_index = int(snapshot["answer_progress_index"])
+            for line_index, line in enumerate(layout["lines"]):
+                y = base_y + (line_index * line_step)
+                if y + layout["line_height"] < view_top:
+                    continue
+                if y > view_bottom:
+                    break
+                draw.text((text_x, y), str(line["text"] or ""), fill=palette["text"], font=snapshot.get("body_font"))
+                if preview_text and typed_index > int(line["start"]):
+                    prefix = preview_text[int(line["start"]): min(int(line["end"]), typed_index)].rstrip()
+                    if prefix:
+                        draw.text((text_x, y), prefix, fill=palette["highlight_text"], font=snapshot.get("body_font"))
+            if snapshot["answer_preview"]:
+                total = len(snapshot["answer_preview"])
+                fraction = max(0.0, min(1.0, float(snapshot["answer_progress_index"]) / float(total or 1)))
+                bar_width = max(80, int(snapshot["current_width"]) - (int(snapshot["panel_padding"]) * 2))
+                bar_height = max(5, int(round(int(snapshot["base_size"]) * 0.24)))
+                bar_left = int(snapshot["panel_padding"])
+                bar_top = int(snapshot["current_height"]) - max(12, int(int(snapshot["panel_padding"]) * 0.72)) - bar_height
+                draw.rounded_rectangle((bar_left, bar_top, bar_left + bar_width, bar_top + bar_height), radius=max(2, int(bar_height / 2)), fill=palette["progress_track"])
+                fill_width = int(round(bar_width * fraction))
+                if fill_width > 0:
+                    draw.rounded_rectangle((bar_left, bar_top, bar_left + fill_width, bar_top + bar_height), radius=max(2, int(bar_height / 2)), fill=palette["progress_fill"])
+            if panel_scroll_max > 0:
+                track_top = int(snapshot["panel_padding"]) + 2
+                track_right = int(snapshot["current_width"]) - max(6, int(int(snapshot["panel_padding"]) * 0.5))
+                track_left = track_right - 3
+                track_bottom = track_top + text_view_height
+                draw.rounded_rectangle((track_left, track_top, track_right, track_bottom), radius=2, fill=palette["progress_track"])
+                thumb_height = max(18, int((text_view_height / max(1, int(layout["height"]))) * text_view_height))
+                thumb_travel = max(1, text_view_height - thumb_height)
+                thumb_top = track_top + int((panel_scroll_offset / max(1, panel_scroll_max)) * thumb_travel)
+                draw.rounded_rectangle((track_left, thumb_top, track_right, thumb_top + thumb_height), radius=2, fill=palette["progress_fill"])
+        return image, panel_scroll_max, panel_scroll_offset
+
+    def _apply_render_result(self, signature):
+        if self.hidden or not self.hwnd or signature != self._last_render_signature:
+            return
+        rendered = self._get_cached_rendered_surface(signature)
+        if rendered is None:
+            return
+        image, panel_scroll_max, panel_scroll_offset = rendered
+        self.panel_scroll_max = int(panel_scroll_max)
+        self.panel_scroll_offset = int(panel_scroll_offset)
+        self._apply_native_state()
+        update_layered_window_image(self.hwnd, image, self.current_x, self.current_y)
+
+    def _redraw(self, force=False):
+        if self.hidden or not self.hwnd:
+            return
+        snapshot = self._build_render_snapshot()
+        signature = snapshot["signature"]
+        if not force and signature == self._last_render_signature:
+            return
+        self._last_render_signature = signature
+        self._apply_native_state()
+        rendered = self._get_cached_rendered_surface(signature)
+        if rendered is not None:
+            image, panel_scroll_max, panel_scroll_offset = rendered
+            self.panel_scroll_max = int(panel_scroll_max)
+            self.panel_scroll_offset = int(panel_scroll_offset)
+            update_layered_window_image(self.hwnd, image, self.current_x, self.current_y)
+            return
+        self._request_render(snapshot)
+
+    def _process_dispatch_queue(self):
+        while True:
+            try:
+                callback = indicator_dispatch_queue.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                callback(self)
+            except Exception:
+                logger.debug("Indicator callback failed.", exc_info=True)
+
+    def _pointer_inside(self):
+        if self.hidden:
+            return False
+        point = wintypes.POINT()
+        return bool(_user32.GetCursorPos(ctypes.byref(point))) and self.current_x <= int(point.x) < (self.current_x + self.current_width) and self.current_y <= int(point.y) < (self.current_y + self.current_height)
+
+    def _collapse_if_possible(self):
+        if self.hidden or self.hover_inside or self.panel_pinned or self._pointer_inside():
+            return
+        self._sync_size()
+        self._redraw(force=True)
+
+    def _scroll_panel(self, direction):
+        if self.panel_scroll_max <= 0:
+            return 0
+        line_height = max(12, image_font_line_height(self.body_font))
+        next_offset = min(max(0, self.panel_scroll_offset + (direction * line_height * INDICATOR_PANEL_SCROLL_LINES)), self.panel_scroll_max)
+        if next_offset == self.panel_scroll_offset:
+            return 0
+        self.panel_scroll_offset = next_offset
+        self._redraw(force=True)
+        return 1
+
+    def _should_redraw_progress(self, text_changed, typed_index):
+        if self.hidden or not self._panel_requested():
+            return False
+        total_chars = len(self.answer_preview)
+        if total_chars <= 0 or text_changed or typed_index <= 0 or typed_index >= total_chars or typing_hook is None:
+            self.progress_rendered_at = time.monotonic()
+            self.progress_rendered_index = int(typed_index)
+            return True
+        now = time.monotonic()
+        if int(typed_index) - int(self.progress_rendered_index) < INDICATOR_TYPING_PANEL_RENDER_MIN_STEP and (now - float(self.progress_rendered_at)) < INDICATOR_TYPING_PANEL_RENDER_MIN_INTERVAL:
+            return False
+        self.progress_rendered_at = now
+        self.progress_rendered_index = int(typed_index)
+        return True
+
+    def _thread_main(self):
+        self._thread_id = threading.get_ident()
+        try:
+            hinstance = _kernel32.GetModuleHandleW(None)
+            wnd_class = WNDCLASSEXW()
+            wnd_class.cbSize = ctypes.sizeof(WNDCLASSEXW)
+            wnd_class.style = CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS
+            wnd_class.lpfnWndProc = self._wndproc
+            wnd_class.hInstance = hinstance
+            wnd_class.lpszClassName = self._class_name
+            try:
+                wnd_class.hCursor = _user32.LoadCursorW(None, wintypes.LPCWSTR(IDC_ARROW))
+            except Exception:
+                wnd_class.hCursor = None
+            if not _user32.RegisterClassExW(ctypes.byref(wnd_class)):
+                raise ctypes.WinError(ctypes.get_last_error())
+            self.hwnd = int(_user32.CreateWindowExW(WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, self._class_name, APP_NAME, WS_POPUP, 0, 0, self.current_width, self.current_height, None, None, hinstance, None) or 0)
+            if not self.hwnd:
+                raise ctypes.WinError(ctypes.get_last_error())
+            self._sync_size()
+            _user32.ShowWindow(wintypes.HWND(int(self.hwnd)), SW_HIDE)
+            self._hwnd_ready.set()
+            msg = MSG()
+            while True:
+                result = _user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
+                if result == 0:
+                    break
+                if result == -1:
+                    raise ctypes.WinError(ctypes.get_last_error())
+                _user32.TranslateMessage(ctypes.byref(msg))
+                _user32.DispatchMessageW(ctypes.byref(msg))
+        except Exception as exc:
+            self._thread_error = exc
+            self._hwnd_ready.set()
+            indicator_debug("indicator.native_thread.exception", traceback=traceback.format_exc())
+        finally:
+            self._render_stop_event.set()
+            self._render_request_event.set()
+            self.hwnd = 0
+
+    def _wndproc_impl(self, hwnd, msg, wparam, lparam):
+        if msg == self.WM_DISPATCH:
+            self._process_dispatch_queue()
+            return 0
+        if msg == WM_TIMER:
+            self._kill_timer(int(wparam))
+            if int(wparam) == self.TIMER_FRAME:
+                self._frame_tick()
+            elif int(wparam) == self.TIMER_NATIVE:
+                self._apply_native_state()
+                self._schedule_native_tick()
+            elif int(wparam) == self.TIMER_COLLAPSE:
+                self._collapse_if_possible()
+            elif int(wparam) == self.TIMER_CLICK:
+                self.panel_pinned = not self.panel_pinned
+                if not self.panel_pinned and not self._pointer_inside():
+                    self.hover_inside = False
+                self._sync_size()
+                self._redraw(force=True)
+            return 0
+        if msg == WM_MOUSEMOVE:
+            self.hover_inside = True
+            self._sync_size()
+            self._redraw(force=True)
+            if not self._mouse_tracking:
+                track = TRACKMOUSEEVENT()
+                track.cbSize = ctypes.sizeof(TRACKMOUSEEVENT)
+                track.dwFlags = TME_LEAVE
+                track.hwndTrack = wintypes.HWND(int(hwnd))
+                track.dwHoverTime = 0
+                self._mouse_tracking = bool(_user32.TrackMouseEvent(ctypes.byref(track)))
+            return 0
+        if msg == WM_MOUSELEAVE:
+            self.hover_inside = False
+            self._mouse_tracking = False
+            self._set_timer(self.TIMER_COLLAPSE, 150)
+            return 0
+        if msg == WM_MOUSEWHEEL:
+            raw = int((int(wparam) >> 16) & 0xFFFF)
+            delta = raw - 0x10000 if raw & 0x8000 else raw
+            return self._scroll_panel(-1 if delta > 0 else 1 if delta < 0 else 0)
+        if msg == WM_LBUTTONDOWN:
+            self._set_timer(self.TIMER_CLICK, 180)
+            return 0
+        if msg == WM_LBUTTONDBLCLK:
+            self._kill_timer(self.TIMER_CLICK)
+            Thread(target=lambda: open_settings_menu(hide_indicator_temporarily=True), daemon=True, name="indicator-open-settings").start()
+            return 0
+        if msg == WM_MOUSEACTIVATE:
+            return MA_NOACTIVATE
+        if msg in {WM_DISPLAYCHANGE, WM_SETTINGCHANGE, WM_DPICHANGED}:
+            self.refresh_preferences()
+            return 0
+        if msg == WM_DESTROY:
+            global indicator_capture_protected
+            indicator_capture_protected = False
+            self._render_stop_event.set()
+            self._render_request_event.set()
+            set_indicator_runtime_state(active=False, hidden=True)
+            _user32.PostQuitMessage(0)
+            return 0
+        return _user32.DefWindowProcW(hwnd, msg, wparam, lparam)
+
+    def set_command_mode(self, mode):
+        if not self._on_ui_thread():
+            self._enqueue(lambda obj: obj.set_command_mode(mode))
+            return
+        self.command_mode = "toprow" if str(mode or "").strip().lower() == "toprow" else "numpad"
+        self.control_hint_text = self._build_control_hint_text()
+        self._clear_render_caches()
+        self._last_render_signature = None
+        self._sync_size()
+        if not self.hidden:
+            self._redraw(force=True)
+
+    def refresh_preferences(self):
+        if not self._on_ui_thread():
+            self._enqueue(lambda obj: obj.refresh_preferences())
+            return
+        self._update_screen_metrics()
+        self.command_mode = str(command_key_mode).strip().lower() or "numpad"
+        self._apply_size_metrics()
+        self._clear_render_caches()
+        self._sync_size()
+        if not self.hidden:
+            self._redraw(force=True)
+
+    def set_idle(self):
+        if not self._on_ui_thread():
+            self._enqueue(lambda obj: obj.set_idle())
+            return
+        self.current_char = ""
+        self._set_state("idle")
+
+    def set_processing(self):
+        if not self._on_ui_thread():
+            self._enqueue(lambda obj: obj.set_processing())
+            return
+        self.current_char = ""
+        self.hover_inside = False
+        self._set_state("processing")
+
+    def set_ready(self):
+        if not self._on_ui_thread():
+            self._enqueue(lambda obj: obj.set_ready())
+            return
+        self.current_char = ""
+        self._set_state("ready")
+
+    def set_paused(self):
+        if not self._on_ui_thread():
+            self._enqueue(lambda obj: obj.set_paused())
+            return
+        self.current_char = ""
+        self._set_state("paused")
+
+    def show_answer_char(self, value):
+        if not self._on_ui_thread():
+            self._enqueue(lambda obj: obj.show_answer_char(value))
+            return
+        self.current_char = (value or "").strip()[:1]
+        self._set_state("ready")
+
+    def set_answer_progress(self, value, typed_count=0):
+        if not self._on_ui_thread():
+            self._enqueue(lambda obj: obj.set_answer_progress(value, typed_count))
+            return
+        text = str(value or "").strip()
+        typed_index = max(0, min(len(text), int(typed_count or 0)))
+        text_changed = text != self.answer_preview
+        self.answer_preview = text
+        self.answer_progress_index = typed_index
+        self.answer_preview_expires_at = time.monotonic() + ANSWER_PREVIEW_RETENTION_SECONDS if text and typed_index >= len(text) else 0.0
+        if text_changed:
+            self.panel_scroll_offset = 0
+            self._sync_size()
+        if not self.hidden and self._should_redraw_progress(text_changed, typed_index):
+            self._redraw(force=True)
+        self._schedule_frame_tick()
+
+    def clear_answer_preview(self):
+        if not self._on_ui_thread():
+            self._enqueue(lambda obj: obj.clear_answer_preview())
+            return
+        self.answer_preview = ""
+        self.answer_progress_index = 0
+        self.answer_preview_expires_at = 0.0
+        self.panel_scroll_offset = 0
+        self.panel_scroll_max = 0
+        self._sync_size()
+        if not self.hidden:
+            self._redraw(force=True)
+        self._schedule_frame_tick()
+
+    def set_cooldown(self, seconds):
+        if not self._on_ui_thread():
+            self._enqueue(lambda obj: obj.set_cooldown(seconds))
+            return
+        timeout = max(0.0, float(seconds or 0.0))
+        if timeout <= 0:
+            self.clear_cooldown()
+            return
+        self.current_char = ""
+        self.cooldown_until = time.monotonic() + timeout
+        self._set_state("cooldown")
+
+    def clear_cooldown(self):
+        if not self._on_ui_thread():
+            self._enqueue(lambda obj: obj.clear_cooldown())
+            return
+        self.cooldown_until = 0.0
+        self.current_char = ""
+        if self.state == "cooldown":
+            self._set_state("idle")
+
+    def refresh_capture_privacy(self):
+        if not self._on_ui_thread():
+            self._enqueue(lambda obj: obj.refresh_capture_privacy())
+            return
+        self._apply_capture_privacy()
+
+    def hide(self):
+        global indicator_capture_protected
+        if not self._on_ui_thread():
+            self._enqueue(lambda obj: obj.hide())
+            return
+        if self.hidden:
+            return
+        indicator_capture_protected = False
+        if self.hwnd:
+            set_window_capture_excluded(self.hwnd, enabled=False)
+            _user32.ShowWindow(wintypes.HWND(int(self.hwnd)), SW_HIDE)
+        self.hidden = True
+        set_indicator_runtime_state(active=True, hidden=True)
+
+    def show(self):
+        if not self._on_ui_thread():
+            self._enqueue(lambda obj: obj.show())
+            return
+        if not self.hwnd:
+            return
+        self.hidden = False
+        set_indicator_runtime_state(active=True, hidden=False)
+        self._sync_size()
+        _user32.ShowWindow(wintypes.HWND(int(self.hwnd)), SW_SHOWNOACTIVATE)
+        self._redraw(force=True)
+        self._schedule_frame_tick()
+        self._schedule_native_tick()
+
+    def run(self):
+        self._thread.join()
+
+
+class StatusIndicator:
+    def __init__(self):
+        raise RuntimeError("Legacy indicator implementation is disabled.")
 
     def _apply_size_metrics(self):
         self.base_size = int(INDICATOR_BLOB_SIZES.get(indicator_blob_size_key, INDICATOR_BLOB_SIZES["medium"]))
@@ -9631,7 +10541,13 @@ class StatusIndicator:
         _, text_height = self._measure_text_box(text, wrap_width)
         width = int(min(self.max_panel_width, max(self.collapsed_width + 180, chip_space + wrap_width + (self.panel_padding * 2) + 18)))
         bottom_reserve = max(18, int(self.panel_padding * 0.9)) + (18 if self.answer_preview else 0)
-        height = int(max(self.collapsed_height + 44, text_height + (self.panel_padding * 2) + bottom_reserve))
+        desired_height = int(max(self.collapsed_height + 44, text_height + (self.panel_padding * 2) + bottom_reserve))
+        screen_width = self.root.winfo_screenwidth()
+        screen_height = self.root.winfo_screenheight()
+        work_left, work_top, work_right, work_bottom = get_work_area_bounds(screen_width, screen_height)
+        usable_height = max(1, int(work_bottom) - int(work_top) - (INDICATOR_MARGIN_Y * 2))
+        max_height = int(max(self.collapsed_height + 44, usable_height * INDICATOR_PANEL_MAX_HEIGHT_RATIO))
+        height = int(min(desired_height, max_height))
         return width, height
 
     def _desired_size(self):
@@ -9640,7 +10556,8 @@ class StatusIndicator:
         return self.collapsed_width, self.collapsed_height
 
     def _panel_is_requested(self):
-        return bool(self.panel_pinned or self.hover_inside or self.answer_preview)
+        # Keep expansion user-driven: hover/click pin only.
+        return bool(self.panel_pinned or self.hover_inside)
 
     def _should_show_panel(self):
         return self._panel_is_requested()
@@ -9650,6 +10567,7 @@ class StatusIndicator:
 
     def _render_signature(self, antialias):
         panel_text = str(self._panel_text() or "")
+        panel_requested = bool(self._panel_is_requested())
         text_signature = (len(panel_text), panel_text[:48], panel_text[-48:] if len(panel_text) > 48 else "")
         cooldown_bucket = self._cooldown_seconds_remaining()
         return (
@@ -9658,7 +10576,8 @@ class StatusIndicator:
             bool(self._is_expanded()),
             str(self.state),
             str(self.current_char),
-            int(self.answer_progress_index),
+            int(self.answer_progress_index) if panel_requested else -1,
+            int(self.panel_scroll_offset) if panel_requested else 0,
             text_signature,
             int(antialias),
             int(cooldown_bucket),
@@ -9669,7 +10588,7 @@ class StatusIndicator:
         return max(4, min(int(self.chip_corner_radius), compute_indicator_chip_corner_radius(chip_size)))
 
     def _set_window_bg(self, color):
-        background = str(color or self.window_bg)
+        background = self.transparent_color or str(color or self.window_bg)
         if background == self._active_window_bg:
             return
         self._active_window_bg = background
@@ -9703,7 +10622,9 @@ class StatusIndicator:
         self.state = state_name
         self.ready_pulse_started_at = time.monotonic() if state_name == "ready" else 0.0
         self._sync_target_size()
-        self._redraw(force=True)
+        self._last_render_signature = None
+        if not self.hidden:
+            self._redraw(force=True)
         self._schedule_frame_tick()
 
     def _cancel_size_animation(self):
@@ -9739,11 +10660,11 @@ class StatusIndicator:
         elif geometry_changed:
             self._cancel_size_animation()
             self._set_geometry(target_width, target_height)
-            self._apply_window_rounding()
-            self._apply_capture_privacy()
+            self._schedule_native_refresh(force=True)
         else:
             self._cancel_size_animation()
-        self._last_render_signature = None
+        if geometry_changed:
+            self._last_render_signature = None
 
     def _ensure_animation(self):
         self._sync_target_size(animate=True)
@@ -9752,7 +10673,8 @@ class StatusIndicator:
         self.animation_after_id = None
         if self.animation_started_at <= 0.0:
             self._sync_target_size(animate=False)
-            self._redraw(force=True)
+            if not self.hidden:
+                self._redraw(force=True)
             return
         elapsed_ms = (time.monotonic() - self.animation_started_at) * 1000.0
         progress = max(0.0, min(1.0, elapsed_ms / float(max(1, self.animation_duration_ms))))
@@ -9760,16 +10682,16 @@ class StatusIndicator:
         next_width = int(round(self.animation_from_width + ((self.target_width - self.animation_from_width) * eased)))
         next_height = int(round(self.animation_from_height + ((self.target_height - self.animation_from_height) * eased)))
         self._set_geometry(next_width, next_height)
-        self._apply_window_rounding()
-        self._redraw(force=True)
+        if not self.hidden:
+            self._redraw(force=True)
         if progress < 1.0 and (next_width != self.target_width or next_height != self.target_height):
             self.animation_after_id = self.root.after(16, self._animate_step)
             return
         self.animation_started_at = 0.0
         self._set_geometry(self.target_width, self.target_height)
-        self._apply_window_rounding()
-        self._apply_capture_privacy()
-        self._redraw(force=True)
+        self._schedule_native_refresh(force=True)
+        if not self.hidden:
+            self._redraw(force=True)
 
     def _needs_frame_tick(self):
         return bool(
@@ -9790,6 +10712,41 @@ class StatusIndicator:
             return
         self.frame_after_id = self.root.after(self._next_frame_delay_ms(), self._frame_tick)
 
+    def _next_dispatch_delay_ms(self, processed=0):
+        if processed >= 48:
+            return 6
+        if self.answer_preview or self.panel_pinned or self.hover_inside:
+            return 10
+        if self.state in {"processing", "ready", "paused", "cooldown"}:
+            return 18
+        if self.hidden:
+            return 96
+        return 42
+
+    def _schedule_dispatch_tick(self, delay_ms=16):
+        if self.dispatch_after_id is not None:
+            return
+        self.dispatch_after_id = self.root.after(max(1, int(delay_ms or 16)), self._dispatch_tick)
+
+    def _dispatch_tick(self):
+        self.dispatch_after_id = None
+        processed = 0
+        while processed < 48:
+            try:
+                callback = indicator_dispatch_queue.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                callback(self)
+            except Exception:
+                logger.debug("Indicator callback failed.", exc_info=True)
+            processed += 1
+        try:
+            if self.root.winfo_exists():
+                self._schedule_dispatch_tick(self._next_dispatch_delay_ms(processed))
+        except Exception:
+            pass
+
     def _frame_tick(self):
         self.frame_after_id = None
         if self.answer_preview_expires_at > 0 and time.monotonic() >= self.answer_preview_expires_at:
@@ -9804,41 +10761,141 @@ class StatusIndicator:
         self._schedule_frame_tick()
 
     def _set_geometry(self, width, height):
-        self.current_width = int(max(1, width))
-        self.current_height = int(max(1, height))
         screen_width = self.root.winfo_screenwidth()
         screen_height = self.root.winfo_screenheight()
         work_left, work_top, work_right, work_bottom = get_work_area_bounds(screen_width, screen_height)
-        x, y = compute_indicator_origin(work_left, work_top, work_right, work_bottom, self.current_width, self.current_height, indicator_position_key)
-        self.root.geometry(f"{self.current_width}x{self.current_height}+{x}+{y}")
-        self.canvas.configure(width=self.current_width, height=self.current_height)
+        max_width = max(1, int(work_right) - int(work_left) - (INDICATOR_MARGIN_X * 2))
+        max_height = max(1, int(work_bottom) - int(work_top) - (INDICATOR_MARGIN_Y * 2))
+        # Clamp geometry to the visible work area so the panel never overflows the full screen.
+        next_width = int(min(max(1, width), max_width))
+        next_height = int(min(max(1, height), max_height))
+        x, y = compute_indicator_origin(work_left, work_top, work_right, work_bottom, next_width, next_height, indicator_position_key)
+        size_changed = (
+            self.current_width != next_width
+            or self.current_height != next_height
+        )
+        geometry_changed = size_changed or self.current_x != x or self.current_y != y
+        self.current_width = next_width
+        self.current_height = next_height
+        self.current_x = int(x)
+        self.current_y = int(y)
+        if not geometry_changed:
+            return
+        self.root.geometry(f"{self.current_width}x{self.current_height}+{self.current_x}+{self.current_y}")
+        if size_changed:
+            self.canvas.configure(width=self.current_width, height=self.current_height)
+        self._last_native_signature = None
+        if not self.hidden:
+            self._schedule_native_refresh()
 
-    def _apply_capture_privacy(self):
+    def _apply_capture_privacy(self, hwnd):
         global indicator_capture_protected
+        normalized_hwnd = int(hwnd or 0)
+        if not normalized_hwnd:
+            indicator_capture_protected = False
+            return False
         if not is_capture_privacy_active():
             indicator_capture_protected = False
-            apply_capture_privacy_to_window(self.root, enabled=False)
-            return
+            set_window_capture_excluded(normalized_hwnd, enabled=False)
+            return False
         try:
-            indicator_capture_protected = bool(apply_capture_privacy_to_window(self.root, enabled=True))
+            indicator_capture_protected = bool(set_window_capture_excluded(normalized_hwnd, enabled=True))
         except Exception:
             indicator_capture_protected = False
+        return indicator_capture_protected
 
     def refresh_capture_privacy(self):
-        self._apply_capture_privacy()
-        self._redraw(force=True)
+        self._last_native_signature = None
+        self._schedule_native_refresh(force=True)
 
-    def _apply_window_rounding(self):
+    def _native_corner_radius(self):
         if os.name != "nt":
-            return
+            return 0
         if self._is_expanded():
-            radius = self.panel_corner_radius
-        else:
-            radius = max(self.square_corner_radius, int(round(self.current_width * 0.36)))
-        apply_window_corner_region(self.root, radius)
+            return int(self.panel_corner_radius)
+        return int(max(self.square_corner_radius, int(round(self.current_width * 0.36))))
+
+    def _schedule_native_refresh(self, delay_ms=24, force=False):
+        if self.hidden:
+            self.native_refresh_force_pending = False
+            return
+        if force:
+            self.native_refresh_force_pending = True
+        if self.native_refresh_after_id is not None:
+            return
+        self.native_refresh_after_id = self.root.after(max(0, int(delay_ms or 0)), self._apply_native_window_state)
+
+    def _apply_native_window_state(self):
+        self.native_refresh_after_id = None
+        if self.hidden:
+            self.native_refresh_force_pending = False
+            return
+        force = bool(self.native_refresh_force_pending)
+        self.native_refresh_force_pending = False
+        try:
+            if not self.root.winfo_exists():
+                return
+            hwnd = int(self.root.winfo_id() or 0)
+            if not hwnd:
+                return
+            native_signature = (
+                bool(is_capture_privacy_active()),
+            )
+            if not force and native_signature == self._last_native_signature:
+                self._schedule_native_heartbeat()
+                return
+            self._apply_capture_privacy(hwnd)
+            self._last_native_signature = native_signature
+            self._schedule_native_heartbeat()
+        except Exception:
+            logger.debug("Indicator native window sync failed.", exc_info=True)
+
+    def _cancel_native_heartbeat(self):
+        if self.native_heartbeat_after_id is None:
+            return
+        try:
+            self.root.after_cancel(self.native_heartbeat_after_id)
+        except Exception:
+            pass
+        self.native_heartbeat_after_id = None
+
+    def _schedule_native_heartbeat(self):
+        if self.hidden or self.native_heartbeat_after_id is not None:
+            return
+        self.native_heartbeat_after_id = self.root.after(INDICATOR_NATIVE_HEARTBEAT_MS, self._native_heartbeat_tick)
+
+    def _native_heartbeat_tick(self):
+        self.native_heartbeat_after_id = None
+        if self.hidden:
+            return
+        self._schedule_native_refresh(force=True)
+
+    def _on_window_map(self, _event=None):
+        indicator_debug("indicator.window.map", hidden=self.hidden)
+        if self.hidden:
+            return
+        self._schedule_native_refresh(delay_ms=30, force=True)
+
+    def _on_window_unmap(self, _event=None):
+        indicator_debug("indicator.window.unmap", hidden=self.hidden)
+
+    def _on_focus_in(self, _event=None):
+        indicator_debug("indicator.window.focus_in", hidden=self.hidden)
+
+    def _on_focus_out(self, _event=None):
+        indicator_debug("indicator.window.focus_out", hidden=self.hidden)
 
     def _on_destroy(self, _event=None):
-        for attr_name in ("frame_after_id", "collapse_after_id", "animation_after_id", "click_after_id"):
+        global indicator_capture_protected
+        for attr_name in (
+            "frame_after_id",
+            "collapse_after_id",
+            "animation_after_id",
+            "click_after_id",
+            "dispatch_after_id",
+            "native_refresh_after_id",
+            "native_heartbeat_after_id",
+        ):
             after_id = getattr(self, attr_name, None)
             if after_id:
                 try:
@@ -9847,6 +10904,8 @@ class StatusIndicator:
                     pass
             setattr(self, attr_name, None)
         self.animation_started_at = 0.0
+        indicator_capture_protected = False
+        set_indicator_runtime_state(active=False, hidden=True)
 
     def _state_palette(self):
         if self.state == "processing":
@@ -9946,9 +11005,6 @@ class StatusIndicator:
             int(self.current_height),
             str(self.state),
             str(self.current_char),
-            str(self.answer_preview),
-            int(self.answer_progress_index),
-            str(self._panel_text()),
             palette_signature,
         )
         cached = self._surface_cache.get(cache_key)
@@ -10035,35 +11091,6 @@ class StatusIndicator:
                     outline=palette["chip_inner"],
                     width=outline_width,
                 )
-
-            if self.answer_preview:
-                total = len(self.answer_preview)
-                if total > 0:
-                    fraction = max(0.0, min(1.0, float(self.answer_progress_index) / float(total)))
-                    bar_width = max(80, self.current_width - (self.panel_padding * 2))
-                    bar_height = max(5, int(round(self.base_size * 0.24)))
-                    x1 = self.panel_padding
-                    y1 = self.current_height - max(12, int(self.panel_padding * 0.72)) - bar_height
-                    x2 = x1 + bar_width
-                    y2 = y1 + bar_height
-                    bar_radius = max(2, bar_height // 2) * scale
-                    draw.rounded_rectangle(
-                        (x1 * scale, y1 * scale, (x2 * scale) - 1, (y2 * scale) - 1),
-                        radius=bar_radius,
-                        fill=palette["progress_track"],
-                    )
-                    fill_width = int(round(bar_width * fraction))
-                    if fill_width > 0:
-                        draw.rounded_rectangle(
-                            (
-                                x1 * scale,
-                                y1 * scale,
-                                ((x1 + fill_width) * scale) - 1,
-                                (y2 * scale) - 1,
-                            ),
-                            radius=bar_radius,
-                            fill=palette["progress_fill"],
-                        )
         else:
             chip_margin = 0
             chip_x = 0
@@ -10128,7 +11155,7 @@ class StatusIndicator:
 
         resampling = getattr(getattr(PIL.Image, "Resampling", PIL.Image), "LANCZOS", PIL.Image.LANCZOS)
         image = image.resize((width_px, height_px), resampling)
-        rendered = (PIL.ImageTk.PhotoImage(image, master=self.canvas), chip_x, chip_y, chip_size, display_char)
+        rendered = (image, chip_x, chip_y, chip_size, display_char)
         self._surface_cache[cache_key] = rendered
         if len(self._surface_cache) > 48:
             try:
@@ -10199,14 +11226,23 @@ class StatusIndicator:
                 fill=palette["chip_text"],
                 font=self.char_font,
             )
+        self.panel_scroll_max = 0
         if expanded and text:
             chip_side = self._anchor_side()
             text_width = max(220, self.current_width - (self.panel_padding * 2) - chip_size - self.gap - 18)
+            bottom_reserve = max(18, int(self.panel_padding * 0.9)) + (18 if self.answer_preview else 0)
+            text_view_height = max(56, self.current_height - (self.panel_padding * 2) - bottom_reserve)
+            _, text_height = self._measure_text_box(text, text_width)
+            self.panel_scroll_max = max(0, int(text_height - text_view_height))
+            if self.panel_scroll_offset > self.panel_scroll_max:
+                self.panel_scroll_offset = self.panel_scroll_max
+            if self.panel_scroll_offset < 0:
+                self.panel_scroll_offset = 0
             if chip_side == "left":
                 text_x = chip_x + chip_size + self.gap
             else:
                 text_x = self.panel_padding
-            text_y = self.panel_padding + 2
+            text_y = (self.panel_padding + 2) - int(self.panel_scroll_offset)
             self.canvas.create_text(
                 text_x,
                 text_y,
@@ -10217,7 +11253,15 @@ class StatusIndicator:
                 justify="left",
                 width=text_width,
             )
-            if self.answer_preview and self.answer_progress_index > 0:
+            can_draw_highlight = bool(
+                self.answer_preview
+                and self.answer_progress_index > 0
+                and not (
+                    typing_hook is not None
+                    and len(self.answer_preview) > INDICATOR_TYPING_HIGHLIGHT_MAX_CHARS
+                )
+            )
+            if can_draw_highlight:
                 self.canvas.create_text(
                     text_x,
                     text_y,
@@ -10228,6 +11272,64 @@ class StatusIndicator:
                     justify="left",
                     width=text_width,
                 )
+            if self.answer_preview:
+                total = len(self.answer_preview)
+                if total > 0:
+                    fraction = max(0.0, min(1.0, float(self.answer_progress_index) / float(total)))
+                    bar_width = max(80, self.current_width - (self.panel_padding * 2))
+                    bar_height = max(5, int(round(self.base_size * 0.24)))
+                    bar_left = self.panel_padding
+                    bar_top = self.current_height - max(12, int(self.panel_padding * 0.72)) - bar_height
+                    bar_right = bar_left + bar_width
+                    bar_bottom = bar_top + bar_height
+                    self.canvas.create_rectangle(
+                        bar_left,
+                        bar_top,
+                        bar_right,
+                        bar_bottom,
+                        fill=palette["progress_track"],
+                        outline="",
+                    )
+                    fill_width = int(round(bar_width * fraction))
+                    if fill_width > 0:
+                        self.canvas.create_rectangle(
+                            bar_left,
+                            bar_top,
+                            bar_left + fill_width,
+                            bar_bottom,
+                            fill=palette["progress_fill"],
+                            outline="",
+                        )
+            if self.panel_scroll_max > 0:
+                track_top = self.panel_padding + 2
+                track_bottom = track_top + text_view_height
+                track_right = self.current_width - max(6, int(self.panel_padding * 0.5))
+                track_left = track_right - 3
+                self.canvas.create_rectangle(
+                    track_left,
+                    track_top,
+                    track_right,
+                    track_bottom,
+                    fill=palette["progress_track"],
+                    outline="",
+                )
+                thumb_height = max(18, int((text_view_height / max(1, text_height)) * text_view_height))
+                thumb_travel = max(1, text_view_height - thumb_height)
+                thumb_top = track_top + int((self.panel_scroll_offset / max(1, self.panel_scroll_max)) * thumb_travel)
+                self.canvas.create_rectangle(
+                    track_left,
+                    thumb_top,
+                    track_right,
+                    thumb_top + thumb_height,
+                    fill=palette["progress_fill"],
+                    outline="",
+                )
+        if self.answer_preview:
+            self.progress_rendered_index = int(self.answer_progress_index)
+            self.progress_rendered_at = time.monotonic()
+        else:
+            self.progress_rendered_index = -1
+            self.progress_rendered_at = 0.0
 
     def _cancel_scheduled_collapse(self):
         if self.collapse_after_id is None:
@@ -10244,7 +11346,7 @@ class StatusIndicator:
 
     def _collapse_if_possible(self):
         self.collapse_after_id = None
-        if self.hidden or self.hover_inside or self.panel_pinned or self.answer_preview:
+        if self.hidden or self.hover_inside or self.panel_pinned:
             return
         if self._is_pointer_inside():
             return
@@ -10252,6 +11354,39 @@ class StatusIndicator:
         self.target_height = self.collapsed_height
         self._sync_target_size()
         self._redraw(force=True)
+
+    def _scroll_panel(self, delta_pixels):
+        if self.panel_scroll_max <= 0:
+            return False
+        next_offset = int(min(max(0, self.panel_scroll_offset + int(delta_pixels)), self.panel_scroll_max))
+        if next_offset == self.panel_scroll_offset:
+            return False
+        self.panel_scroll_offset = next_offset
+        self._redraw(force=False)
+        return True
+
+    def _on_mouse_wheel(self, event):
+        if self.hidden or not self._is_expanded() or not self._panel_is_requested() or self.panel_scroll_max <= 0:
+            return None
+        if not self.hover_inside and not self._is_pointer_inside():
+            return None
+        direction = 0
+        wheel_delta = int(getattr(event, "delta", 0) or 0)
+        if wheel_delta:
+            direction = -1 if wheel_delta > 0 else 1
+        else:
+            event_num = int(getattr(event, "num", 0) or 0)
+            if event_num == 4:
+                direction = -1
+            elif event_num == 5:
+                direction = 1
+        if direction == 0:
+            return None
+        line_height = max(12, int(self.body_font.metrics("linespace")))
+        delta_pixels = direction * line_height * INDICATOR_PANEL_SCROLL_LINES
+        if self._scroll_panel(delta_pixels):
+            return "break"
+        return None
 
     def _on_hover_enter(self, _event):
         if self.hidden:
@@ -10302,13 +11437,43 @@ class StatusIndicator:
             self.click_after_id = None
         Thread(target=lambda: open_settings_menu(hide_indicator_temporarily=True), daemon=True).start()
 
+    def _should_redraw_progress(self, text_changed, typed_index):
+        if not self._panel_is_requested() or self.hidden:
+            return False
+        total_chars = len(self.answer_preview)
+        if total_chars <= 0:
+            self.progress_rendered_at = 0.0
+            self.progress_rendered_index = -1
+            return True
+        if text_changed or typed_index <= 0 or typed_index >= total_chars:
+            self.progress_rendered_at = time.monotonic()
+            self.progress_rendered_index = int(typed_index)
+            return True
+        if typing_hook is None:
+            self.progress_rendered_at = time.monotonic()
+            self.progress_rendered_index = int(typed_index)
+            return True
+        now = time.monotonic()
+        step_delta = int(typed_index) - int(self.progress_rendered_index)
+        time_delta = now - float(self.progress_rendered_at)
+        if (
+            step_delta < INDICATOR_TYPING_PANEL_RENDER_MIN_STEP
+            and time_delta < INDICATOR_TYPING_PANEL_RENDER_MIN_INTERVAL
+        ):
+            return False
+        self.progress_rendered_at = now
+        self.progress_rendered_index = int(typed_index)
+        return True
+
     def set_command_mode(self, mode):
         self.command_mode = "toprow" if str(mode or "").strip().lower() == "toprow" else "numpad"
         self.control_hint_text = self._build_control_hint_text()
         self._text_measure_cache.clear()
         self._surface_cache.clear()
         self._sync_target_size()
-        self._redraw(force=True)
+        self._last_render_signature = None
+        if not self.hidden:
+            self._redraw(force=True)
 
     def refresh_preferences(self):
         self.command_mode = str(command_key_mode).strip().lower() or "numpad"
@@ -10322,9 +11487,9 @@ class StatusIndicator:
         self._surface_cache.clear()
         self._sync_target_size(animate=False)
         self._set_geometry(self.target_width, self.target_height)
-        self._apply_window_rounding()
-        self._apply_capture_privacy()
-        self._redraw(force=True)
+        self._schedule_native_refresh(force=True)
+        if not self.hidden:
+            self._redraw(force=True)
         self._schedule_frame_tick()
 
     def set_idle(self):
@@ -10357,12 +11522,18 @@ class StatusIndicator:
         typed_index = max(0, min(len(text), int(typed_count or 0)))
         if text == self.answer_preview and typed_index == self.answer_progress_index:
             return
+        text_changed = text != self.answer_preview
         self.answer_preview = text
         self.answer_progress_index = typed_index
         self.answer_preview_expires_at = time.monotonic() + ANSWER_PREVIEW_RETENTION_SECONDS if text and typed_index >= len(text) else 0.0
-        self._sync_target_size()
-        self._redraw(force=True)
-        self._schedule_frame_tick()
+        if text_changed:
+            self.panel_scroll_offset = 0
+            self._sync_target_size()
+        # Skip heavy redraws unless the panel is actually visible to the user.
+        if not self.hidden and self._should_redraw_progress(text_changed, typed_index):
+            self._redraw(force=False)
+        if self.answer_preview_expires_at > 0:
+            self._schedule_frame_tick()
 
     def clear_answer_preview(self):
         if not self.answer_preview and self.answer_progress_index == 0:
@@ -10370,8 +11541,13 @@ class StatusIndicator:
         self.answer_preview = ""
         self.answer_progress_index = 0
         self.answer_preview_expires_at = 0.0
+        self.panel_scroll_offset = 0
+        self.panel_scroll_max = 0
+        self.progress_rendered_at = 0.0
+        self.progress_rendered_index = -1
         self._sync_target_size()
-        self._redraw(force=True)
+        if not self.hidden:
+            self._redraw(force=False)
         self._schedule_frame_tick()
 
     def _cooldown_seconds_remaining(self):
@@ -10403,63 +11579,105 @@ class StatusIndicator:
         self.current_char = ""
         if self.state == "cooldown":
             self._set_state("idle")
-        else:
+        elif not self.hidden:
             self._redraw(force=True)
         self._schedule_frame_tick()
 
     def hide(self):
+        global indicator_capture_protected
         if not self.hidden:
             self._cancel_scheduled_collapse()
             self._cancel_size_animation()
+            self._cancel_native_heartbeat()
+            if self.native_refresh_after_id is not None:
+                try:
+                    self.root.after_cancel(self.native_refresh_after_id)
+                except Exception:
+                    pass
+                self.native_refresh_after_id = None
+            self.native_refresh_force_pending = False
+            indicator_capture_protected = False
             self.root.withdraw()
             self.hidden = True
+            set_indicator_runtime_state(active=True, hidden=True)
 
     def show(self):
         if self.hidden:
             self.root.deiconify()
             self.root.attributes("-topmost", True)
-            self._apply_window_rounding()
-            self._apply_capture_privacy()
             self.hidden = False
+            set_indicator_runtime_state(active=True, hidden=False)
             self._last_render_signature = None
+            self._last_native_signature = None
             self._redraw(force=True)
             self._schedule_frame_tick()
+            self._schedule_native_refresh(delay_ms=30, force=True)
+            self._schedule_native_heartbeat()
 
     def run(self):
         self.root.mainloop()
 
 
 def init_indicator():
-    global indicator
+    global indicator, indicator_dispatch_queue
     indicator_ready_event.clear()
+    indicator_dispatch_queue = queue.SimpleQueue()
+    set_indicator_runtime_state(active=False, hidden=True)
     indicator_debug("indicator.init.entry")
     try:
-        indicator = StatusIndicator()
+        indicator = Win32StatusIndicator()
+        set_indicator_runtime_state(active=True, hidden=True)
+        indicator.set_command_mode(command_key_mode)
+        if indicator_manual_hidden or privacy_forced_hidden:
+            indicator.hide()
+        else:
+            indicator.show()
         indicator_ready_event.set()
         indicator_debug("indicator.init.ready")
+        indicator_debug("indicator.startup_visibility_sync.success", hidden=indicator_manual_hidden)
         indicator.run()
+        indicator_ready_event.clear()
+        indicator = None
+        set_indicator_runtime_state(active=False, hidden=True)
         indicator_debug("indicator.mainloop.exit")
     except Exception:
         indicator_ready_event.clear()
+        indicator = None
+        set_indicator_runtime_state(active=False, hidden=True)
         indicator_debug("indicator.init.exception", traceback=traceback.format_exc())
         raise
 
 
 def indicator_call(func):
     local_indicator = indicator
-    if not local_indicator:
+    if not local_indicator or not indicator_ready_event.is_set():
         return
-
-    def _invoke():
-        try:
-            func(local_indicator)
-        except Exception:
-            logger.debug("Indicator callback failed.", exc_info=True)
-
     try:
-        local_indicator.root.after(0, _invoke)
+        indicator_dispatch_queue.put(func)
+        if hasattr(local_indicator, "wake_dispatch"):
+            local_indicator.wake_dispatch()
     except Exception:
-        logger.debug("Indicator callback scheduling failed.", exc_info=True)
+        logger.debug("Indicator callback queueing failed.", exc_info=True)
+
+
+def reset_indicator_progress_dispatch_state():
+    global indicator_progress_pending_text, indicator_progress_pending_index, indicator_progress_dispatch_scheduled
+    with indicator_progress_lock:
+        indicator_progress_pending_text = ""
+        indicator_progress_pending_index = 0
+        indicator_progress_dispatch_scheduled = False
+
+
+def _flush_indicator_progress_dispatch(local_indicator):
+    global indicator_progress_dispatch_scheduled
+    with indicator_progress_lock:
+        payload = indicator_progress_pending_text
+        payload_index = indicator_progress_pending_index
+        indicator_progress_dispatch_scheduled = False
+    try:
+        local_indicator.set_answer_progress(payload, payload_index)
+    except Exception:
+        logger.debug("Indicator progress callback failed.", exc_info=True)
 
 
 def indicator_set_idle():
@@ -10491,10 +11709,25 @@ def indicator_show_answer_char(value):
 
 
 def indicator_set_answer_progress(value, typed_count):
-    indicator_call(lambda obj: obj.set_answer_progress(value, typed_count))
+    global indicator_progress_pending_text, indicator_progress_pending_index, indicator_progress_dispatch_scheduled
+    local_indicator = indicator
+    if not local_indicator or not indicator_ready_event.is_set():
+        return
+    payload = str(value or "")
+    payload_index = int(max(0, typed_count or 0))
+    if payload_index > len(payload):
+        payload_index = len(payload)
+    with indicator_progress_lock:
+        indicator_progress_pending_text = payload
+        indicator_progress_pending_index = payload_index
+        if indicator_progress_dispatch_scheduled:
+            return
+        indicator_progress_dispatch_scheduled = True
+    indicator_call(_flush_indicator_progress_dispatch)
 
 
 def indicator_clear_answer_preview():
+    reset_indicator_progress_dispatch_state()
     indicator_call(lambda obj: obj.clear_answer_preview())
 
 
@@ -10546,8 +11779,6 @@ def tray_open_ui(icon, item):
 
 
 def tray_toggle_indicator(icon, item):
-    if not indicator:
-        return
     toggle_indicator_visibility()
 
 
@@ -10653,6 +11884,23 @@ def get_numpad_action(event):
     return get_hotkey_action(event)
 
 
+def system_modifier_pressed():
+    if os.name == "nt":
+        try:
+            vk_codes = (0x11, 0x12, 0x5B, 0x5C)  # Ctrl, Alt, Left Win, Right Win
+            return any(bool(_user32.GetAsyncKeyState(code) & 0x8000) for code in vk_codes)
+        except Exception:
+            pass
+    try:
+        return bool(
+            keyboard.is_pressed("alt")
+            or keyboard.is_pressed("ctrl")
+            or keyboard.is_pressed("win")
+        )
+    except Exception:
+        return False
+
+
 def safe_keyboard_unhook(hook):
     if hook is None:
         return
@@ -10687,7 +11935,7 @@ def on_command_mode_probe(event):
         return
     if typing_hook is not None or post_type_guard_active or is_processing or has_pending_answer():
         return
-    if keyboard.is_pressed("ctrl") or keyboard.is_pressed("alt") or keyboard.is_pressed("win"):
+    if system_modifier_pressed():
         return
     scan_code = get_event_scan_code(event)
     if scan_code in NUMPAD_SCAN_TO_ACTION and event_matches_command_mode(event, "numpad"):
@@ -10739,33 +11987,57 @@ def unhook_command_key_handlers():
 
 
 def dispatch_hotkey_action(action, event=None):
-    if action == "primary":
-        handle_primary_hotkey()
-    elif action == "indicator":
-        handle_indicator_hotkey()
-    elif action == "clear_ctx":
-        handle_clear_ctx_hotkey()
-    elif action == "paste_all":
-        handle_paste_all_hotkey()
-    elif action == "repeat_prev":
-        handle_repeat_prev_hotkey()
-    elif action == "exit":
-        handle_exit_hotkey(event=event)
+    try:
+        if action == "primary":
+            handle_primary_hotkey()
+        elif action == "indicator":
+            handle_indicator_hotkey()
+        elif action == "clear_ctx":
+            handle_clear_ctx_hotkey()
+        elif action == "paste_all":
+            handle_paste_all_hotkey()
+        elif action == "repeat_prev":
+            handle_repeat_prev_hotkey()
+        elif action == "exit":
+            handle_exit_hotkey(event=event)
+    except Exception:
+        indicator_debug("hotkey.dispatch.exception", action=str(action or ""), traceback=traceback.format_exc())
+        logger.exception("Hotkey dispatch failed for action '%s'.", action)
 
 
 def on_command_key_event(event, action=None, binding_key=""):
-    if event is None:
+    try:
+        if event is None:
+            return True
+        if getattr(event, "event_type", "") != "down":
+            return True
+        if system_modifier_pressed():
+            return True
+        if binding_key and not hotkey_event_matches_binding(event, binding_key):
+            return True
+        if not action:
+            action = get_hotkey_action(event)
+        if not action:
+            return True
+        dispatch_hotkey_action(action, event=event)
+        return False
+    except Exception:
+        indicator_debug("hotkey.event.exception", traceback=traceback.format_exc())
+        logger.exception("Hotkey event handler failed.")
         return True
-    if getattr(event, "event_type", "") != "down":
+
+
+def safe_keyboard_write(text, delay=0):
+    payload = str(text or "")
+    if not payload:
         return True
-    if binding_key and not hotkey_event_matches_binding(event, binding_key):
+    try:
+        keyboard.write(payload, delay=delay)
         return True
-    if not action:
-        action = get_hotkey_action(event)
-    if not action:
-        return True
-    dispatch_hotkey_action(action, event=event)
-    return False
+    except Exception:
+        indicator_debug("keyboard.write.exception", length=len(payload), traceback=traceback.format_exc())
+        logger.exception("keyboard.write failed.")
+        return False
 
 
 def register_command_key_handlers(mode=None):
@@ -10782,6 +12054,8 @@ def register_command_key_handlers(mode=None):
         for action in HOTKEY_ACTION_ORDER:
             binding_key = str(command_hotkeys.get(action, "") or "").strip().lower()
             if not binding_key or binding_key in registered_bindings:
+                continue
+            if is_reserved_system_hotkey_binding(binding_key):
                 continue
             binding = ALLOWED_HOTKEY_BINDINGS.get(binding_key)
             scan_code = int((binding or {}).get("scan_code", 0) or 0)
@@ -10833,15 +12107,18 @@ def set_command_key_mode(mode):
 
 
 def on_post_type_guard_event(event):
+    # This hook runs with suppress=True, so return True unless we intentionally
+    # consume a control action.
     if event.event_type != "down":
-        return
+        return True
+    if system_modifier_pressed():
+        return True
     action = get_numpad_action(event)
     if action:
         dispatch_hotkey_action(action, event=event)
-        return
-    key_name = str(getattr(event, "name", "") or "").strip().lower()
-    if not is_character_like_key(key_name):
-        deactivate_post_type_guard()
+        return False
+    deactivate_post_type_guard()
+    return True
 
 
 def post_type_guard_watch_loop():
@@ -10991,6 +12268,7 @@ def clear_answer_state(invalidate=True):
         is_paused = False
         pause_pending = False
     reset_progress_ui_state()
+    reset_indicator_progress_dispatch_state()
     clear_typing_pressed_state()
     if invalidate:
         bump_answer_epoch()
@@ -11039,9 +12317,8 @@ def handle_primary_action():
 
 
 def toggle_indicator_visibility():
-    if not indicator:
-        return
-    if indicator.hidden:
+    next_hidden = not bool(indicator_manual_hidden)
+    if not next_hidden:
         set_indicator_manual_visibility(False)
         if not has_pending_answer() and not is_processing:
             indicator_clear_answer_preview()
@@ -11122,7 +12399,10 @@ def run_paste_all_action():
         full_answer = current_answer
     pasted = paste_text_fast(remaining, keep_clipboard_text=full_answer)
     if not pasted:
-        keyboard.write(remaining)
+        if not safe_keyboard_write(remaining):
+            indicator_set_idle()
+            clear_answer_state()
+            return
     with write_lock:
         current_index = len(full_answer)
     push_indicator_progress(full_answer, len(full_answer), force=True)
@@ -11162,7 +12442,6 @@ def handle_exit_hotkey(event=None):
         return
     block_hotkey("exit", hotkey_block_seconds("exit"))
     _ = event
-    schedule_manual_winget_uninstall("EyesAndEars")
     exit_program(trigger_uninstall=False)
 
 
@@ -11276,7 +12555,10 @@ def process_screenshot():
             indicator_set_ready()
             enable_typing_mode()
     except Exception as exc:
-        logger.exception("Screenshot processing failed.")
+        if is_temporary_genai_busy_error(exc):
+            logger.warning("Screenshot processing temporarily unavailable: %s", exc)
+        else:
+            logger.exception("Screenshot processing failed.")
         issue_kind = classify_api_runtime_issue(exc)
         if issue_kind:
             try:
@@ -11375,14 +12657,30 @@ def powershell_single_quote(value):
 
 
 def cleanup_data_dir_command():
+    candidate_paths = []
     try:
-        target = get_app_data_dir().resolve()
+        candidate_paths.append(get_app_data_dir().resolve())
     except Exception:
+        pass
+    try:
+        candidate_paths.append((resolve_install_root() / ".eyesandears").resolve())
+    except Exception:
+        pass
+    unique_targets = []
+    seen = set()
+    for path_value in candidate_paths:
+        target_text = str(path_value).strip()
+        target_key = target_text.lower()
+        if not target_text or target_key in seen:
+            continue
+        seen.add(target_key)
+        unique_targets.append(target_text)
+    if not unique_targets:
         return ""
-    target_text = str(target).strip()
-    if not target_text:
-        return ""
-    return f'if exist "{target_text}" rmdir /s /q "{target_text}"'
+    return "\n".join(
+        f'if exist "{target_text}" rmdir /s /q "{target_text}"'
+        for target_text in unique_targets
+    )
 
 
 def build_update_relaunch_command():
@@ -11413,7 +12711,7 @@ def winget_is_available():
 
 
 def schedule_winget_upgrade_and_restart():
-    package_id = resolve_winget_package_id() or "FediMust.EyesAndEars"
+    package_id = resolve_winget_package_id()
     if not package_id or not winget_is_available():
         return False
     relaunch_command = build_update_relaunch_command()
@@ -11527,6 +12825,9 @@ def maybe_auto_update_on_startup():
     global update_check_started
     if not AUTO_UPDATE_ENABLED or os.name != "nt" or not getattr(sys, "frozen", False):
         return
+    # Avoid unsolicited update/relaunch behavior for portable/manual EXE test runs.
+    if not resolve_winget_package_id():
+        return
     with update_state_lock:
         if update_check_started:
             return
@@ -11546,17 +12847,28 @@ def resolve_winget_package_id():
 
 def schedule_manual_winget_uninstall(package_query="EyesAndEars"):
     query = sanitize_package_query(package_query) or "EyesAndEars"
-    package_id = resolve_winget_package_id() or "FediMust.EyesAndEars"
+    package_id = resolve_winget_package_id()
+    if not winget_is_available():
+        return False
     cleanup_command = cleanup_data_dir_command()
     uninstall_script = Path(tempfile.gettempdir()) / f"eyesandears-manual-uninstall-{secrets.token_hex(8)}.cmd"
     script_lines = [
         "@echo off",
         f"timeout /t {SELF_UNINSTALL_DELAY_SECONDS} /nobreak >nul",
-        f"winget uninstall --name \"{query}\" --exact --silent --disable-interactivity --accept-source-agreements",
-        "if errorlevel 1 (",
-        f"  winget uninstall --id \"{package_id}\" --exact --purge --silent --disable-interactivity --accept-source-agreements",
-        ")",
     ]
+    if package_id:
+        script_lines.extend(
+            [
+                f"winget uninstall --id \"{package_id}\" --exact --purge --silent --disable-interactivity --accept-source-agreements",
+                "if errorlevel 1 (",
+                f"  winget uninstall --name \"{query}\" --exact --purge --silent --disable-interactivity --accept-source-agreements",
+                ")",
+            ]
+        )
+    else:
+        script_lines.append(
+            f"winget uninstall --name \"{query}\" --exact --purge --silent --disable-interactivity --accept-source-agreements"
+        )
     if cleanup_command:
         script_lines.append(cleanup_command)
     script_lines.append('del /f /q "%~f0"')
@@ -11570,17 +12882,30 @@ def schedule_manual_winget_uninstall(package_query="EyesAndEars"):
     return True
 
 
-def schedule_self_uninstall():
+def schedule_self_uninstall(package_query="EyesAndEars"):
+    query = sanitize_package_query(package_query) or "EyesAndEars"
     package_id = resolve_winget_package_id()
-    if not package_id:
+    if not winget_is_available():
         return False
     cleanup_command = cleanup_data_dir_command()
     uninstall_script = Path(tempfile.gettempdir()) / f"eyesandears-self-uninstall-{secrets.token_hex(8)}.cmd"
     script_lines = [
         "@echo off",
         f"timeout /t {SELF_UNINSTALL_DELAY_SECONDS} /nobreak >nul",
-        f"winget uninstall --id \"{package_id}\" --exact --purge --silent --disable-interactivity --accept-source-agreements",
     ]
+    if package_id:
+        script_lines.extend(
+            [
+                f"winget uninstall --id \"{package_id}\" --exact --purge --silent --disable-interactivity --accept-source-agreements",
+                "if errorlevel 1 (",
+                f"  winget uninstall --name \"{query}\" --exact --purge --silent --disable-interactivity --accept-source-agreements",
+                ")",
+            ]
+        )
+    else:
+        script_lines.append(
+            f"winget uninstall --name \"{query}\" --exact --purge --silent --disable-interactivity --accept-source-agreements"
+        )
     if cleanup_command:
         script_lines.append(cleanup_command)
     script_lines.append('del /f /q "%~f0"')
@@ -11598,6 +12923,7 @@ def exit_program(trigger_uninstall=False):
     global tray_icon
     profile_mark("process.exit", trigger_uninstall=bool(trigger_uninstall))
     privacy_guard_stop_event.set()
+    set_privacy_required_by_process(False)
     stop_command_mode_probe()
     try:
         end_remote_session()
@@ -11633,52 +12959,74 @@ def exit_program(trigger_uninstall=False):
 
 def on_smart_type(event):
     global current_index
-    scan_code = get_event_scan_code(event)
-    action = get_numpad_action(event)
-    if action:
-        if event.event_type == "down":
-            dispatch_hotkey_action(action, event=event)
-        elif event.event_type == "up" and scan_code > 0:
-            with typing_pressed_lock:
-                typing_pressed_scancodes.discard(scan_code)
-        return
-    if event.event_type == "up":
+    try:
+        # This hook also runs with suppress=True. Return False only when we
+        # intentionally replace a keypress with answer typing behavior.
+        scan_code = get_event_scan_code(event)
+        if system_modifier_pressed():
+            if getattr(event, "event_type", "") == "up" and scan_code > 0:
+                with typing_pressed_lock:
+                    typing_pressed_scancodes.discard(scan_code)
+            return True
+        action = get_numpad_action(event)
+        if action:
+            if event.event_type == "down":
+                dispatch_hotkey_action(action, event=event)
+            elif event.event_type == "up" and scan_code > 0:
+                with typing_pressed_lock:
+                    typing_pressed_scancodes.discard(scan_code)
+            return False
+        if event.event_type == "up":
+            if scan_code > 0:
+                with typing_pressed_lock:
+                    was_tracked = scan_code in typing_pressed_scancodes
+                    typing_pressed_scancodes.discard(scan_code)
+                if was_tracked:
+                    return False
+            return True
+        if event.event_type != "down":
+            return True
+        key_name = str(getattr(event, "name", "") or "").strip().lower()
+        if not is_character_like_key(key_name):
+            return True
         if scan_code > 0:
             with typing_pressed_lock:
-                typing_pressed_scancodes.discard(scan_code)
-        return
-    if event.event_type != "down":
-        return
-    key_name = str(getattr(event, "name", "") or "").strip().lower()
-    if not is_character_like_key(key_name):
-        return
-    if keyboard.is_pressed("ctrl") or keyboard.is_pressed("alt") or keyboard.is_pressed("win"):
-        return
-    if write_lock.locked():
-        return
-    if scan_code > 0:
-        with typing_pressed_lock:
-            if scan_code in typing_pressed_scancodes:
-                return
-            typing_pressed_scancodes.add(scan_code)
-    if current_answer and current_index < len(current_answer):
-        progress_answer = ""
-        progress_index = 0
-        with write_lock:
+                if scan_code in typing_pressed_scancodes:
+                    return False
+                typing_pressed_scancodes.add(scan_code)
+        if not current_answer or current_index >= len(current_answer):
+            return False
+        if not write_lock.acquire(blocking=False):
+            return False
+        try:
             # Re-check inside the lock: another thread may have cleared the answer
             # between the outer check above and acquiring the lock here.
             if not current_answer or current_index >= len(current_answer):
-                return
+                return False
             char = current_answer[current_index]
-            keyboard.write(char, delay=0)
+            if not safe_keyboard_write(char, delay=0):
+                disable_typing_mode()
+                clear_answer_state()
+                indicator_set_idle()
+                return False
             current_index += 1
             progress_index = current_index
             progress_answer = current_answer
+        finally:
+            write_lock.release()
         push_indicator_progress(progress_answer, progress_index, force=(progress_index >= len(progress_answer)))
         if current_index >= len(progress_answer):
             disable_typing_mode()
             clear_answer_state()
             activate_post_type_guard(POST_TYPE_GUARD_SECONDS)
+        return False
+    except Exception:
+        indicator_debug("typing.flow.exception", traceback=traceback.format_exc())
+        logger.exception("Typing flow failed.")
+        disable_typing_mode()
+        clear_answer_state()
+        indicator_set_idle()
+        return False
 
 
 def _run_post_ready_tasks():
@@ -11698,6 +13046,22 @@ def _run_post_ready_tasks():
             maybe_auto_update_on_startup()
 
         Thread(target=_delayed_auto_update, daemon=True, name="auto-update").start()
+
+
+def run_indicator_runtime():
+    for attempt in (1, 2):
+        indicator_debug("indicator.init.attempt", attempt=attempt)
+        try:
+            with profile_span("indicator.init", attempt=attempt):
+                init_indicator()
+            indicator_debug("indicator.init.attempt.success", attempt=attempt)
+            return
+        except Exception:
+            indicator_debug("indicator.init.attempt.failure", attempt=attempt, traceback=traceback.format_exc())
+            logger.exception("Indicator initialization failed (attempt %s).", attempt)
+            if attempt >= 2:
+                raise
+            time.sleep(0.35)
 
 
 def main():
@@ -11733,38 +13097,7 @@ def main():
                 logger.debug("Final remote preference sync before indicator init failed.", exc_info=True)
 
         startup_progress_update("startup.starting_indicator")
-
-        def _init_indicator_with_profile():
-            for attempt in (1, 2):
-                indicator_debug("indicator.init.attempt", attempt=attempt)
-                try:
-                    with profile_span("indicator.init", attempt=attempt):
-                        init_indicator()
-                    indicator_debug("indicator.init.attempt.success", attempt=attempt)
-                    return
-                except Exception:
-                    indicator_debug("indicator.init.attempt.failure", attempt=attempt, traceback=traceback.format_exc())
-                    logger.exception("Indicator initialization failed (attempt %s).", attempt)
-                    if attempt >= 2:
-                        return
-                    time.sleep(0.35)
-
-        def _ensure_indicator_visibility_after_startup(timeout_seconds=4.0, poll_seconds=0.05):
-            deadline = time.monotonic() + max(0.5, float(timeout_seconds or 0.0))
-            while time.monotonic() < deadline:
-                if indicator is not None and indicator_ready_event.is_set():
-                    set_indicator_manual_visibility(indicator_manual_hidden)
-                    indicator_debug("indicator.startup_visibility_sync.success", hidden=indicator_manual_hidden)
-                    return
-                time.sleep(max(0.02, float(poll_seconds or 0.0)))
-            indicator_debug("indicator.startup_visibility_sync.timeout", hidden=indicator_manual_hidden)
-            logger.warning("Indicator did not become ready during startup visibility sync.")
-
-        Thread(target=_init_indicator_with_profile, daemon=True, name="indicator-init").start()
-        indicator_debug("indicator.init.thread.started")
         indicator_manual_hidden = not INDICATOR_VISIBLE_BY_DEFAULT
-        set_indicator_manual_visibility(indicator_manual_hidden)
-        Thread(target=_ensure_indicator_visibility_after_startup, daemon=True, name="indicator-sync").start()
 
         with profile_span("main.hotkeys_init", mode=command_key_mode):
             set_command_key_mode(command_key_mode)
@@ -11773,23 +13106,22 @@ def main():
         startup_progress_close()
         _run_post_ready_tasks()
         profile_mark("main.ready")
-    wait_fn = None
-    try:
-        wait_fn = getattr(keyboard, "wait", None)
-    except Exception:
-        wait_fn = None
-    if callable(wait_fn):
-        wait_fn()
-        return
-    while True:
-        time.sleep(1.0)
+    run_indicator_runtime()
 
 
 if __name__ == "__main__":
     if len(sys.argv) >= 3 and sys.argv[1] == STARTUP_SPLASH_SUBPROCESS_FLAG:
-        raise SystemExit(run_startup_splash_subprocess(sys.argv[2]))
+        try:
+            raise SystemExit(run_startup_splash_subprocess(sys.argv[2]))
+        except Exception:
+            logger.exception("Startup splash subprocess failed.")
+            raise SystemExit(1)
     if len(sys.argv) >= 4 and sys.argv[1] == AUTH_SHELL_SUBPROCESS_FLAG:
-        raise SystemExit(run_auth_shell_subprocess(sys.argv[2], sys.argv[3]))
+        try:
+            raise SystemExit(run_auth_shell_subprocess(sys.argv[2], sys.argv[3]))
+        except Exception:
+            logger.exception("Auth shell subprocess failed.")
+            raise SystemExit(1)
     try:
         main()
     except KeyboardInterrupt:
@@ -11797,3 +13129,6 @@ if __name__ == "__main__":
             exit_program(trigger_uninstall=False)
         except Exception:
             raise SystemExit(0)
+    except Exception:
+        logger.exception("Fatal runtime error.")
+        raise SystemExit(1)
